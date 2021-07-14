@@ -15,13 +15,14 @@
  */
 
 #include <config.h>
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <sys/socket.h>
 #include <net/if.h>
-#include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -36,7 +37,6 @@
 #include "dpctl.h"
 #include "fatal-signal.h"
 #include "odp-util.h"
-#include "ofp-parse.h"
 #include "packets.h"
 #include "timeval.h"
 #include "util.h"
@@ -77,13 +77,19 @@ parse_options(int argc, char *argv[])
     enum {
         OPT_CLEAR = UCHAR_MAX + 1,
         OPT_MAY_CREATE,
+        OPT_READ_ONLY,
+        OPT_NAMES,
+        OPT_NO_NAMES,
         VLOG_OPTION_ENUMS
     };
     static const struct option long_options[] = {
         {"statistics", no_argument, NULL, 's'},
         {"clear", no_argument, NULL, OPT_CLEAR},
         {"may-create", no_argument, NULL, OPT_MAY_CREATE},
+        {"read-only", no_argument, NULL, OPT_READ_ONLY},
         {"more", no_argument, NULL, 'm'},
+        {"names", no_argument, NULL, OPT_NAMES},
+        {"no-names", no_argument, NULL, OPT_NO_NAMES},
         {"timeout", required_argument, NULL, 't'},
         {"help", no_argument, NULL, 'h'},
         {"option", no_argument, NULL, 'o'},
@@ -93,8 +99,10 @@ parse_options(int argc, char *argv[])
     };
     char *short_options = ovs_cmdl_long_options_to_short_options(long_options);
 
+    bool set_names = false;
+    unsigned int timeout = 0;
+
     for (;;) {
-        unsigned long int timeout;
         int c;
 
         c = getopt_long(argc, argv, short_options, long_options, NULL);
@@ -115,17 +123,27 @@ parse_options(int argc, char *argv[])
             dpctl_p.may_create = true;
             break;
 
+        case OPT_READ_ONLY:
+            dpctl_p.read_only = true;
+            break;
+
         case 'm':
             dpctl_p.verbosity++;
             break;
 
+        case OPT_NAMES:
+            dpctl_p.names = true;
+            set_names = true;
+            break;
+
+        case OPT_NO_NAMES:
+            dpctl_p.names = false;
+            set_names = true;
+            break;
+
         case 't':
-            timeout = strtoul(optarg, NULL, 10);
-            if (timeout <= 0) {
-                ovs_fatal(0, "value %s on -t or --timeout is not at least 1",
-                          optarg);
-            } else {
-                time_alarm(timeout);
+            if (!str_to_uint(optarg, 10, &timeout) || !timeout) {
+                ovs_fatal(0, "value %s on -t or --timeout is invalid", optarg);
             }
             break;
 
@@ -150,6 +168,12 @@ parse_options(int argc, char *argv[])
         }
     }
     free(short_options);
+
+    ctl_timeout_setup(timeout);
+
+    if (!set_names) {
+        dpctl_p.names = dpctl_p.verbosity > 0;
+    }
 }
 
 static void
@@ -167,23 +191,36 @@ usage(void *userdata OVS_UNUSED)
            "  show DP...               show basic info on each DP\n"
            "  dump-flows [DP]          display flows in DP\n"
            "  add-flow [DP] FLOW ACTIONS add FLOW with ACTIONS to DP\n"
+           "  add-flows [DP] FILE        add flows from FILE\n"
            "  mod-flow [DP] FLOW ACTIONS change FLOW actions to ACTIONS in DP\n"
+           "  mod-flows [DP] FILE        change flows from FILE\n"
            "  get-flow [DP] ufid:UFID    fetch flow corresponding to UFID\n"
            "  del-flow [DP] FLOW         delete FLOW from DP\n"
-           "  del-flows [DP]             delete all flows from DP\n"
+           "  del-flows [DP] [FILE]      " \
+               "delete all or specified flows from DP\n"
+           "  dump-conntrack [DP] [zone=ZONE]  " \
+               "display conntrack entries for ZONE\n"
+           "  flush-conntrack [DP] [zone=ZONE] [ct-tuple]" \
+               "delete matched conntrack entries in ZONE\n"
+           "  ct-stats-show [DP] [zone=ZONE] [verbose] " \
+               "CT connections grouped by protocol\n"
+           "  ct-bkts [DP] [gt=N] display connections per CT bucket\n"
            "Each IFACE on add-dp, add-if, and set-if may be followed by\n"
            "comma-separated options.  See ovs-dpctl(8) for syntax, or the\n"
            "Interface table in ovs-vswitchd.conf.db(5) for an options list.\n"
-           "For COMMAND dump-flows, add-flow, mod-flow, del-flow and\n"
-           "del-flows, DP is optional if there is only one datapath.\n",
+           "For COMMAND dump-flows, add-flow, add-flows, mod-flow,\n"
+           "mod-flows, del-flow and del-flows, DP is optional if there is\n"
+           "only one datapath.\n",
            program_name, program_name);
     vlog_usage();
     printf("\nOptions for show and mod-flow:\n"
            "  -s,  --statistics           print statistics for port or flow\n"
            "\nOptions for dump-flows:\n"
            "  -m, --more                  increase verbosity of output\n"
+           "  --names                     use port names in output\n"
            "\nOptions for mod-flow:\n"
            "  --may-create                create flow if it doesn't exist\n"
+           "  --read-only                 do not run read/write commands\n"
            "  --clear                     reset existing stats to zero\n"
            "\nOther options:\n"
            "  -t, --timeout=SECS          give up after SECS seconds\n"

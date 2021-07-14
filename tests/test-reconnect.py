@@ -74,11 +74,11 @@ def do_run(arg):
     if action is None:
         pass
     elif action == ovs.reconnect.CONNECT:
-        print "  should connect"
+        print("  should connect")
     elif action == ovs.reconnect.DISCONNECT:
-        print "  should disconnect"
+        print("  should disconnect")
     elif action == ovs.reconnect.PROBE:
-        print "  should send probe"
+        print("  should send probe")
     else:
         assert False
 
@@ -91,15 +91,19 @@ def do_advance(arg):
 def do_timeout(_):
     global now
     timeout = r.timeout(now)
-    if timeout >= 0:
-        print "  advance %d ms" % timeout
+    if timeout is not None and timeout >= 0:
+        print("  advance %d ms" % timeout)
         now += timeout
     else:
-        print "  no timeout"
+        print("  no timeout")
 
 
 def do_set_max_tries(arg):
     r.set_max_tries(int(arg))
+
+
+def do_set_backoff_free_tries(arg):
+    r.set_backoff_free_tries(int(arg))
 
 
 def diff_stats(old, new, delta):
@@ -130,7 +134,7 @@ def diff_stats(old, new, delta):
         print("  %sconnected" % negate)
 
     if (old.last_connected != new.last_connected or
-        (new.msec_since_connect != None and
+        (new.msec_since_connect is not None and
          old.msec_since_connect != new.msec_since_connect - delta) or
         (old.total_connected_duration != new.total_connected_duration - delta
             and not (old.total_connected_duration == 0 and
@@ -139,7 +143,7 @@ def diff_stats(old, new, delta):
               % (new.msec_since_connect, new.total_connected_duration))
 
     if (old.last_disconnected != new.last_disconnected or
-        (new.msec_since_disconnect != None and
+        (new.msec_since_disconnect is not None and
          old.msec_since_disconnect != new.msec_since_disconnect - delta)):
         print("  disconnected at %d ms (%d ms ago)"
               % (new.last_disconnected, new.msec_since_disconnect))
@@ -157,6 +161,16 @@ def do_listen_error(arg):
     r.listen_error(now, int(arg))
 
 
+def do_receive_attempted(arg):
+    if arg == "now":
+        r.receive_attempted(now)
+    elif arg == "LLONG_MAX":
+        r.receive_attempted(None)
+    else:
+        sys.stderr.write("receive-attempted: bad argument %s\n" % arg)
+        sys.exit(1)
+
+
 def main():
     commands = {
         "enable": do_enable,
@@ -171,9 +185,11 @@ def main():
         "advance": do_advance,
         "timeout": do_timeout,
         "set-max-tries": do_set_max_tries,
+        "set-backoff-free-tries": do_set_backoff_free_tries,
         "passive": do_set_passive,
         "listening": do_listening,
-        "listen-error": do_listen_error
+        "listen-error": do_listen_error,
+        "receive-attempted": do_receive_attempted
     }
 
     global now
@@ -183,7 +199,7 @@ def main():
     r = ovs.reconnect.Reconnect(now)
     r.set_name("remote")
     prev = r.get_stats(now)
-    print "### t=%d ###" % now
+    print("### t=%d ###" % now)
     old_time = now
     old_max_tries = r.get_max_tries()
     while True:
@@ -191,7 +207,7 @@ def main():
         if line == "":
             break
 
-        print line[:-1]
+        print(line[:-1])
         if line[0] == "#":
             continue
 
@@ -207,15 +223,15 @@ def main():
         commands[command](op)
 
         if old_time != now:
-            print
-            print "### t=%d ###" % now
+            print()
+            print("### t=%d ###" % now)
 
         cur = r.get_stats(now)
         diff_stats(prev, cur, now - old_time)
         prev = cur
         if r.get_max_tries() != old_max_tries:
             old_max_tries = r.get_max_tries()
-            print "  %d tries left" % old_max_tries
+            print("  %d tries left" % old_max_tries)
 
         old_time = now
 

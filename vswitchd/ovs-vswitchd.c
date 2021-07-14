@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+/* Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,7 +37,10 @@
 #include "netdev.h"
 #include "openflow/openflow.h"
 #include "ovsdb-idl.h"
-#include "poll-loop.h"
+#include "ovs-rcu.h"
+#include "ovs-router.h"
+#include "ovs-thread.h"
+#include "openvswitch/poll-loop.h"
 #include "simap.h"
 #include "stream-ssl.h"
 #include "stream.h"
@@ -48,7 +51,7 @@
 #include "openvswitch/vconn.h"
 #include "openvswitch/vlog.h"
 #include "lib/vswitch-idl.h"
-#include "lib/netdev-dpdk.h"
+#include "lib/dns-resolve.h"
 
 VLOG_DEFINE_THIS_MODULE(vswitchd);
 
@@ -61,29 +64,29 @@ static unixctl_cb_func ovs_vswitchd_exit;
 static char *parse_options(int argc, char *argv[], char **unixctl_path);
 OVS_NO_RETURN static void usage(void);
 
+struct ovs_vswitchd_exit_args {
+    bool *exiting;
+    bool *cleanup;
+};
+
 int
 main(int argc, char *argv[])
 {
     char *unixctl_path = NULL;
     struct unixctl_server *unixctl;
     char *remote;
-    bool exiting;
+    bool exiting, cleanup;
+    struct ovs_vswitchd_exit_args exit_args = {&exiting, &cleanup};
     int retval;
 
     set_program_name(argv[0]);
-    retval = dpdk_init(argc,argv);
-    if (retval < 0) {
-        return retval;
-    }
+    ovsthread_id_init();
 
-    argc -= retval;
-    argv += retval;
-
+    dns_resolve_init(true);
     ovs_cmdl_proctitle_init(argc, argv);
     service_start(&argc, &argv);
     remote = parse_options(argc, argv, &unixctl_path);
     fatal_ignore_sigpipe();
-    ovsrec_init();
 
     daemonize_start(true);
 
@@ -91,6 +94,8 @@ main(int argc, char *argv[])
 #ifdef HAVE_MLOCKALL
         if (mlockall(MCL_CURRENT | MCL_FUTURE)) {
             VLOG_ERR("mlockall failed: %s", ovs_strerror(errno));
+        } else {
+            set_memory_locked();
         }
 #else
         VLOG_ERR("mlockall not supported on this system");
@@ -101,12 +106,14 @@ main(int argc, char *argv[])
     if (retval) {
         exit(EXIT_FAILURE);
     }
-    unixctl_command_register("exit", "", 0, 0, ovs_vswitchd_exit, &exiting);
+    unixctl_command_register("exit", "[--cleanup]", 0, 1,
+                             ovs_vswitchd_exit, &exit_args);
 
     bridge_init(remote);
     free(remote);
 
     exiting = false;
+    cleanup = false;
     while (!exiting) {
         memory_run();
         if (memory_should_report()) {
@@ -133,9 +140,12 @@ main(int argc, char *argv[])
             exiting = true;
         }
     }
-    bridge_exit();
+    bridge_exit(cleanup);
     unixctl_server_destroy(unixctl);
     service_stop();
+    vlog_disable_async();
+    ovsrcu_exit();
+    dns_resolve_destroy();
 
     return 0;
 }
@@ -151,8 +161,11 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
         OPT_BOOTSTRAP_CA_CERT,
         OPT_ENABLE_DUMMY,
         OPT_DISABLE_SYSTEM,
+        OPT_DISABLE_SYSTEM_ROUTE,
         DAEMON_OPTION_ENUMS,
         OPT_DPDK,
+        SSL_OPTION_ENUMS,
+        OPT_DUMMY_NUMA,
     };
     static const struct option long_options[] = {
         {"help",        no_argument, NULL, 'h'},
@@ -166,7 +179,9 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
         {"bootstrap-ca-cert", required_argument, NULL, OPT_BOOTSTRAP_CA_CERT},
         {"enable-dummy", optional_argument, NULL, OPT_ENABLE_DUMMY},
         {"disable-system", no_argument, NULL, OPT_DISABLE_SYSTEM},
-        {"dpdk", required_argument, NULL, OPT_DPDK},
+        {"disable-system-route", no_argument, NULL, OPT_DISABLE_SYSTEM_ROUTE},
+        {"dpdk", optional_argument, NULL, OPT_DPDK},
+        {"dummy-numa", required_argument, NULL, OPT_DUMMY_NUMA},
         {NULL, 0, NULL, 0},
     };
     char *short_options = ovs_cmdl_long_options_to_short_options(long_options);
@@ -185,6 +200,7 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
 
         case 'V':
             ovs_print_version(0, 0);
+            print_dpdk_version();
             exit(EXIT_SUCCESS);
 
         case OPT_MLOCKALL:
@@ -212,14 +228,22 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
             break;
 
         case OPT_DISABLE_SYSTEM:
-            dp_blacklist_provider("system");
+            dp_disallow_provider("system");
+            break;
+
+        case OPT_DISABLE_SYSTEM_ROUTE:
+            ovs_router_disable_system_routing_table();
             break;
 
         case '?':
             exit(EXIT_FAILURE);
 
         case OPT_DPDK:
-            ovs_fatal(0, "--dpdk must be given at beginning of command line.");
+            ovs_fatal(0, "Using --dpdk to configure DPDK is not supported.");
+            break;
+
+        case OPT_DUMMY_NUMA:
+            ovs_numa_set_dummy(optarg);
             break;
 
         default:
@@ -256,18 +280,9 @@ usage(void)
     daemon_usage();
     vlog_usage();
     printf("\nDPDK options:\n"
-           "  --dpdk [VHOST] [DPDK]     Initialize DPDK datapath.\n"
-           "  where DPDK are options for initializing DPDK lib and VHOST is\n"
-#ifdef VHOST_CUSE
-           "  option to override default character device name used for\n"
-           "  for use with userspace vHost\n"
-           "    -cuse_dev_name NAME\n"
-#else
-           "  option to override default directory where vhost-user\n"
-           "  sockets are created.\n"
-           "    -vhost_sock_dir DIR\n"
-#endif
-           );
+           "Configuration of DPDK via command-line is removed from this\n"
+           "version of Open vSwitch. DPDK is configured through ovsdb.\n"
+          );
     printf("\nOther options:\n"
            "  --unixctl=SOCKET          override default control socket name\n"
            "  -h, --help                display this help message\n"
@@ -276,10 +291,11 @@ usage(void)
 }
 
 static void
-ovs_vswitchd_exit(struct unixctl_conn *conn, int argc OVS_UNUSED,
-                  const char *argv[] OVS_UNUSED, void *exiting_)
+ovs_vswitchd_exit(struct unixctl_conn *conn, int argc,
+                  const char *argv[], void *exit_args_)
 {
-    bool *exiting = exiting_;
-    *exiting = true;
+    struct ovs_vswitchd_exit_args *exit_args = exit_args_;
+    *exit_args->exiting = true;
+    *exit_args->cleanup = argc == 2 && !strcmp(argv[1], "--cleanup");
     unixctl_command_reply(conn, NULL);
 }

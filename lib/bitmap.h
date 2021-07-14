@@ -21,8 +21,6 @@
 #include <stdlib.h>
 #include "util.h"
 
-#define BITMAP_ULONG_BITS (sizeof(unsigned long) * CHAR_BIT)
-
 static inline unsigned long *
 bitmap_unit__(const unsigned long *bitmap, size_t offset)
 {
@@ -34,8 +32,6 @@ bitmap_bit__(size_t offset)
 {
     return 1UL << (offset % BITMAP_ULONG_BITS);
 }
-
-#define BITMAP_N_LONGS(N_BITS) DIV_ROUND_UP(N_BITS, BITMAP_ULONG_BITS)
 
 static inline size_t
 bitmap_n_longs(size_t n_bits)
@@ -65,7 +61,7 @@ bitmap_init1(unsigned long *bitmap, size_t n_bits)
 
     memset(bitmap, 0xff, n_bytes);
     if (r_bits) {
-        bitmap[n_longs - 1] >>= BITMAP_ULONG_BITS - r_bits;
+        bitmap[n_longs - 1] = (1UL << r_bits) - 1;
     }
     return bitmap;
 }
@@ -253,6 +249,21 @@ found:
         }
     }
     return end;
+}
+
+/* Returns true if the 1-bits in 'super' are a superset of the 1-bits in 'sub',
+ * false otherwise.  'super' and 'sub' both have 'n_bits' bits. */
+static inline bool
+bitmap_is_superset(const unsigned long int *super,
+                   const unsigned long int *sub, size_t n_bits)
+{
+    size_t n_longs = bitmap_n_longs(n_bits);
+    for (size_t i = 0; i < n_longs; i++) {
+        if (!uint_is_superset(super[i], sub[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Returns true if all of the 'n' bits in 'bitmap' are 0,

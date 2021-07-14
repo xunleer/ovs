@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 Nicira, Inc.
+ * Copyright (c) 2014, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,10 +26,12 @@
 /* Concurrent Priority Vector
  * ==========================
  *
- * Concurrent priority vector holds non-NULL pointers to objects in an
- * increasing priority order and allows readers to traverse the vector without
- * being concerned about writers modifying the vector as they are traversing
- * it.
+ * Concurrent priority vector holds non-NULL pointers to objects in a
+ * nondecreasing priority order and allows readers to traverse the vector
+ * without being concerned about writers modifying the vector as they are
+ * traversing it.
+ *
+ * Multiple elements of a given priority are allowed.
  *
  * The priority order is maintained as a linear vector of elements to allow
  * for efficient memory prefetching.
@@ -55,7 +57,12 @@
  * sorted before it is published at 'impl', which also removes the NULLs from
  * the published vector.
  *
- * Clients should not use priority INT_MIN.
+ * Since the vector is RCU protected, the entry destruction after removal must
+ * be RCU postponed.  Also, if it happens before changes published with
+ * pvector_publish(), destruction must be double postponed, i.e., the second
+ * ovsrcu_postpone() call to destruct the entry should be called from the first
+ * RCU callback.  This is required because readers could still obtain the
+ * unmodified vector until updated version is published.
  */
 
 struct pvector_entry {
@@ -63,13 +70,9 @@ struct pvector_entry {
     void *ptr;
 };
 
-/* Writers will preallocate space for some entries at the end to avoid future
- * reallocations. */
-enum { PVECTOR_EXTRA_ALLOC = 4 };
-
 struct pvector_impl {
-    size_t size;       /* Number of entries in the vector. */
-    size_t allocated;  /* Number of allocated entries. */
+    atomic_size_t size;   /* Number of entries in the vector. */
+    size_t allocated;     /* Number of allocated entries. */
     struct pvector_entry vector[];
 };
 
@@ -133,7 +136,7 @@ static inline bool pvector_is_empty(const struct pvector *);
  * has to be started.
  *
  * The PVECTOR_FOR_EACH_PRIORITY limits the iteration to entries with higher
- * than given priority and allows for object lookahead.
+ * than or equal to the given priority and allows for object lookahead.
  *
  * The iteration loop must be completed without entering the OVS RCU quiescent
  * period.  That is, an old iteration loop must not be continued after any
@@ -149,7 +152,7 @@ static inline struct pvector_cursor pvector_cursor_init(const struct pvector *,
                                                         size_t n_ahead,
                                                         size_t obj_size);
 static inline void *pvector_cursor_next(struct pvector_cursor *,
-                                        int stop_at_priority,
+                                        int lowest_priority,
                                         size_t n_ahead, size_t obj_size);
 static inline void pvector_cursor_lookahead(const struct pvector_cursor *,
                                             int n, size_t size);
@@ -158,8 +161,8 @@ static inline void pvector_cursor_lookahead(const struct pvector_cursor *,
     for (struct pvector_cursor cursor__ = pvector_cursor_init(PVECTOR, 0, 0); \
          ((PTR) = pvector_cursor_next(&cursor__, INT_MIN, 0, 0)) != NULL; )
 
-/* Loop while priority is higher than 'PRIORITY' and prefetch objects
- * of size 'SZ' 'N' objects ahead from the current object. */
+/* Loop while priority is higher than or equal to 'PRIORITY' and prefetch
+ * objects of size 'SZ' 'N' objects ahead from the current object. */
 #define PVECTOR_FOR_EACH_PRIORITY(PTR, PRIORITY, N, SZ, PVECTOR)        \
     for (struct pvector_cursor cursor__ = pvector_cursor_init(PVECTOR, N, SZ); \
          ((PTR) = pvector_cursor_next(&cursor__, PRIORITY, N, SZ)) != NULL; )
@@ -180,12 +183,17 @@ pvector_cursor_init(const struct pvector *pvec,
 {
     const struct pvector_impl *impl;
     struct pvector_cursor cursor;
+    size_t size;
 
     impl = ovsrcu_get(struct pvector_impl *, &pvec->impl);
 
-    ovs_prefetch_range(impl->vector, impl->size * sizeof impl->vector[0]);
+    /* Use memory_order_acquire to ensure entry access can not be
+     * reordered to happen before size read. */
+    atomic_read_explicit(&CONST_CAST(struct pvector_impl *, impl)->size,
+                         &size, memory_order_acquire);
+    ovs_prefetch_range(impl->vector, size * sizeof impl->vector[0]);
 
-    cursor.size = impl->size;
+    cursor.size = size;
     cursor.vector = impl->vector;
     cursor.entry_idx = -1;
 
@@ -197,11 +205,11 @@ pvector_cursor_init(const struct pvector *pvec,
 }
 
 static inline void *pvector_cursor_next(struct pvector_cursor *cursor,
-                                        int stop_at_priority,
+                                        int lowest_priority,
                                         size_t n_ahead, size_t obj_size)
 {
     if (++cursor->entry_idx < cursor->size &&
-        cursor->vector[cursor->entry_idx].priority > stop_at_priority) {
+        cursor->vector[cursor->entry_idx].priority >= lowest_priority) {
         if (n_ahead) {
             pvector_cursor_lookahead(cursor, n_ahead, obj_size);
         }

@@ -1,4 +1,4 @@
-#! @PYTHON@
+#! @PYTHON3@
 #
 # Copyright (c) 2010 Nicira, Inc.
 #
@@ -20,8 +20,9 @@ import sys
 
 argv0 = sys.argv[0]
 
+
 def usage():
-    print """\
+    print("""\
 %(argv0)s: print "tcpdump -xx" output as hex
 usage: %(argv0)s < FILE
 where FILE is output from "tcpdump -xx".
@@ -29,14 +30,15 @@ where FILE is output from "tcpdump -xx".
 The following options are also available:
   -h, --help                  display this help message
   -V, --version               display version information\
-""" % {'argv0': argv0}
+""" % {'argv0': argv0})
     sys.exit(0)
+
 
 if __name__ == "__main__":
     try:
         options, args = getopt.gnu_getopt(sys.argv[1:], 'hV',
                                           ['help', 'version'])
-    except getopt.GetoptError, geo:
+    except getopt.GetoptError as geo:
         sys.stderr.write("%s: %s\n" % (argv0, geo.msg))
         sys.exit(1)
 
@@ -44,7 +46,8 @@ if __name__ == "__main__":
         if key in ['-h', '--help']:
             usage()
         elif key in ['-V', '--version']:
-            print "ovs-tcpundump (Open vSwitch) @VERSION@"
+            print("ovs-tcpundump (Open vSwitch) @VERSION@")
+            sys.exit(0)
         else:
             sys.exit(0)
 
@@ -54,21 +57,21 @@ if __name__ == "__main__":
         sys.exit(1)
 
     packet = ''
-    regex = re.compile(r'^\s+0x([0-9a-fA-F]+): ((?: [0-9a-fA-F]{4})+)')
+    regex = re.compile(r'^\s+0x([0-9a-fA-F]+): ((?: [0-9a-fA-F]{2,4})+)')
     while True:
         line = sys.stdin.readline()
         if line == "":
             break
 
         m = regex.match(line)
-        if m is None or int(m.group(1)) == 0:
+        if m is None or int(m.group(1), 16) == 0:
             if packet != '':
-                print packet
+                print(packet)
             packet = ''
         if m:
             packet += re.sub(r'\s', '', m.group(2), 0)
     if packet != '':
-        print packet
+        print(packet)
 
 # Local variables:
 # mode: python

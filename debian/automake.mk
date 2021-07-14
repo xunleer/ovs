@@ -7,6 +7,8 @@ EXTRA_DIST += \
 	debian/copyright.in \
 	debian/dkms.conf.in \
 	debian/dirs \
+	debian/libopenvswitch.install \
+	debian/libopenvswitch-dev.install \
 	debian/openvswitch-common.dirs \
 	debian/openvswitch-common.docs \
 	debian/openvswitch-common.install \
@@ -50,9 +52,8 @@ EXTRA_DIST += \
 	debian/openvswitch-vtep.init \
 	debian/openvswitch-vtep.install \
 	debian/openvswitch-vtep.manpages \
-	debian/ovs-monitor-ipsec \
-	debian/python-openvswitch.dirs \
-	debian/python-openvswitch.install \
+	debian/python3-openvswitch.dirs \
+	debian/python3-openvswitch.install \
 	debian/rules \
 	debian/rules.modules \
 	debian/ifupdown.sh \
@@ -70,12 +71,12 @@ check-debian-changelog-version:
 ALL_LOCAL += check-debian-changelog-version
 DIST_HOOKS += check-debian-changelog-version
 
-$(srcdir)/debian/copyright: AUTHORS debian/copyright.in
+$(srcdir)/debian/copyright: AUTHORS.rst debian/copyright.in
 	$(AM_V_GEN) \
 	{ sed -n -e '/%AUTHORS%/q' -e p < $(srcdir)/debian/copyright.in;   \
-	  sed '1,/^$$/d' $(srcdir)/AUTHORS |				   \
+	  sed '34,/^$$/d' $(srcdir)/AUTHORS.rst |			   \
 		sed -n -e '/^$$/q' -e 's/^/  /p';			   \
-	  sed -e '1,/%AUTHORS%/d' $(srcdir)/debian/copyright.in;	   \
+	  sed -e '34,/%AUTHORS%/d' $(srcdir)/debian/copyright.in;	   \
 	} > $@
 
-DISTCLEANFILES += debian/copyright
+CLEANFILES += debian/copyright

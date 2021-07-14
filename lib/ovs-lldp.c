@@ -28,21 +28,21 @@
 
 #include <config.h>
 #include "ovs-lldp.h"
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <inttypes.h>
-#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <sys/types.h>
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "flow.h"
-#include "list.h"
+#include "openvswitch/list.h"
 #include "lldp/lldpd.h"
 #include "lldp/lldpd-structs.h"
 #include "netdev.h"
 #include "openvswitch/types.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "smap.h"
 #include "unixctl.h"
 #include "util.h"
@@ -180,16 +180,16 @@ aa_print_lldp_and_aa_stats(struct ds *ds, struct lldp *lldp)
     }
 
     LIST_FOR_EACH (hw, h_entries, &lldp->lldpd->g_hardware) {
-        ds_put_format(ds, "\ttx cnt: %"PRIu64"\n", hw->h_tx_cnt);
-        ds_put_format(ds, "\trx cnt: %"PRIu64"\n", hw->h_rx_cnt);
-        ds_put_format(ds, "\trx discarded cnt: %"PRIu64"\n",
+        ds_put_format(ds, "  tx cnt: %"PRIu64"\n", hw->h_tx_cnt);
+        ds_put_format(ds, "  rx cnt: %"PRIu64"\n", hw->h_rx_cnt);
+        ds_put_format(ds, "  rx discarded cnt: %"PRIu64"\n",
                       hw->h_rx_discarded_cnt);
-        ds_put_format(ds, "\trx unrecognized cnt: %"PRIu64"\n",
+        ds_put_format(ds, "  rx unrecognized cnt: %"PRIu64"\n",
                       hw->h_rx_unrecognized_cnt);
-        ds_put_format(ds, "\tageout cnt: %"PRIu64"\n", hw->h_ageout_cnt);
-        ds_put_format(ds, "\tinsert cnt: %"PRIu64"\n", hw->h_insert_cnt);
-        ds_put_format(ds, "\tdelete cnt: %"PRIu64"\n", hw->h_delete_cnt);
-        ds_put_format(ds, "\tdrop cnt: %"PRIu64"\n", hw->h_drop_cnt);
+        ds_put_format(ds, "  ageout cnt: %"PRIu64"\n", hw->h_ageout_cnt);
+        ds_put_format(ds, "  insert cnt: %"PRIu64"\n", hw->h_insert_cnt);
+        ds_put_format(ds, "  delete cnt: %"PRIu64"\n", hw->h_delete_cnt);
+        ds_put_format(ds, "  drop cnt: %"PRIu64"\n", hw->h_drop_cnt);
     }
 }
 
@@ -219,11 +219,11 @@ aa_print_element_status_port(struct ds *ds, struct lldpd_hardware *hw)
             chassisid_to_string((uint8_t *) &port->p_element.system_id,
                 sizeof port->p_element.system_id, &system);
 
-            ds_put_format(ds, "\tAuto Attach Primary Server Id: %s\n",
+            ds_put_format(ds, "  Auto Attach Primary Server Id: %s\n",
                           id ? id : none_str);
-            ds_put_format(ds, "\tAuto Attach Primary Server Descr: %s\n",
+            ds_put_format(ds, "  Auto Attach Primary Server Descr: %s\n",
                           descr ? descr : none_str);
-            ds_put_format(ds, "\tAuto Attach Primary Server System Id: %s\n",
+            ds_put_format(ds, "  Auto Attach Primary Server System Id: %s\n",
                           system);
 
             free(id);
@@ -257,7 +257,7 @@ aa_print_isid_status_port_isid(struct lldp *lldp, struct lldpd_port *port)
 {
     struct lldpd_aa_isid_vlan_maps_tlv *mapping;
 
-    if (list_is_empty(&port->p_isid_vlan_maps)) {
+    if (ovs_list_is_empty(&port->p_isid_vlan_maps)) {
         return;
     }
 
@@ -391,12 +391,12 @@ update_mapping_on_lldp(struct lldp *lldp, struct lldpd_hardware *hardware,
 {
     struct lldpd_aa_isid_vlan_maps_tlv *lm = xzalloc(sizeof *lm);
 
-    VLOG_INFO("\t\t hardware->h_ifname=%s", hardware->h_ifname);
+    VLOG_INFO("     hardware->h_ifname=%s", hardware->h_ifname);
 
     lm->isid_vlan_data.isid = m->isid;
     lm->isid_vlan_data.vlan = m->vlan;
 
-    list_push_back(&hardware->h_lport.p_isid_vlan_maps, &lm->m_entries);
+    ovs_list_push_back(&hardware->h_lport.p_isid_vlan_maps, &lm->m_entries);
 
     /* TODO Should be done in the Auto Attach state machine when a mapping goes
      * from "pending" to "active".
@@ -407,7 +407,7 @@ update_mapping_on_lldp(struct lldp *lldp, struct lldpd_hardware *hardware,
     node->vlan = m->vlan;
     node->oper = BRIDGE_AA_VLAN_OPER_ADD;
 
-    list_push_back(&lldp->active_mapping_queue, &node->list_node);
+    ovs_list_push_back(&lldp->active_mapping_queue, &node->list_node);
 }
 
 /* Bridge will poll the list of VLAN that needs to be auto configure based on
@@ -431,7 +431,7 @@ aa_get_vlan_queued(struct ovs_list *list)
             copy->vlan = node->vlan;
             copy->oper = node->oper;
 
-            list_push_back(list, &copy->list_node);
+            ovs_list_push_back(list, &copy->list_node);
 
             /* Cleanup */
             free(node->port_name);
@@ -455,7 +455,7 @@ aa_get_vlan_queue_size(void)
     ovs_mutex_lock(&mutex);
 
     HMAP_FOR_EACH (lldp, hmap_node, all_lldps) {
-        size += list_size(&lldp->active_mapping_queue);
+        size += ovs_list_size(&lldp->active_mapping_queue);
     }
 
     ovs_mutex_unlock(&mutex);
@@ -526,7 +526,7 @@ aa_mapping_register(void *aux, const struct aa_mapping_settings *s)
         struct lldpd_hardware *hw;
         struct aa_mapping_internal *m;
 
-        VLOG_INFO("\t lldp->name=%s", lldp->name);
+        VLOG_INFO("   lldp->name=%s", lldp->name);
 
         if (mapping_find_by_isid(lldp, s->isid)) {
             continue;
@@ -566,11 +566,11 @@ aa_mapping_unregister_mapping(struct lldp *lldp,
         uint32_t isid = lm->isid_vlan_data.isid;
 
         if (isid == m->isid) {
-            VLOG_INFO("\t\t Removing lport, isid=%u, vlan=%u",
+            VLOG_INFO("     Removing lport, isid=%u, vlan=%u",
                       isid,
                       lm->isid_vlan_data.vlan);
 
-            list_remove(&lm->m_entries);
+            ovs_list_remove(&lm->m_entries);
 
             /* TODO Should be done in the AA SM when a mapping goes
              * from "pending" to "active".
@@ -581,7 +581,7 @@ aa_mapping_unregister_mapping(struct lldp *lldp,
             node->vlan = m->vlan;
             node->oper = BRIDGE_AA_VLAN_OPER_REMOVE;
 
-            list_push_back(&lldp->active_mapping_queue, &node->list_node);
+            ovs_list_push_back(&lldp->active_mapping_queue, &node->list_node);
 
             break;
         }
@@ -609,7 +609,7 @@ aa_mapping_unregister(void *aux)
             uint16_t vlan = m->vlan;
             struct aa_mapping_internal *p = mapping_find_by_isid(lldp, isid);
 
-            VLOG_INFO("\t Removing mapping ISID=%"PRIu32", VLAN=%"PRIu16
+            VLOG_INFO("   Removing mapping ISID=%"PRIu32", VLAN=%"PRIu16
                       " (lldp->name=%s)", isid, vlan, lldp->name);
 
             if (p) {
@@ -620,7 +620,7 @@ aa_mapping_unregister(void *aux)
 
             /* Remove from all the lldp instances */
             LIST_FOR_EACH (hw, h_entries, &lldp->lldpd->g_hardware) {
-                VLOG_INFO("\t\t hardware->h_ifname=%s", hw->h_ifname);
+                VLOG_INFO("     hardware->h_ifname=%s", hw->h_ifname);
                 aa_mapping_unregister_mapping(lldp, hw, m);
             }
             free(m);
@@ -726,8 +726,7 @@ lldp_put_packet(struct lldp *lldp, struct dp_packet *packet,
 {
     struct lldpd *mylldpd = lldp->lldpd;
     struct lldpd_hardware *hw = lldpd_first_hardware(mylldpd);
-    static const struct eth_addr eth_addr_lldp =
-        { { { 0x01, 0x80, 0xC2, 0x00, 0x00, 0x0e } } };
+    static const struct eth_addr eth_addr_lldp = ETH_ADDR_C(01,80,c2,00,00,0e);
 
     ovs_mutex_lock(&mutex);
 
@@ -784,7 +783,7 @@ lldp_create(const struct netdev *netdev,
 
     hmap_init(&lldp->mappings_by_isid);
     hmap_init(&lldp->mappings_by_aux);
-    list_init(&lldp->active_mapping_queue);
+    ovs_list_init(&lldp->active_mapping_queue);
 
     lchassis = xzalloc(sizeof *lchassis);
     lchassis->c_cap_available = LLDP_CAP_BRIDGE;
@@ -796,21 +795,13 @@ lldp_create(const struct netdev *netdev,
     netdev_get_etheraddr(netdev, mac);
     lchassis->c_id = &mac->ea[0];
 
-    list_init(&lchassis->c_mgmt);
-    lchassis->c_ttl = lldp->lldpd->g_config.c_tx_interval *
-                      lldp->lldpd->g_config.c_tx_hold;
+    ovs_list_init(&lchassis->c_mgmt);
     lchassis->c_ttl = LLDP_CHASSIS_TTL;
     lldpd_assign_cfg_to_protocols(lldp->lldpd);
-    list_init(&lldp->lldpd->g_chassis);
-    list_push_back(&lldp->lldpd->g_chassis, &lchassis->list);
+    ovs_list_init(&lldp->lldpd->g_chassis);
+    ovs_list_push_back(&lldp->lldpd->g_chassis, &lchassis->list);
 
-    if ((hw = lldpd_alloc_hardware(lldp->lldpd,
-                                   (char *) netdev_get_name(netdev),
-                                   0)) == NULL) {
-        VLOG_WARN("Unable to allocate space for %s",
-                  (char *) netdev_get_name(netdev));
-        out_of_memory();
-    }
+    hw = lldpd_alloc_hardware(lldp->lldpd, netdev_get_name(netdev), 0);
 
     ovs_refcount_init(&lldp->ref_cnt);
 #ifndef _WIN32
@@ -834,9 +825,9 @@ lldp_create(const struct netdev *netdev,
     hw->h_lport.p_element.system_id.rsvd2[0] = 0;
     hw->h_lport.p_element.system_id.rsvd2[1] = 0;
 
-    list_init(&hw->h_lport.p_isid_vlan_maps);
-    list_init(&lldp->lldpd->g_hardware);
-    list_push_back(&lldp->lldpd->g_hardware, &hw->h_entries);
+    ovs_list_init(&hw->h_lport.p_isid_vlan_maps);
+    ovs_list_init(&lldp->lldpd->g_hardware);
+    ovs_list_push_back(&lldp->lldpd->g_hardware, &hw->h_entries);
 
     ovs_mutex_lock(&mutex);
 
@@ -880,20 +871,19 @@ lldp_create_dummy(void)
 
     hmap_init(&lldp->mappings_by_isid);
     hmap_init(&lldp->mappings_by_aux);
-    list_init(&lldp->active_mapping_queue);
+    ovs_list_init(&lldp->active_mapping_queue);
 
     lchassis = xzalloc(sizeof *lchassis);
     lchassis->c_cap_available = LLDP_CAP_BRIDGE;
     lchassis->c_cap_enabled = LLDP_CAP_BRIDGE;
     lchassis->c_id_subtype = LLDP_CHASSISID_SUBTYPE_LLADDR;
     lchassis->c_id_len = ETH_ADDR_LEN;
-    lchassis->c_id = xmalloc(ETH_ADDR_LEN);
 
-    list_init(&lchassis->c_mgmt);
+    ovs_list_init(&lchassis->c_mgmt);
     lchassis->c_ttl = LLDP_CHASSIS_TTL;
     lldpd_assign_cfg_to_protocols(lldp->lldpd);
-    list_init(&lldp->lldpd->g_chassis);
-    list_push_back(&lldp->lldpd->g_chassis, &lchassis->list);
+    ovs_list_init(&lldp->lldpd->g_chassis);
+    ovs_list_push_back(&lldp->lldpd->g_chassis, &lchassis->list);
 
     hw = lldpd_alloc_hardware(lldp->lldpd, "dummy-hw", 0);
 
@@ -911,17 +901,15 @@ lldp_create_dummy(void)
     /* Auto Attach element tlv */
     hw->h_lport.p_element.type = LLDP_TLV_AA_ELEM_TYPE_CLIENT_VIRTUAL_SWITCH;
     hw->h_lport.p_element.mgmt_vlan = 0;
-    memcpy(&hw->h_lport.p_element.system_id.system_mac,
-           lchassis->c_id, lchassis->c_id_len);
     hw->h_lport.p_element.system_id.conn_type =
         LLDP_TLV_AA_ELEM_CONN_TYPE_SINGLE;
     hw->h_lport.p_element.system_id.rsvd = 0;
     hw->h_lport.p_element.system_id.rsvd2[0] = 0;
     hw->h_lport.p_element.system_id.rsvd2[1] = 0;
 
-    list_init(&hw->h_lport.p_isid_vlan_maps);
-    list_init(&lldp->lldpd->g_hardware);
-    list_push_back(&lldp->lldpd->g_hardware, &hw->h_entries);
+    ovs_list_init(&hw->h_lport.p_isid_vlan_maps);
+    ovs_list_init(&lldp->lldpd->g_hardware);
+    ovs_list_push_back(&lldp->lldpd->g_hardware, &hw->h_entries);
 
     return lldp;
 }
@@ -950,7 +938,7 @@ lldp_unref(struct lldp *lldp)
     free(lldp);
 }
 
-/* Unreference a specific LLDP instance.
+/* Reference a specific LLDP instance.
  */
 struct lldp *
 lldp_ref(const struct lldp *lldp_)
@@ -961,3 +949,32 @@ lldp_ref(const struct lldp *lldp_)
     }
     return lldp;
 }
+
+void
+lldp_destroy_dummy(struct lldp *lldp)
+{
+    struct lldpd_hardware *hw, *hw_next;
+    struct lldpd_chassis *chassis, *chassis_next;
+    struct lldpd *cfg;
+
+    if (!lldp) {
+        return;
+    }
+
+    cfg = lldp->lldpd;
+
+    LIST_FOR_EACH_SAFE (hw, hw_next, h_entries, &cfg->g_hardware) {
+        ovs_list_remove(&hw->h_entries);
+        free(hw->h_lport.p_lastframe);
+        free(hw);
+    }
+
+    LIST_FOR_EACH_SAFE (chassis, chassis_next, list, &cfg->g_chassis) {
+        ovs_list_remove(&chassis->list);
+        free(chassis);
+    }
+
+    free(lldp->lldpd);
+    free(lldp);
+}
+

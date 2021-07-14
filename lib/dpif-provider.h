@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2009-2014, 2018 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,7 +39,11 @@ struct dpif {
     char *full_name;
     uint8_t netflow_engine_type;
     uint8_t netflow_engine_id;
+    long long int current_ms;
 };
+
+struct dpif_ipf_status;
+struct ipf_dump_ctx;
 
 void dpif_init(struct dpif *, const struct dpif_class *, const char *name,
                uint8_t netflow_engine_type, uint8_t netflow_engine_id);
@@ -73,6 +77,33 @@ dpif_flow_dump_thread_init(struct dpif_flow_dump_thread *thread,
     thread->dpif = dump->dpif;
 }
 
+struct ct_dpif_dump_state;
+struct ct_dpif_entry;
+struct ct_dpif_tuple;
+struct ct_dpif_timeout_policy;
+enum ct_features;
+
+/* 'dpif_ipf_proto_status' and 'dpif_ipf_status' are presently in
+ * sync with 'ipf_proto_status' and 'ipf_status', but more
+ * generally represent a superset of present and future support. */
+struct dpif_ipf_proto_status {
+   uint64_t nfrag_accepted;
+   uint64_t nfrag_completed_sent;
+   uint64_t nfrag_expired_sent;
+   uint64_t nfrag_too_small;
+   uint64_t nfrag_overlap;
+   uint64_t nfrag_purged;
+   unsigned int min_frag_size;
+   bool enabled;
+};
+
+struct dpif_ipf_status {
+   struct dpif_ipf_proto_status v4;
+   struct dpif_ipf_proto_status v6;
+   unsigned int nfrag;
+   unsigned int nfrag_max;
+};
+
 /* Datapath interface class structure, to be defined by each implementation of
  * a datapath interface.
  *
@@ -89,6 +120,12 @@ struct dpif_class {
      * One of the providers should supply a "system" type, since this is
      * the type assumed if no type is specified when opening a dpif. */
     const char *type;
+
+    /* If 'true', datapath ports should be destroyed on ofproto destruction.
+     *
+     * This is used by the vswitch at exit, so that it can clean any
+     * datapaths that can not exist without it (e.g. netdev datapath).  */
+    bool cleanup_required;
 
     /* Called when the dpif provider is registered, typically at program
      * startup.  Returning an error from this function will prevent any
@@ -152,8 +189,10 @@ struct dpif_class {
     /* Retrieves statistics for 'dpif' into 'stats'. */
     int (*get_stats)(const struct dpif *dpif, struct dpif_dp_stats *stats);
 
+    int (*set_features)(struct dpif *dpif, uint32_t user_features);
+
     /* Adds 'netdev' as a new port in 'dpif'.  If '*port_no' is not
-     * UINT32_MAX, attempts to use that as the port's port number.
+     * ODPP_NONE, attempts to use that as the port's port number.
      *
      * If port is successfully added, sets '*port_no' to the new port's
      * port number.  Returns EBUSY if caller attempted to choose a port
@@ -164,9 +203,18 @@ struct dpif_class {
     /* Removes port numbered 'port_no' from 'dpif'. */
     int (*port_del)(struct dpif *dpif, odp_port_t port_no);
 
+    /* Refreshes configuration of 'dpif's port. The implementation might
+     * postpone applying the changes until run() is called. */
+    int (*port_set_config)(struct dpif *dpif, odp_port_t port_no,
+                           const struct smap *cfg);
+
     /* Queries 'dpif' for a port with the given 'port_no' or 'devname'.
      * If 'port' is not null, stores information about the port into
      * '*port' if successful.
+     *
+     * If the port doesn't exist, the provider must return ENODEV.  Other
+     * error numbers means that something wrong happened and will be
+     * treated differently by upper layers.
      *
      * If 'port' is not null, the caller takes ownership of data in
      * 'port' and must free it with dpif_port_destroy() when it is no
@@ -178,16 +226,7 @@ struct dpif_class {
 
     /* Returns the Netlink PID value to supply in OVS_ACTION_ATTR_USERSPACE
      * actions as the OVS_USERSPACE_ATTR_PID attribute's value, for use in
-     * flows whose packets arrived on port 'port_no'.  In the case where the
-     * provider allocates multiple Netlink PIDs to a single port, it may use
-     * 'hash' to spread load among them.  The caller need not use a particular
-     * hash function; a 5-tuple hash is suitable.
-     *
-     * (The datapath implementation might use some different hash function for
-     * distributing packets received via flow misses among PIDs.  This means
-     * that packets received via flow misses might be reordered relative to
-     * packets received via userspace actions.  This is not ordinarily a
-     * problem.)
+     * flows whose packets arrived on port 'port_no'.
      *
      * A 'port_no' of UINT32_MAX should be treated as a special case.  The
      * implementation should return a reserved PID, not allocated to any port,
@@ -199,8 +238,7 @@ struct dpif_class {
      *
      * A dpif provider that doesn't have meaningful Netlink PIDs can use NULL
      * for this function.  This is equivalent to always returning 0. */
-    uint32_t (*port_get_pid)(const struct dpif *dpif, odp_port_t port_no,
-                             uint32_t hash);
+    uint32_t (*port_get_pid)(const struct dpif *dpif, odp_port_t port_no);
 
     /* Attempts to begin dumping the ports in a dpif.  On success, returns 0
      * and initializes '*statep' with any data needed for iteration.  On
@@ -269,9 +307,13 @@ struct dpif_class {
      * dpif_flow_dump_thread_init(), respectively.
      *
      * If 'terse' is true, then only UID and statistics will
-     * be returned in the dump. Otherwise, all fields will be returned. */
-    struct dpif_flow_dump *(*flow_dump_create)(const struct dpif *dpif,
-                                               bool terse);
+     * be returned in the dump. Otherwise, all fields will be returned.
+     *
+     * If 'types' isn't null, dumps only the flows of the passed types. */
+    struct dpif_flow_dump *(*flow_dump_create)(
+        const struct dpif *dpif,
+        bool terse,
+        struct dpif_flow_dump_types *types);
     int (*flow_dump_destroy)(struct dpif_flow_dump *dump);
 
     struct dpif_flow_dump_thread *(*flow_dump_thread_create)(
@@ -280,12 +322,14 @@ struct dpif_class {
 
     int (*flow_dump_next)(struct dpif_flow_dump_thread *thread,
                           struct dpif_flow *flows, int max_flows);
-
     /* Executes each of the 'n_ops' operations in 'ops' on 'dpif', in the order
      * in which they are specified, placing each operation's results in the
      * "output" members documented in comments and the 'error' member of each
-     * dpif_op. */
-    void (*operate)(struct dpif *dpif, struct dpif_op **ops, size_t n_ops);
+     * dpif_op. The offload_type argument tells the provider if 'ops' should
+     * be submitted to to a netdev (only offload) or to the kernel datapath
+     * (never offload) or to both (offload if possible; software fallback). */
+    void (*operate)(struct dpif *dpif, struct dpif_op **ops, size_t n_ops,
+                    enum dpif_offload_type offload_type);
 
     /* Enables or disables receiving packets with dpif_recv() for 'dpif'.
      * Turning packet receive off and then back on is allowed to change Netlink
@@ -314,12 +358,9 @@ struct dpif_class {
      * */
     int (*handlers_set)(struct dpif *dpif, uint32_t n_handlers);
 
-    /* If 'dpif' creates its own I/O polling threads, refreshes poll threads
-     * configuration.  'n_rxqs' configures the number of rx_queues, which
-     * are distributed among threads.  'cmask' configures the cpu mask
-     * for setting the polling threads' cpu affinity. */
-    int (*poll_threads_set)(struct dpif *dpif, unsigned int n_rxqs,
-                            const char *cmask);
+    /* Pass custom configuration options to the datapath.  The implementation
+     * might postpone applying the changes until run() is called. */
+    int (*set_config)(struct dpif *dpif, const struct smap *other_config);
 
     /* Translates OpenFlow queue ID 'queue_id' (in host byte order) into a
      * priority value used for setting packet priority. */
@@ -390,6 +431,208 @@ struct dpif_class {
     /* Get datapath version. Caller is responsible for freeing the string
      * returned.  */
     char *(*get_datapath_version)(void);
+
+    /* Conntrack entry dumping interface.
+     *
+     * These functions are used by ct-dpif.c to provide a datapath-agnostic
+     * dumping interface to the connection trackers provided by the
+     * datapaths.
+     *
+     * ct_dump_start() should put in '*state' a pointer to a newly allocated
+     * stucture that will be passed by the caller to ct_dump_next() and
+     * ct_dump_done(). If 'zone' is not NULL, only the entries in '*zone'
+     * should be dumped.
+     *
+     * ct_dump_next() should fill 'entry' with information from a connection
+     * and prepare to dump the next one on a subsequest invocation.
+     *
+     * ct_dump_done() should perform any cleanup necessary (including
+     * deallocating the 'state' structure, if applicable). */
+    int (*ct_dump_start)(struct dpif *, struct ct_dpif_dump_state **state,
+                         const uint16_t *zone, int *);
+    int (*ct_dump_next)(struct dpif *, struct ct_dpif_dump_state *state,
+                        struct ct_dpif_entry *entry);
+    int (*ct_dump_done)(struct dpif *, struct ct_dpif_dump_state *state);
+
+    /* Flushes the connection tracking tables.  The arguments have the
+     * following behavior:
+     *
+     *   - If both 'zone' and 'tuple' are NULL, flush all the conntrack
+     *     entries.
+     *   - If 'zone' is not NULL, and 'tuple' is NULL, flush all the
+     *     conntrack entries in '*zone'.
+     *   - If 'tuple' is not NULL, flush the conntrack entry specified by
+     *     'tuple' in '*zone'. If 'zone' is NULL, use the default zone
+     *     (zone 0). */
+    int (*ct_flush)(struct dpif *, const uint16_t *zone,
+                    const struct ct_dpif_tuple *tuple);
+    /* Set max connections allowed. */
+    int (*ct_set_maxconns)(struct dpif *, uint32_t maxconns);
+    /* Get max connections allowed. */
+    int (*ct_get_maxconns)(struct dpif *, uint32_t *maxconns);
+    /* Get number of connections tracked. */
+    int (*ct_get_nconns)(struct dpif *, uint32_t *nconns);
+    /* Enable or disable TCP sequence checking. */
+    int (*ct_set_tcp_seq_chk)(struct dpif *, bool enabled);
+    /* Get the TCP sequence checking configuration. */
+    int (*ct_get_tcp_seq_chk)(struct dpif *, bool *enabled);
+
+
+    /* Connection tracking per zone limit */
+
+    /* Per zone conntrack limit sets the maximum allowed connections in zones
+     * to provide resource isolation.  If a per zone limit for a particular
+     * zone is not available in the datapath, it defaults to the default
+     * per zone limit.  Initially, the default per zone limit is
+     * unlimited (0). */
+
+    /* Sets the max connections allowed per zone according to 'zone_limits',
+     * a list of 'struct ct_dpif_zone_limit' entries (the 'count' member
+     * is not used when setting limits).  If 'default_limit' is not NULL,
+     * modifies the default limit to '*default_limit'. */
+    int (*ct_set_limits)(struct dpif *, const uint32_t *default_limit,
+                         const struct ovs_list *zone_limits);
+
+    /* Looks up the default per zone limit and stores that in
+     * 'default_limit'.  Look up the per zone limits for all zones in
+     * the 'zone_limits_in' list of 'struct ct_dpif_zone_limit' entries
+     * (the 'limit' and 'count' members are not used), and stores the
+     * reply that includes the zone, the per zone limit, and the number
+     * of connections in the zone into 'zone_limits_out' list. */
+    int (*ct_get_limits)(struct dpif *, uint32_t *default_limit,
+                         const struct ovs_list *zone_limits_in,
+                         struct ovs_list *zone_limits_out);
+
+    /* Deletes per zone limit of all zones specified in 'zone_limits', a
+     * list of 'struct ct_dpif_zone_limit' entries. */
+    int (*ct_del_limits)(struct dpif *, const struct ovs_list *zone_limits);
+
+    /* Connection tracking timeout policy */
+
+    /* A connection tracking timeout policy contains a list of timeout
+     * attributes that specify timeout values on various connection states.
+     * In a datapath, the timeout policy is identified by a 4-byte unsigned
+     * integer.  Unsupported timeout attributes are ignored.  When a
+     * connection is committed it can be associated with a timeout
+     * policy, or it defaults to the datapath's default timeout policy. */
+
+    /* Sets timeout policy '*tp' into the datapath. */
+    int (*ct_set_timeout_policy)(struct dpif *,
+                                 const struct ct_dpif_timeout_policy *tp);
+    /* Gets a timeout policy specified by tp_id and stores it into '*tp'. */
+    int (*ct_get_timeout_policy)(struct dpif *, uint32_t tp_id,
+                                 struct ct_dpif_timeout_policy *tp);
+    /* Deletes a timeout policy identified by 'tp_id'. */
+    int (*ct_del_timeout_policy)(struct dpif *, uint32_t tp_id);
+
+    /* Conntrack timeout policy dumping interface.
+     *
+     * These functions provide a datapath-agnostic dumping interface
+     * to the conntrack timeout policy provided by the datapaths.
+     *
+     * ct_timeout_policy_dump_start() should put in '*statep' a pointer to
+     * a newly allocated structure that will be passed by the caller to
+     * ct_timeout_policy_dump_next() and ct_timeout_policy_dump_done().
+     *
+     * ct_timeout_policy_dump_next() attempts to retrieve another timeout
+     * policy from 'dpif' for 'state', which was initialized by a successful
+     * call to ct_timeout_policy_dump_start().  On success, stores a new
+     * timeout policy into 'tp' and returns 0.  Returns EOF if the last
+     * timeout policy has been dumped, or a positive errno value on error.
+     * This function will not be called again once it returns nonzero once
+     * for a given iteration (but the ct_timeout_policy_dump_done() will
+     * be called afterward).
+     *
+     * ct_timeout_policy_dump_done() should perform any cleanup necessary
+     * (including deallocating the 'state' structure, if applicable). */
+    int (*ct_timeout_policy_dump_start)(struct dpif *, void **statep);
+    int (*ct_timeout_policy_dump_next)(struct dpif *, void *state,
+                                       struct ct_dpif_timeout_policy *tp);
+    int (*ct_timeout_policy_dump_done)(struct dpif *, void *state);
+
+    /* Gets timeout policy based on 'tp_id', 'dl_type' and 'nw_proto'.
+     * On success, returns 0, stores the timeout policy name in 'tp_name',
+     * and sets 'is_generic'. 'is_generic' is false if the returned timeout
+     * policy in the 'dpif' is specific to 'dl_type' and 'nw_proto' in the
+     * datapath (e.g., the Linux kernel datapath).  Sets 'is_generic' to
+     * true, if the timeout policy supports all OVS supported L3/L4
+     * protocols.
+     *
+     * The caller is responsible for freeing 'tp_name'. */
+    int (*ct_get_timeout_policy_name)(struct dpif *, uint32_t tp_id,
+                                      uint16_t dl_type, uint8_t nw_proto,
+                                      char **tp_name, bool *is_generic);
+
+    /* Stores the conntrack features supported by 'dpif' into features.
+     * The value is a bitmap of CONNTRACK_F_* bits. */
+    int (*ct_get_features)(struct dpif *, enum ct_features *features);
+
+    /* IP Fragmentation. */
+
+    /* Disables or enables conntrack fragment reassembly.  The default
+     * setting is enabled. */
+    int (*ipf_set_enabled)(struct dpif *, bool v6, bool enabled);
+
+    /* Set minimum fragment allowed. */
+    int (*ipf_set_min_frag)(struct dpif *, bool v6, uint32_t min_frag);
+
+    /* Set maximum number of fragments tracked. */
+    int (*ipf_set_max_nfrags)(struct dpif *, uint32_t max_nfrags);
+
+    /* Get fragmentation configuration status and counters. */
+    int (*ipf_get_status)(struct dpif *,
+                          struct dpif_ipf_status *dpif_ipf_status);
+
+    /* The following 3 apis find and print ipf lists by creating a string
+     * representation of the state of an ipf list, to which 'dump' is pointed
+     * to.  'ipf_dump_start()' allocates memory for 'ipf_dump_ctx'.
+     * 'ipf_dump_next()' finds the next ipf list and copies it's
+     * characteristics to a string, which is freed by the caller.
+     * 'ipf_dump_done()' frees the 'ipf_dump_ctx' that was allocated in
+     * 'ipf_dump_start'. */
+    int (*ipf_dump_start)(struct dpif *, struct ipf_dump_ctx **ipf_dump_ctx);
+    int (*ipf_dump_next)(struct dpif *, void *ipf_dump_ctx, char **dump);
+    int (*ipf_dump_done)(struct dpif *, void *ipf_dump_ctx);
+
+    /* Meters */
+
+    /* Queries 'dpif' for supported meter features.
+     * NULL pointer means no meter features are supported. */
+    void (*meter_get_features)(const struct dpif *,
+                               struct ofputil_meter_features *);
+
+    /* Adds or modifies the meter in 'dpif' with the given 'meter_id'
+     * and the configuration in 'config'.
+     *
+     * The meter id specified through 'config->meter_id' is ignored. */
+    int (*meter_set)(struct dpif *, ofproto_meter_id meter_id,
+                     struct ofputil_meter_config *);
+
+    /* Queries 'dpif' for meter stats with the given 'meter_id'.  Stores
+     * maximum of 'n_bands' meter statistics, returning the number of band
+     * stats returned in 'stats->n_bands' if successful. */
+    int (*meter_get)(const struct dpif *, ofproto_meter_id meter_id,
+                     struct ofputil_meter_stats *, uint16_t n_bands);
+
+    /* Removes meter 'meter_id' from 'dpif'. Stores meter and band statistics
+     * (for maximum of 'n_bands', returning the number of band stats returned
+     * in 'stats->n_bands' if successful.  'stats' may be passed in as NULL if
+     * no stats are needed, in which case 'n_bands' must be passed in as
+     * zero. */
+    int (*meter_del)(struct dpif *, ofproto_meter_id meter_id,
+                     struct ofputil_meter_stats *, uint16_t n_bands);
+
+    /* Adds a bond with 'bond_id' and the member-map to 'dpif'. */
+    int (*bond_add)(struct dpif *dpif, uint32_t bond_id,
+                    odp_port_t *member_map);
+
+    /* Removes bond identified by 'bond_id' from 'dpif'. */
+    int (*bond_del)(struct dpif *dpif, uint32_t bond_id);
+
+    /* Reads bond stats from 'dpif'.  'n_bytes' should be an array with size
+     * sufficient to store BOND_BUCKETS number of elements. */
+    int (*bond_stats_get)(struct dpif *dpif, uint32_t bond_id,
+                          uint64_t *n_bytes);
 };
 
 extern const struct dpif_class dpif_netlink_class;

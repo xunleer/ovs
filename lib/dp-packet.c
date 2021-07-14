@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,11 @@
 #include <config.h>
 #include <stdlib.h>
 #include <string.h>
-#include "dynamic-string.h"
-#include "netdev-dpdk.h"
+
 #include "dp-packet.h"
+#include "netdev-afxdp.h"
+#include "netdev-dpdk.h"
+#include "openvswitch/dynamic-string.h"
 #include "util.h"
 
 static void
@@ -27,9 +29,14 @@ dp_packet_init__(struct dp_packet *b, size_t allocated, enum dp_packet_source so
 {
     dp_packet_set_allocated(b, allocated);
     b->source = source;
-    b->l2_pad_size = 0;
-    b->l2_5_ofs = b->l3_ofs = b->l4_ofs = UINT16_MAX;
+    dp_packet_reset_offsets(b);
     pkt_metadata_init(&b->md, 0);
+    dp_packet_reset_cutlen(b);
+    dp_packet_reset_offload(b);
+    /* Initialize implementation-specific fields of dp_packet. */
+    dp_packet_init_specific(b);
+    /* By default assume the packet type to be Ethernet. */
+    b->packet_type = htonl(PT_ETH);
 }
 
 static void
@@ -52,6 +59,22 @@ dp_packet_use(struct dp_packet *b, void *base, size_t allocated)
 {
     dp_packet_use__(b, base, allocated, DPBUF_MALLOC);
 }
+
+#if HAVE_AF_XDP
+/* Initialize 'b' as an empty dp_packet that contains
+ * memory starting at AF_XDP umem base.
+ */
+void
+dp_packet_use_afxdp(struct dp_packet *b, void *data, size_t allocated,
+                    size_t headroom)
+{
+    dp_packet_set_base(b, (char *)data - headroom);
+    dp_packet_set_data(b, data);
+    dp_packet_set_size(b, 0);
+
+    dp_packet_init__(b, allocated, DPBUF_AFXDP);
+}
+#endif
 
 /* Initializes 'b' as an empty dp_packet that contains the 'allocated' bytes of
  * memory starting at 'base'.  'base' should point to a buffer on the stack.
@@ -87,16 +110,12 @@ dp_packet_use_const(struct dp_packet *b, const void *data, size_t size)
     dp_packet_set_size(b, size);
 }
 
-/* Initializes 'b' as an empty dp_packet that contains the 'allocated' bytes of
- * memory starting at 'base'.  DPDK allocated dp_packet and *data is allocated
- * from one continous memory region, so in memory data start right after
- * dp_packet.  Therefore there is special method to free this type of
- * buffer.  dp_packet base, data and size are initialized by dpdk rcv() so no
- * need to initialize those fields. */
+/* Initializes 'b' as a DPDK dp-packet, which must have been allocated from a
+ * DPDK memory pool. */
 void
-dp_packet_init_dpdk(struct dp_packet *b, size_t allocated)
+dp_packet_init_dpdk(struct dp_packet *b)
 {
-    dp_packet_init__(b, allocated, DPBUF_DPDK);
+    b->source = DPBUF_DPDK;
 }
 
 /* Initializes 'b' as an empty dp_packet with an initial capacity of 'size'
@@ -120,6 +139,8 @@ dp_packet_uninit(struct dp_packet *b)
              * created as a dp_packet */
             free_dpdk_buf((struct dp_packet*) b);
 #endif
+        } else if (b->source == DPBUF_AFXDP) {
+            free_afxdp_buf(b);
         }
     }
 }
@@ -153,21 +174,33 @@ dp_packet_clone(const struct dp_packet *buffer)
     return dp_packet_clone_with_headroom(buffer, 0);
 }
 
-/* Creates and returns a new dp_packet whose data are copied from 'buffer'.   The
- * returned dp_packet will additionally have 'headroom' bytes of headroom. */
+/* Creates and returns a new dp_packet whose data are copied from 'buffer'.
+ * The returned dp_packet will additionally have 'headroom' bytes of
+ * headroom. */
 struct dp_packet *
 dp_packet_clone_with_headroom(const struct dp_packet *buffer, size_t headroom)
 {
     struct dp_packet *new_buffer;
+    uint32_t mark;
 
     new_buffer = dp_packet_clone_data_with_headroom(dp_packet_data(buffer),
                                                  dp_packet_size(buffer),
                                                  headroom);
-    new_buffer->l2_pad_size = buffer->l2_pad_size;
-    new_buffer->l2_5_ofs = buffer->l2_5_ofs;
-    new_buffer->l3_ofs = buffer->l3_ofs;
-    new_buffer->l4_ofs = buffer->l4_ofs;
-    new_buffer->md = buffer->md;
+    /* Copy the following fields into the returned buffer: l2_pad_size,
+     * l2_5_ofs, l3_ofs, l4_ofs, cutlen, packet_type and md. */
+    memcpy(&new_buffer->l2_pad_size, &buffer->l2_pad_size,
+            sizeof(struct dp_packet) -
+            offsetof(struct dp_packet, l2_pad_size));
+
+    *dp_packet_ol_flags_ptr(new_buffer) = *dp_packet_ol_flags_ptr(buffer);
+    *dp_packet_ol_flags_ptr(new_buffer) &= DP_PACKET_OL_SUPPORTED_MASK;
+
+    if (dp_packet_rss_valid(buffer)) {
+        dp_packet_set_rss_hash(new_buffer, dp_packet_get_rss_hash(buffer));
+    }
+    if (dp_packet_has_flow_mark(buffer, &mark)) {
+        dp_packet_set_flow_mark(new_buffer, mark);
+    }
 
     return new_buffer;
 }
@@ -208,8 +241,8 @@ dp_packet_copy__(struct dp_packet *b, uint8_t *new_base,
 
 /* Reallocates 'b' so that it has exactly 'new_headroom' and 'new_tailroom'
  * bytes of headroom and tailroom, respectively. */
-static void
-dp_packet_resize__(struct dp_packet *b, size_t new_headroom, size_t new_tailroom)
+void
+dp_packet_resize(struct dp_packet *b, size_t new_headroom, size_t new_tailroom)
 {
     void *new_base, *new_data;
     size_t new_allocated;
@@ -231,6 +264,9 @@ dp_packet_resize__(struct dp_packet *b, size_t new_headroom, size_t new_tailroom
         break;
 
     case DPBUF_STACK:
+        OVS_NOT_REACHED();
+
+    case DPBUF_AFXDP:
         OVS_NOT_REACHED();
 
     case DPBUF_STUB:
@@ -259,7 +295,7 @@ void
 dp_packet_prealloc_tailroom(struct dp_packet *b, size_t size)
 {
     if (size > dp_packet_tailroom(b)) {
-        dp_packet_resize__(b, dp_packet_headroom(b), MAX(size, 64));
+        dp_packet_resize(b, dp_packet_headroom(b), MAX(size, 64));
     }
 }
 
@@ -270,7 +306,7 @@ void
 dp_packet_prealloc_headroom(struct dp_packet *b, size_t size)
 {
     if (size > dp_packet_headroom(b)) {
-        dp_packet_resize__(b, MAX(size, 64), dp_packet_tailroom(b));
+        dp_packet_resize(b, MAX(size, 64), dp_packet_tailroom(b));
     }
 }
 
@@ -418,6 +454,7 @@ dp_packet_steal_data(struct dp_packet *b)
 {
     void *p;
     ovs_assert(b->source != DPBUF_DPDK);
+    ovs_assert(b->source != DPBUF_AFXDP);
 
     if (b->source == DPBUF_MALLOC && dp_packet_data(b) == dp_packet_base(b)) {
         p = dp_packet_data(b);
@@ -430,21 +467,6 @@ dp_packet_steal_data(struct dp_packet *b)
     dp_packet_set_base(b, NULL);
     dp_packet_set_data(b, NULL);
     return p;
-}
-
-/* Returns a string that describes some of 'b''s metadata plus a hex dump of up
- * to 'maxbytes' from the start of the buffer. */
-char *
-dp_packet_to_string(const struct dp_packet *b, size_t maxbytes)
-{
-    struct ds s;
-
-    ds_init(&s);
-    ds_put_format(&s, "size=%"PRIu32", allocated=%"PRIu32", head=%"PRIuSIZE", tail=%"PRIuSIZE"\n",
-                  dp_packet_size(b), dp_packet_get_allocated(b),
-                  dp_packet_headroom(b), dp_packet_tailroom(b));
-    ds_put_hex_dump(&s, dp_packet_data(b), MIN(dp_packet_size(b), maxbytes), 0, false);
-    return ds_cstr(&s);
 }
 
 static inline void

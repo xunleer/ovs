@@ -16,7 +16,7 @@
 
 #include <config.h>
 #undef NDEBUG
-#include "json.h"
+#include "openvswitch/json.h"
 #include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
@@ -37,7 +37,7 @@ print_and_free_json(struct json *json)
 {
     bool ok;
     if (json->type == JSON_STRING) {
-        printf("error: %s\n", json->u.string);
+        printf("error: %s\n", json->string);
         ok = false;
     } else {
         char *s = json_to_string(json, JSSF_SORT | (pretty ? JSSF_PRETTY : 0));

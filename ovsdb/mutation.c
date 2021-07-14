@@ -22,9 +22,13 @@
 
 #include "column.h"
 #include "ovsdb-error.h"
-#include "json.h"
+#include "openvswitch/json.h"
 #include "row.h"
+
+#include <string.h>
+
 #include "table.h"
+#include "util.h"
 
 struct ovsdb_error *
 ovsdb_mutator_from_string(const char *name, enum ovsdb_mutator *mutator)
@@ -81,9 +85,9 @@ ovsdb_mutation_from_json(const struct ovsdb_table_schema *ts,
     const char *column_name;
 
     if (json->type != JSON_ARRAY
-        || json->u.array.n != 3
-        || json->u.array.elems[0]->type != JSON_STRING
-        || json->u.array.elems[1]->type != JSON_STRING) {
+        || json->array.n != 3
+        || json->array.elems[0]->type != JSON_STRING
+        || json->array.elems[1]->type != JSON_STRING) {
         return ovsdb_syntax_error(json, NULL, "Parse error in mutation.");
     }
     array = json_array(json);
@@ -143,6 +147,8 @@ ovsdb_mutation_from_json(const struct ovsdb_table_schema *ts,
         if (error && ovsdb_type_is_map(&m->type)
             && m->mutator == OVSDB_M_DELETE) {
             ovsdb_error_destroy(error);
+            ovsdb_base_type_destroy(&m->type.value);
+            m->type.value.enum_ = NULL;
             m->type.value.type = OVSDB_TYPE_VOID;
             error = ovsdb_datum_from_json(&m->arg, &m->type, array->elems[2],
                                           symtab);

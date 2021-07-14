@@ -15,27 +15,59 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
 #endif
 
 #include_next <linux/skbuff.h>
-
 #include <linux/jhash.h>
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0)
-#define SKB_GSO_GRE 0
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,10,0)
-#define SKB_GSO_UDP_TUNNEL 0
-#endif
-
-#ifndef HAVE_SKB_GSO_GRE_CSUM
-#define SKB_GSO_GRE_CSUM 0
-#endif
-
-#ifndef HAVE_SKB_GSO_UDP_TUNNEL_CSUM
-#define SKB_GSO_UDP_TUNNEL_CSUM 0
-#endif
 
 #ifndef HAVE_IGNORE_DF_RENAME
 #define ignore_df local_df
+#endif
+
+
+#ifndef HAVE_NULL_COMPUTE_PSEUDO
+static inline __wsum null_compute_pseudo(struct sk_buff *skb, int proto)
+{
+	return 0;
+}
+#endif
+
+#ifndef HAVE_SKB_CHECKSUM_CONVERT
+static inline bool __skb_checksum_convert_check(struct sk_buff *skb)
+{
+#ifdef HAVE_SKBUFF_CSUM_VALID
+	return (skb->ip_summed == CHECKSUM_NONE && skb->csum_valid);
+#else
+	return skb->ip_summed == CHECKSUM_NONE;
+#endif
+}
+
+static inline void __skb_checksum_convert(struct sk_buff *skb,
+					  __sum16 check, __wsum pseudo)
+{
+	skb->csum = ~pseudo;
+	skb->ip_summed = CHECKSUM_COMPLETE;
+}
+
+#define skb_checksum_try_convert(skb, proto, check, compute_pseudo)	\
+do {									\
+	if (__skb_checksum_convert_check(skb))				\
+		__skb_checksum_convert(skb, check,			\
+				       compute_pseudo(skb, proto));	\
+} while (0)
+
+#endif
+
+#ifndef SKB_CHECKSUM_SIMPLE_VALIDATE
+
+#ifndef __skb_checksum_validate
+#define __skb_checksum_validate(skb, proto, complete,			\
+				zero_okay, check, compute_pseudo)	\
+({									\
+	__sum16 __ret = 0;						\
+	__ret;								\
+})
+#endif
+
+#define skb_checksum_simple_validate(skb)				\
+	__skb_checksum_validate(skb, 0, true, false, 0, null_compute_pseudo)
 #endif
 
 #ifndef HAVE_SKB_COPY_FROM_LINEAR_DATA_OFFSET
@@ -55,6 +87,13 @@ static inline void skb_copy_to_linear_data_offset(struct sk_buff *skb,
 }
 
 #endif	/* !HAVE_SKB_COPY_FROM_LINEAR_DATA_OFFSET */
+
+#ifndef HAVE_SKB_INNER_TRANSPORT_OFFSET
+static inline int skb_inner_transport_offset(const struct sk_buff *skb)
+{
+	return skb_inner_transport_header(skb) - skb->data;
+}
+#endif
 
 #ifndef HAVE_SKB_RESET_TAIL_POINTER
 static inline void skb_reset_tail_pointer(struct sk_buff *skb)
@@ -127,71 +166,6 @@ static inline struct rtable *skb_rtable(const struct sk_buff *skb)
 #ifndef CHECKSUM_COMPLETE
 #define CHECKSUM_COMPLETE CHECKSUM_HW
 #endif
-
-#ifndef HAVE_SKBUFF_HEADER_HELPERS
-static inline unsigned char *skb_transport_header(const struct sk_buff *skb)
-{
-	return skb->h.raw;
-}
-
-static inline void skb_reset_transport_header(struct sk_buff *skb)
-{
-	skb->h.raw = skb->data;
-}
-
-static inline void skb_set_transport_header(struct sk_buff *skb,
-			const int offset)
-{
-	skb->h.raw = skb->data + offset;
-}
-
-static inline unsigned char *skb_network_header(const struct sk_buff *skb)
-{
-	return skb->nh.raw;
-}
-
-static inline void skb_reset_network_header(struct sk_buff *skb)
-{
-	skb->nh.raw = skb->data;
-}
-
-static inline void skb_set_network_header(struct sk_buff *skb, const int offset)
-{
-	skb->nh.raw = skb->data + offset;
-}
-
-static inline unsigned char *skb_mac_header(const struct sk_buff *skb)
-{
-	return skb->mac.raw;
-}
-
-static inline void skb_reset_mac_header(struct sk_buff *skb)
-{
-	skb->mac_header = skb->data;
-}
-
-static inline void skb_set_mac_header(struct sk_buff *skb, const int offset)
-{
-	skb->mac.raw = skb->data + offset;
-}
-
-static inline int skb_transport_offset(const struct sk_buff *skb)
-{
-	return skb_transport_header(skb) - skb->data;
-}
-
-static inline int skb_network_offset(const struct sk_buff *skb)
-{
-	return skb_network_header(skb) - skb->data;
-}
-
-static inline void skb_copy_to_linear_data(struct sk_buff *skb,
-					   const void *from,
-					   const unsigned int len)
-{
-	memcpy(skb->data, from, len);
-}
-#endif	/* !HAVE_SKBUFF_HEADER_HELPERS */
 
 #ifndef HAVE_SKB_WARN_LRO
 #ifndef NETIF_F_LRO
@@ -284,35 +258,8 @@ static inline int skb_orphan_frags(struct sk_buff *skb, gfp_t gfp_mask)
 #endif
 
 #ifndef HAVE_SKB_GET_HASH
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0)
-#define __skb_get_hash rpl__skb_get_rxhash
-#define skb_get_hash rpl_skb_get_rxhash
-
-extern u32 __skb_get_hash(struct sk_buff *skb);
-static inline __u32 skb_get_hash(struct sk_buff *skb)
-{
-#ifdef HAVE_RXHASH
-	if (skb->rxhash)
-#ifndef HAVE_U16_RXHASH
-		return skb->rxhash;
-#else
-		return jhash_1word(skb->rxhash, 0);
-#endif
-#endif
-	return __skb_get_hash(skb);
-}
-
-#else
 #define skb_get_hash skb_get_rxhash
-#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0) */
 #endif /* HAVE_SKB_GET_HASH */
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0)
-static inline void skb_tx_error(struct sk_buff *skb)
-{
-	return;
-}
-#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0) */
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
 #define skb_zerocopy_headlen rpl_skb_zerocopy_headlen
@@ -331,9 +278,7 @@ static inline void skb_clear_hash(struct sk_buff *skb)
 #ifdef HAVE_RXHASH
 	skb->rxhash = 0;
 #endif
-#if defined(HAVE_L4_RXHASH) && !defined(HAVE_RHEL_OVS_HOOK)
-	skb->l4_rxhash = 0;
-#endif
+	skb->l4_hash = 0;
 }
 #endif
 
@@ -356,6 +301,11 @@ static inline void __skb_fill_page_desc(struct sk_buff *skb, int i,
 #ifndef HAVE_SKB_ENSURE_WRITABLE
 #define skb_ensure_writable rpl_skb_ensure_writable
 int rpl_skb_ensure_writable(struct sk_buff *skb, int write_len);
+#endif
+
+#ifndef HAVE___SKB_VLAN_POP
+#define __skb_vlan_pop rpl___skb_vlan_pop
+int rpl___skb_vlan_pop(struct sk_buff *skb, u16 *vlan_tci);
 #endif
 
 #ifndef HAVE_SKB_VLAN_POP
@@ -388,19 +338,154 @@ static inline void skb_postpull_rcsum(struct sk_buff *skb,
 	if (skb->ip_summed == CHECKSUM_COMPLETE)
 		skb->csum = csum_sub(skb->csum, csum_partial(start, len, 0));
 	else if (skb->ip_summed == CHECKSUM_PARTIAL &&
-			skb_checksum_start_offset(skb) <= len)
+			skb_checksum_start_offset(skb) < 0)
 		skb->ip_summed = CHECKSUM_NONE;
 }
 
 #define skb_pull_rcsum rpl_skb_pull_rcsum
 static inline unsigned char *skb_pull_rcsum(struct sk_buff *skb, unsigned int len)
 {
+	unsigned char *data = skb->data;
+
 	BUG_ON(len > skb->len);
-	skb->len -= len;
-	BUG_ON(skb->len < skb->data_len);
-	skb_postpull_rcsum(skb, skb->data, len);
-	return skb->data += len;
+	__skb_pull(skb, len);
+	skb_postpull_rcsum(skb, data, len);
+	return skb->data;
 }
 
 #endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0)
+#define skb_scrub_packet rpl_skb_scrub_packet
+void rpl_skb_scrub_packet(struct sk_buff *skb, bool xnet);
+#endif
+
+#define skb_pop_mac_header rpl_skb_pop_mac_header
+static inline void skb_pop_mac_header(struct sk_buff *skb)
+{
+	skb->mac_header = skb->network_header;
+}
+
+#ifndef HAVE_SKB_CLEAR_HASH_IF_NOT_L4
+static inline void skb_clear_hash_if_not_l4(struct sk_buff *skb)
+{
+	if (!skb->l4_hash)
+		skb_clear_hash(skb);
+}
+#endif
+
+#ifndef HAVE_SKB_POSTPUSH_RCSUM
+static inline void skb_postpush_rcsum(struct sk_buff *skb,
+				      const void *start, unsigned int len)
+{
+	/* For performing the reverse operation to skb_postpull_rcsum(),
+	 * we can instead of ...
+	 *
+	 *   skb->csum = csum_add(skb->csum, csum_partial(start, len, 0));
+	 *
+	 * ... just use this equivalent version here to save a few
+	 * instructions. Feeding csum of 0 in csum_partial() and later
+	 * on adding skb->csum is equivalent to feed skb->csum in the
+	 * first place.
+	 */
+	if (skb->ip_summed == CHECKSUM_COMPLETE)
+		skb->csum = csum_partial(start, len, skb->csum);
+}
+#endif
+
+#define skb_checksum_start rpl_skb_checksum_start
+static inline unsigned char *skb_checksum_start(const struct sk_buff *skb)
+{
+	return skb->head + skb->csum_start;
+}
+
+#ifndef HAVE_LCO_CSUM
+static inline __wsum lco_csum(struct sk_buff *skb)
+{
+	unsigned char *csum_start = skb_checksum_start(skb);
+	unsigned char *l4_hdr = skb_transport_header(skb);
+	__wsum partial;
+
+	/* Start with complement of inner checksum adjustment */
+	partial = ~csum_unfold(*(__force __sum16 *)(csum_start +
+				skb->csum_offset));
+
+	/* Add in checksum of our headers (incl. outer checksum
+	 * adjustment filled in by caller) and return result.
+	 */
+	return csum_partial(l4_hdr, csum_start - l4_hdr, partial);
+}
+#endif
+
+#ifndef HAVE_SKB_NFCT
+static inline struct nf_conntrack *skb_nfct(const struct sk_buff *skb)
+{
+#if IS_ENABLED(CONFIG_NF_CONNTRACK)
+       return skb->nfct;
+#else
+       return NULL;
+#endif
+}
+#endif
+
+#ifndef HAVE_SKB_PUT_ZERO
+static inline void *skb_put_zero(struct sk_buff *skb, unsigned int len)
+{
+	void *tmp = skb_put(skb, len);
+
+	memset(tmp, 0, len);
+
+	return tmp;
+}
+#endif
+
+#ifndef HAVE_SKB_GSO_IPXIP6
+#define SKB_GSO_IPXIP6 (1 << 10)
+#endif
+
+#ifndef HAVE_SKB_SET_INNER_IPPROTO
+static inline void skb_set_inner_ipproto(struct sk_buff *skb,
+					 __u8 ipproto)
+{
+}
+#endif
+
+#ifndef HAVE_NF_RESET_CT
+#define nf_reset_ct nf_reset
+#endif
+
+#ifndef HAVE___SKB_SET_HASH
+static inline void
+__skb_set_hash(struct sk_buff *skb, __u32 hash, bool is_sw, bool is_l4)
+{
+#ifdef HAVE_RXHASH
+	skb->rxhash = hash;
+#else
+	skb->hash = hash;
+#endif
+	skb->l4_hash = is_l4;
+#ifdef HAVE_SW_HASH
+	skb->sw_hash = is_sw;
+#endif
+}
+#endif
+
+#ifndef HAVE_SKB_GET_HASH_RAW
+static inline __u32 skb_get_hash_raw(const struct sk_buff *skb)
+{
+#ifdef HAVE_RXHASH
+	return skb->rxhash;
+#else
+	return skb->hash;
+#endif
+}
+#endif
+
+#ifndef skb_list_walk_safe
+/* Iterate through singly-linked GSO fragments of an skb. */
+#define skb_list_walk_safe(first, skb, next_skb)                               \
+	for ((skb) = (first), (next_skb) = (skb) ? (skb)->next : NULL; (skb);  \
+	     (skb) = (next_skb), (next_skb) = (skb) ? (skb)->next : NULL)
+#endif
+
 #endif

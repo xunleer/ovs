@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 Nicira, Inc.
+ * Copyright (c) 2014, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,10 @@
 #include <config.h>
 #include "pvector.h"
 
+/* Writers will preallocate space for some entries at the end to avoid future
+ * reallocations. */
+enum { PVECTOR_EXTRA_ALLOC = 4 };
+
 static struct pvector_impl *
 pvector_impl_get(const struct pvector *pvec)
 {
@@ -29,7 +33,7 @@ pvector_impl_alloc(size_t size)
     struct pvector_impl *impl;
 
     impl = xmalloc(sizeof *impl + size * sizeof impl->vector[0]);
-    impl->size = 0;
+    atomic_init(&impl->size, 0);
     impl->allocated = size;
 
     return impl;
@@ -91,10 +95,6 @@ static void
 pvector_impl_sort(struct pvector_impl *impl)
 {
     qsort(impl->vector, impl->size, sizeof *impl->vector, pvector_entry_cmp);
-    /* Trim gaps. */
-    while (impl->size && impl->vector[impl->size - 1].priority == INT_MIN) {
-        impl->size = impl->size - 1;
-    }
 }
 
 /* Returns the index of the 'ptr' in the vector, or -1 if none is found. */
@@ -117,18 +117,22 @@ pvector_insert(struct pvector *pvec, void *ptr, int priority)
 {
     struct pvector_impl *temp = pvec->temp;
     struct pvector_impl *old = pvector_impl_get(pvec);
+    size_t size;
 
     ovs_assert(ptr != NULL);
 
+    /* There is no possible concurrent writer. Insertions must be protected
+     * by mutex or be always excuted from the same thread. */
+    atomic_read_relaxed(&old->size, &size);
+
     /* Check if can add to the end without reallocation. */
-    if (!temp && old->allocated > old->size &&
-        (!old->size || priority <= old->vector[old->size - 1].priority)) {
-        old->vector[old->size].ptr = ptr;
-        old->vector[old->size].priority = priority;
+    if (!temp && old->allocated > size &&
+        (!size || priority <= old->vector[size - 1].priority)) {
+        old->vector[size].ptr = ptr;
+        old->vector[size].priority = priority;
         /* Size increment must not be visible to the readers before the new
          * entry is stored. */
-        atomic_thread_fence(memory_order_release);
-        ++old->size;
+        atomic_store_explicit(&old->size, size + 1, memory_order_release);
     } else {
         if (!temp) {
             temp = pvector_impl_dup(old);
@@ -159,9 +163,11 @@ pvector_remove(struct pvector *pvec, void *ptr)
     index = pvector_impl_find(temp, ptr);
     ovs_assert(index >= 0);
     /* Now at the index of the entry to be deleted.
-     * Clear in place, publish will sort and clean these off. */
-    temp->vector[index].ptr = NULL;
-    temp->vector[index].priority = INT_MIN;
+     * Swap another entry in if needed, publish will sort anyway. */
+    temp->size--;
+    if (index != temp->size) {
+        temp->vector[index] = temp->vector[temp->size];
+    }
 }
 
 /* Change entry's 'priority' and keep the vector ordered. */

@@ -19,8 +19,8 @@
 
 #include <time.h>
 #include "heap.h"
-#include "hmap.h"
-#include "list.h"
+#include "openvswitch/hmap.h"
+#include "openvswitch/list.h"
 #include "ovs-atomic.h"
 #include "ovs-thread.h"
 #include "packets.h"
@@ -46,8 +46,8 @@
  *
  * Second, the implementation has the ability to "lock" a MAC table entry
  * updated by a gratuitous ARP.  This is a simple feature but the rationale for
- * it is complicated.  Please refer to the description of SLB bonding in
- * vswitchd/INTERNALS for an explanation.
+ * it is complicated.  Refer to the description of SLB bonding in the
+ * 'ovs-vswitchd Internals' guide for an explanation.
  *
  * Third, the implementation expires entries that are idle for longer than a
  * configurable amount of time.  This is implemented by keeping all of the
@@ -89,13 +89,13 @@
 struct mac_learning;
 
 /* Default maximum size of a MAC learning table, in entries. */
-#define MAC_DEFAULT_MAX 2048
+#define MAC_DEFAULT_MAX 8192
 
 /* Time, in seconds, before expiring a mac_entry due to inactivity. */
 #define MAC_ENTRY_DEFAULT_IDLE_TIME 300
 
 /* Time, in seconds, to lock an entry updated by a gratuitous ARP to avoid
- * relearning based on a reflection from a bond slave. */
+ * relearning based on a reflection from a bond member. */
 #define MAC_GRAT_ARP_LOCK_TIME 5
 
 /* A MAC learning table entry.
@@ -160,6 +160,12 @@ struct mac_learning {
     struct ovs_rwlock rwlock;
     bool need_revalidate;
 
+    /* Statistics */
+    uint64_t total_learned;
+    uint64_t total_expired;
+    uint64_t total_evicted;
+    uint64_t total_moved;
+
     /* Fairness.
      *
      * Both of these data structures include the same "struct
@@ -183,6 +189,7 @@ int mac_entry_age(const struct mac_learning *ml, const struct mac_entry *e)
 struct mac_learning *mac_learning_create(unsigned int idle_time);
 struct mac_learning *mac_learning_ref(const struct mac_learning *);
 void mac_learning_unref(struct mac_learning *);
+void mac_learning_clear_statistics(struct mac_learning *ml);
 
 bool mac_learning_run(struct mac_learning *ml) OVS_REQ_WRLOCK(ml->rwlock);
 void mac_learning_wait(struct mac_learning *ml)
@@ -207,6 +214,10 @@ struct mac_entry *mac_learning_insert(struct mac_learning *ml,
                                       const struct eth_addr src,
                                       uint16_t vlan)
     OVS_REQ_WRLOCK(ml->rwlock);
+bool mac_learning_update(struct mac_learning *ml, struct eth_addr src,
+                         int vlan, bool is_gratuitous_arp, bool is_bond,
+                         void *in_port)
+    OVS_EXCLUDED(ml->rwlock);
 
 /* Lookup. */
 struct mac_entry *mac_learning_lookup(const struct mac_learning *ml,

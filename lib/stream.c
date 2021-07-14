@@ -18,26 +18,28 @@
 #include "stream-provider.h"
 #include <errno.h>
 #include <inttypes.h>
+#include <sys/types.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include "coverage.h"
-#include "dynamic-string.h"
 #include "fatal-signal.h"
 #include "flow.h"
 #include "jsonrpc.h"
-#include "ofp-print.h"
-#include "ofpbuf.h"
 #include "openflow/nicira-ext.h"
 #include "openflow/openflow.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/ofp-print.h"
+#include "openvswitch/ofpbuf.h"
+#include "openvswitch/vlog.h"
+#include "ovs-replay.h"
 #include "ovs-thread.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "random.h"
 #include "socket-util.h"
 #include "util.h"
-#include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(stream);
 
@@ -125,11 +127,11 @@ stream_usage(const char *name, bool active, bool passive,
     printf("\n");
     if (active) {
         printf("Active %s connection methods:\n", name);
-        printf("  tcp:IP:PORT             "
-               "PORT at remote IP\n");
+        printf("  tcp:HOST:PORT           "
+               "PORT at remote HOST\n");
 #ifdef HAVE_OPENSSL
-        printf("  ssl:IP:PORT             "
-               "SSL PORT at remote IP\n");
+        printf("  ssl:HOST:PORT           "
+               "SSL PORT at remote HOST\n");
 #endif
         printf("  unix:FILE               "
                "Unix domain socket named FILE\n");
@@ -156,6 +158,9 @@ stream_usage(const char *name, bool active, bool passive,
         printf("  --bootstrap-ca-cert=FILE  file with peer CA certificate "
                "to read or create\n");
     }
+    printf("SSL options:\n"
+           "  --ssl-protocols=PROTOS  list of SSL protocols to enable\n"
+           "  --ssl-ciphers=CIPHERS   list of SSL ciphers to enable\n");
 #endif
 }
 
@@ -180,7 +185,11 @@ stream_lookup_class(const char *name, const struct stream_class **classp)
         const struct stream_class *class = stream_classes[i];
         if (strlen(class->name) == prefix_len
             && !memcmp(class->name, name, prefix_len)) {
-            *classp = class;
+            if (ovs_replay_get_state() == OVS_REPLAY_READ) {
+                *classp = &replay_stream_class;
+            } else {
+                *classp = class;
+            }
             return 0;
         }
     }
@@ -223,6 +232,8 @@ stream_open(const char *name, struct stream **streamp, uint8_t dscp)
     suffix_copy = xstrdup(strchr(name, ':') + 1);
     error = class->open(name, suffix_copy, &stream, dscp);
     free(suffix_copy);
+
+    stream_replay_open_wfd(stream, error, name);
     if (error) {
         goto error;
     }
@@ -237,27 +248,39 @@ error:
 }
 
 /* Blocks until a previously started stream connection attempt succeeds or
- * fails.  'error' should be the value returned by stream_open() and 'streamp'
- * should point to the stream pointer set by stream_open().  Returns 0 if
- * successful, otherwise a positive errno value other than EAGAIN or
- * EINPROGRESS.  If successful, leaves '*streamp' untouched; on error, closes
- * '*streamp' and sets '*streamp' to null.
+ * fails, but no more than 'timeout' milliseconds.  'error' should be the
+ * value returned by stream_open() and 'streamp' should point to the stream
+ * pointer set by stream_open().  Returns 0 if successful, otherwise a
+ * positive errno value other than EAGAIN or EINPROGRESS.  If successful,
+ * leaves '*streamp' untouched; on error, closes '*streamp' and sets
+ * '*streamp' to null. Negative value of 'timeout' means infinite waiting.
  *
  * Typical usage:
- *   error = stream_open_block(stream_open("tcp:1.2.3.4:5", &stream), &stream);
+ *   error = stream_open_block(stream_open("tcp:1.2.3.4:5", &stream), -1,
+ *                             &stream);
  */
 int
-stream_open_block(int error, struct stream **streamp)
+stream_open_block(int error, long long int timeout, struct stream **streamp)
 {
     struct stream *stream = *streamp;
 
     fatal_signal_run();
 
     if (!error) {
+        long long int deadline = (timeout >= 0
+                                  ? time_msec() + timeout
+                                  : LLONG_MAX);
         while ((error = stream_connect(stream)) == EAGAIN) {
+            if (deadline != LLONG_MAX && time_msec() > deadline) {
+                error = ETIMEDOUT;
+                break;
+            }
             stream_run(stream);
             stream_run_wait(stream);
             stream_connect_wait(stream);
+            if (deadline != LLONG_MAX) {
+                poll_timer_wait_until(deadline);
+            }
             poll_block();
         }
         ovs_assert(error != EINPROGRESS);
@@ -278,8 +301,11 @@ stream_close(struct stream *stream)
 {
     if (stream != NULL) {
         char *name = stream->name;
+        char *peer_id = stream->peer_id;
+        stream_replay_close_wfd(stream);
         (stream->class->close)(stream);
         free(name);
+        free(peer_id);
     }
 }
 
@@ -349,9 +375,13 @@ int
 stream_recv(struct stream *stream, void *buffer, size_t n)
 {
     int retval = stream_connect(stream);
-    return (retval ? -retval
-            : n == 0 ? 0
-            : (stream->class->recv)(stream, buffer, n));
+
+    retval = retval ? -retval
+             : n == 0 ? 0
+             : (stream->class->recv)(stream, buffer, n);
+
+    stream_replay_write(stream, buffer, retval, true);
+    return retval;
 }
 
 /* Tries to send up to 'n' bytes of 'buffer' on 'stream', and returns:
@@ -367,9 +397,12 @@ int
 stream_send(struct stream *stream, const void *buffer, size_t n)
 {
     int retval = stream_connect(stream);
-    return (retval ? -retval
-            : n == 0 ? 0
-            : (stream->class->send)(stream, buffer, n));
+    retval = retval ? -retval
+             : n == 0 ? 0
+             : (stream->class->send)(stream, buffer, n);
+
+    stream_replay_write(stream, buffer, retval, false);
+    return retval;
 }
 
 /* Allows 'stream' to perform maintenance activities, such as flushing
@@ -430,6 +463,19 @@ stream_send_wait(struct stream *stream)
     stream_wait(stream, STREAM_SEND);
 }
 
+void
+stream_set_peer_id(struct stream *stream, const char *peer_id)
+{
+    free(stream->peer_id);
+    stream->peer_id = xstrdup(peer_id);
+}
+
+const char *
+stream_get_peer_id(const struct stream *stream)
+{
+    return stream->peer_id;
+}
+
 /* Given 'name', a pstream name in the form "TYPE:ARGS", stores the class
  * named "TYPE" into '*classp' and returns 0.  Returns EAFNOSUPPORT and stores
  * a null pointer into '*classp' if 'name' is in the wrong form or if no such
@@ -451,7 +497,11 @@ pstream_lookup_class(const char *name, const struct pstream_class **classp)
         const struct pstream_class *class = pstream_classes[i];
         if (strlen(class->name) == prefix_len
             && !memcmp(class->name, name, prefix_len)) {
-            *classp = class;
+            if (ovs_replay_get_state() == OVS_REPLAY_READ) {
+                *classp = &preplay_pstream_class;
+            } else {
+                *classp = class;
+            }
             return 0;
         }
     }
@@ -513,6 +563,8 @@ pstream_open(const char *name, struct pstream **pstreamp, uint8_t dscp)
     suffix_copy = xstrdup(strchr(name, ':') + 1);
     error = class->listen(name, suffix_copy, &pstream, dscp);
     free(suffix_copy);
+
+    pstream_replay_open_wfd(pstream, error, name);
     if (error) {
         goto error;
     }
@@ -540,6 +592,7 @@ pstream_close(struct pstream *pstream)
 {
     if (pstream != NULL) {
         char *name = pstream->name;
+        pstream_replay_close_wfd(pstream);
         (pstream->class->close)(pstream);
         free(name);
     }
@@ -557,9 +610,12 @@ pstream_accept(struct pstream *pstream, struct stream **new_stream)
     int retval = (pstream->class->accept)(pstream, new_stream);
     if (retval) {
         *new_stream = NULL;
+        pstream_replay_write_accept(pstream, NULL, retval);
     } else {
         ovs_assert((*new_stream)->state != SCS_CONNECTING
                    || (*new_stream)->class->connect);
+        pstream_replay_write_accept(pstream, *new_stream, 0);
+        stream_replay_open_wfd(*new_stream, 0, (*new_stream)->name);
     }
     return retval;
 }
@@ -616,10 +672,10 @@ pstream_get_bound_port(const struct pstream *pstream)
  * After calling this function, stream_close() must be used to destroy
  * 'stream', otherwise resources will be leaked.
  *
- * The caller retains ownership of 'name'. */
+ * Takes ownership of 'name'. */
 void
 stream_init(struct stream *stream, const struct stream_class *class,
-            int connect_status, const char *name)
+            int connect_status, char *name)
 {
     memset(stream, 0, sizeof *stream);
     stream->class = class;
@@ -627,17 +683,18 @@ stream_init(struct stream *stream, const struct stream_class *class,
                     : !connect_status ? SCS_CONNECTED
                     : SCS_DISCONNECTED);
     stream->error = connect_status;
-    stream->name = xstrdup(name);
+    stream->name = name;
     ovs_assert(stream->state != SCS_CONNECTING || class->connect);
 }
 
+/* Takes ownership of 'name'. */
 void
 pstream_init(struct pstream *pstream, const struct pstream_class *class,
-            const char *name)
+            char *name)
 {
     memset(pstream, 0, sizeof *pstream);
     pstream->class = class;
-    pstream->name = xstrdup(name);
+    pstream->name = name;
 }
 
 void
@@ -727,12 +784,11 @@ pstream_open_with_default_port(const char *name_,
  *     - On error, function returns false and *ss contains garbage.
  */
 bool
-stream_parse_target_with_default_port(const char *target,
-                                      uint16_t default_port,
+stream_parse_target_with_default_port(const char *target, int default_port,
                                       struct sockaddr_storage *ss)
 {
     return ((!strncmp(target, "tcp:", 4) || !strncmp(target, "ssl:", 4))
-            && inet_parse_active(target + 4, default_port, ss));
+            && inet_parse_active(target + 4, default_port, ss, true));
 }
 
 /* Attempts to guess the content type of a stream whose first few bytes were

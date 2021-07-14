@@ -12,18 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
-import errno
 import os
-import types
 
 import ovs.jsonrpc
 import ovs.stream
 import ovs.util
 
-
 vlog = ovs.vlog.Vlog("unixctl_client")
-strtypes = types.StringTypes
 
 
 class UnixctlClient(object):
@@ -32,10 +27,10 @@ class UnixctlClient(object):
         self._conn = conn
 
     def transact(self, command, argv):
-        assert isinstance(command, strtypes)
+        assert isinstance(command, str)
         assert isinstance(argv, list)
         for arg in argv:
-            assert isinstance(arg, strtypes)
+            assert isinstance(arg, str)
 
         request = ovs.jsonrpc.Message.create_request(command, argv)
         error, reply = self._conn.transact_block(request)

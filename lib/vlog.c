@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2015 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,14 +31,15 @@
 #include "async-append.h"
 #include "coverage.h"
 #include "dirs.h"
-#include "dynamic-string.h"
-#include "ofpbuf.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/ofpbuf.h"
 #include "ovs-thread.h"
 #include "sat-math.h"
 #include "socket-util.h"
 #include "svec.h"
 #include "syslog-direct.h"
 #include "syslog-libc.h"
+#include "syslog-null.h"
 #include "syslog-provider.h"
 #include "timeval.h"
 #include "unixctl.h"
@@ -77,9 +78,6 @@ VLOG_LEVELS
  * used for LOG_LOCAL0. */
 BUILD_ASSERT_DECL(LOG_LOCAL0 == (16 << 3));
 
-/* The log modules. */
-struct ovs_list vlog_modules = OVS_LIST_INITIALIZER(&vlog_modules);
-
 /* Protects the 'pattern' in all "struct destination"s, so that a race between
  * changing and reading the pattern does not cause an access to freed
  * memory. */
@@ -104,12 +102,17 @@ DEFINE_STATIC_PER_THREAD_DATA(unsigned int, msg_num, 0);
  *
  * All of the following is protected by 'log_file_mutex', which nests inside
  * pattern_rwlock. */
-static struct ovs_mutex log_file_mutex = OVS_MUTEX_INITIALIZER;
-static char *log_file_name OVS_GUARDED_BY(log_file_mutex);
+static struct ovs_mutex log_file_mutex OVS_ACQ_AFTER(pattern_rwlock)
+    = OVS_MUTEX_INITIALIZER;
+static char *log_file_name OVS_GUARDED_BY(log_file_mutex) = NULL;
 static int log_fd OVS_GUARDED_BY(log_file_mutex) = -1;
 static struct async_append *log_writer OVS_GUARDED_BY(log_file_mutex);
 static bool log_async OVS_GUARDED_BY(log_file_mutex);
 static struct syslogger *syslogger = NULL;
+
+/* The log modules. */
+static struct ovs_list vlog_modules OVS_GUARDED_BY(log_file_mutex)
+    = OVS_LIST_INITIALIZER(&vlog_modules);
 
 /* Syslog export configuration. */
 static int syslog_fd OVS_GUARDED_BY(pattern_rwlock) = -1;
@@ -209,9 +212,12 @@ vlog_get_destination_val(const char *name)
     return i;
 }
 
-void vlog_insert_module(struct ovs_list *vlog)
+void
+vlog_insert_module(struct ovs_list *vlog)
 {
-    list_insert(&vlog_modules, vlog);
+    ovs_mutex_lock(&log_file_mutex);
+    ovs_list_insert(&vlog_modules, vlog);
+    ovs_mutex_unlock(&log_file_mutex);
 }
 
 /* Returns the name for logging module 'module'. */
@@ -228,11 +234,14 @@ vlog_module_from_name(const char *name)
 {
     struct vlog_module *mp;
 
+    ovs_mutex_lock(&log_file_mutex);
     LIST_FOR_EACH (mp, list, &vlog_modules) {
         if (!strcasecmp(name, mp->name)) {
+            ovs_mutex_unlock(&log_file_mutex);
             return mp;
         }
     }
+    ovs_mutex_unlock(&log_file_mutex);
 
     return NULL;
 }
@@ -248,7 +257,7 @@ vlog_get_level(const struct vlog_module *module,
 }
 
 static void
-update_min_level(struct vlog_module *module) OVS_REQUIRES(&log_file_mutex)
+update_min_level(struct vlog_module *module) OVS_REQUIRES(log_file_mutex)
 {
     enum vlog_destination destination;
 
@@ -352,7 +361,7 @@ vlog_set_log_file(const char *file_name)
     new_log_file_name = (file_name
                          ? xstrdup(file_name)
                          : xasprintf("%s/%s.log", ovs_logdir(), program_name));
-    new_log_fd = open(new_log_file_name, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    new_log_fd = open(new_log_file_name, O_WRONLY | O_CREAT | O_APPEND, 0660);
     if (new_log_fd < 0) {
         VLOG_WARN("failed to open %s for logging: %s",
                   new_log_file_name, ovs_strerror(errno));
@@ -386,11 +395,11 @@ vlog_set_log_file(const char *file_name)
     /* Close old log file, if any, and install new one. */
     ovs_mutex_lock(&log_file_mutex);
     if (log_fd >= 0) {
-        free(log_file_name);
         close(log_fd);
         async_append_destroy(log_writer);
     }
 
+    free(log_file_name);
     log_file_name = xstrdup(new_log_file_name);
     log_fd = new_log_fd;
     if (log_async) {
@@ -418,7 +427,7 @@ vlog_reopen_log_file(void)
     char *fn;
 
     ovs_mutex_lock(&log_file_mutex);
-    fn = log_file_name ? xstrdup(log_file_name) : NULL;
+    fn = nullable_xstrdup(log_file_name);
     ovs_mutex_unlock(&log_file_mutex);
 
     if (fn) {
@@ -429,6 +438,35 @@ vlog_reopen_log_file(void)
         return 0;
     }
 }
+
+#ifndef _WIN32
+/* In case a log file exists, change its owner to new 'user' and 'group'.
+ *
+ * This is useful for handling cases where the --log-file option is
+ * specified ahead of the --user option.  */
+void
+vlog_change_owner_unix(uid_t user, gid_t group)
+{
+    struct ds err = DS_EMPTY_INITIALIZER;
+    int error;
+
+    ovs_mutex_lock(&log_file_mutex);
+    error = log_file_name ? chown(log_file_name, user, group) : 0;
+    if (error) {
+        /* Build the error message. We can not call VLOG_FATAL directly
+         * here because VLOG_FATAL() will try again to to acquire
+         * 'log_file_mutex' lock, causing deadlock.
+         */
+        ds_put_format(&err, "Failed to change %s ownership: %s.",
+                      log_file_name, ovs_strerror(errno));
+    }
+    ovs_mutex_unlock(&log_file_mutex);
+
+    if (error) {
+        VLOG_FATAL("%s", ds_steal_cstr(&err));
+    }
+}
+#endif
 
 /* Set debugging levels.  Returns null if successful, otherwise an error
  * message that the caller must free(). */
@@ -547,7 +585,9 @@ vlog_set_syslog_method(const char *method)
         return;
     }
 
-    if (!strcmp(method, "libc")) {
+    if (!strcmp(method, "null")) {
+        syslogger = syslog_null_create();
+    } else if (!strcmp(method, "libc")) {
         syslogger = syslog_libc_create();
     } else if (!strncmp(method, "udp:", 4) || !strncmp(method, "unix:", 5)) {
         syslogger = syslog_direct_create(method);
@@ -562,7 +602,7 @@ vlog_set_syslog_target(const char *target)
 {
     int new_fd;
 
-    inet_open_active(SOCK_DGRAM, target, 0, NULL, &new_fd, 0);
+    inet_open_active(SOCK_DGRAM, target, -1, NULL, &new_fd, 0);
 
     ovs_rwlock_wrlock(&pattern_rwlock);
     if (syslog_fd >= 0) {
@@ -570,6 +610,21 @@ vlog_set_syslog_target(const char *target)
     }
     syslog_fd = new_fd;
     ovs_rwlock_unlock(&pattern_rwlock);
+}
+
+/*
+ * This function writes directly to log file without using async writer or
+ * taking a lock.  Caller must hold 'log_file_mutex' or be sure that it's
+ * not necessary.  Could be used in exceptional cases like dumping of backtrace
+ * on fatal signals.
+ */
+void
+vlog_direct_write_to_log_file_unsafe(const char *s)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
+{
+    if (log_fd >= 0) {
+        ignore(write(log_fd, s, strlen(s)));
+    }
 }
 
 /* Returns 'false' if 'facility' is not a valid string. If 'facility'
@@ -594,6 +649,10 @@ vlog_unixctl_set(struct unixctl_conn *conn, int argc, const char *argv[],
 {
     int i;
 
+    /* With no argument, set all destinations and modules to "dbg". */
+    if (argc == 1) {
+        vlog_set_levels(NULL, VLF_ANY_DESTINATION, VLL_DBG);
+    }
     for (i = 1; i < argc; i++) {
         char *msg = vlog_set_levels_from_string(argv[i]);
         if (msg) {
@@ -648,13 +707,37 @@ vlog_unixctl_reopen(struct unixctl_conn *conn, int argc OVS_UNUSED,
 }
 
 static void
+vlog_unixctl_close(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                   const char *argv[] OVS_UNUSED, void *aux OVS_UNUSED)
+{
+    ovs_mutex_lock(&log_file_mutex);
+    if (log_fd >= 0) {
+        close(log_fd);
+        log_fd = -1;
+
+        async_append_destroy(log_writer);
+        log_writer = NULL;
+
+        struct vlog_module *mp;
+        LIST_FOR_EACH (mp, list, &vlog_modules) {
+            update_min_level(mp);
+        }
+    }
+    ovs_mutex_unlock(&log_file_mutex);
+
+    unixctl_command_reply(conn, NULL);
+}
+
+static void
 set_all_rate_limits(bool enable)
 {
     struct vlog_module *mp;
 
+    ovs_mutex_lock(&log_file_mutex);
     LIST_FOR_EACH (mp, list, &vlog_modules) {
         mp->honor_rate_limits = enable;
     }
+    ovs_mutex_unlock(&log_file_mutex);
 }
 
 static void
@@ -713,7 +796,12 @@ vlog_init(void)
          * log anything before calling ovsthread_once_done() will deadlock. */
         atomic_read_explicit(&log_facility, &facility, memory_order_relaxed);
         if (!syslogger) {
-            syslogger = syslog_libc_create();
+            char *env = getenv("OVS_SYSLOG_METHOD");
+            if (env && env[0]) {
+                vlog_set_syslog_method(env);
+            } else {
+                syslogger = syslog_libc_create();
+            }
         }
         syslogger->class->openlog(syslogger, facility ? facility : LOG_DAEMON);
         ovsthread_once_done(&once);
@@ -730,7 +818,7 @@ vlog_init(void)
 
         unixctl_command_register(
             "vlog/set", "{spec | PATTERN:destination:pattern}",
-            1, INT_MAX, vlog_unixctl_set, NULL);
+            0, INT_MAX, vlog_unixctl_set, NULL);
         unixctl_command_register("vlog/list", "", 0, 0, vlog_unixctl_list,
                                  NULL);
         unixctl_command_register("vlog/list-pattern", "", 0, 0,
@@ -741,6 +829,8 @@ vlog_init(void)
                                  0, INT_MAX, vlog_disable_rate_limit, NULL);
         unixctl_command_register("vlog/reopen", "", 0, 0,
                                  vlog_unixctl_reopen, NULL);
+        unixctl_command_register("vlog/close", "", 0, 0,
+                                 vlog_unixctl_close, NULL);
 
         ovs_rwlock_rdlock(&pattern_rwlock);
         print_syslog_target_deprecation = syslog_fd >= 0;
@@ -769,6 +859,16 @@ vlog_enable_async(void)
     ovs_mutex_unlock(&log_file_mutex);
 }
 
+void
+vlog_disable_async(void)
+{
+    ovs_mutex_lock(&log_file_mutex);
+    log_async = false;
+    async_append_destroy(log_writer);
+    log_writer = NULL;
+    ovs_mutex_unlock(&log_file_mutex);
+}
+
 /* Print the current logging level for each module. */
 char *
 vlog_get_levels(void)
@@ -776,12 +876,12 @@ vlog_get_levels(void)
     struct ds s = DS_EMPTY_INITIALIZER;
     struct vlog_module *mp;
     struct svec lines = SVEC_EMPTY_INITIALIZER;
-    char *line;
     size_t i;
 
     ds_put_format(&s, "                 console    syslog    file\n");
     ds_put_format(&s, "                 -------    ------    ------\n");
 
+    ovs_mutex_lock(&log_file_mutex);
     LIST_FOR_EACH (mp, list, &vlog_modules) {
         struct ds line;
 
@@ -798,8 +898,11 @@ vlog_get_levels(void)
 
         svec_add_nocopy(&lines, ds_steal_cstr(&line));
     }
+    ovs_mutex_unlock(&log_file_mutex);
 
     svec_sort(&lines);
+
+    char *line;
     SVEC_FOR_EACH (i, line, &lines) {
         ds_put_cstr(&s, line);
     }
@@ -872,7 +975,7 @@ format_log_message(const struct vlog_module *module, enum vlog_level level,
     for (p = pattern; *p != '\0'; ) {
         const char *subprogram_name;
         enum { LEFT, RIGHT } justify = RIGHT;
-        int pad = '0';
+        int pad = ' ';
         size_t length, field, used;
 
         if (*p != '%') {
@@ -1000,10 +1103,17 @@ vlog_valist(const struct vlog_module *module, enum vlog_level level,
 {
     bool log_to_console = module->levels[VLF_CONSOLE] >= level;
     bool log_to_syslog = module->levels[VLF_SYSLOG] >= level;
-    bool log_to_file;
+    bool log_to_file = module->levels[VLF_FILE]  >= level;
+
+    if (!(log_to_console || log_to_syslog || log_to_file)) {
+        /* fast path - all logging levels specify no logging, no
+         * need to hog the log mutex
+         */
+        return;
+    }
 
     ovs_mutex_lock(&log_file_mutex);
-    log_to_file = module->levels[VLF_FILE] >= level && log_fd >= 0;
+    log_to_file &= (log_fd >= 0);
     ovs_mutex_unlock(&log_file_mutex);
     if (log_to_console || log_to_syslog || log_to_file) {
         int save_errno = errno;

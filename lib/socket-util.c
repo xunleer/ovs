@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,10 @@
 
 #include <config.h>
 #include "socket-util.h"
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -32,10 +35,10 @@
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "ovs-thread.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "util.h"
 #include "openvswitch/vlog.h"
 #ifdef __linux__
@@ -45,11 +48,21 @@
 #include "netlink-protocol.h"
 #include "netlink-socket.h"
 #endif
+#include "dns-resolve.h"
 
 VLOG_DEFINE_THIS_MODULE(socket_util);
 
 static int getsockopt_int(int fd, int level, int option, const char *optname,
                           int *valuep);
+static struct sockaddr_in *sin_cast(const struct sockaddr *);
+static struct sockaddr_in6 *sin6_cast(const struct sockaddr *);
+static const struct sockaddr *sa_cast(const struct sockaddr_storage *);
+static bool parse_sockaddr_components(struct sockaddr_storage *ss,
+                                      char *host_s,
+                                      const char *port_s,
+                                      uint16_t default_port,
+                                      const char *s,
+                                      bool resolve_host);
 
 /* Sets 'fd' to non-blocking mode.  Returns 0 if successful, otherwise a
  * positive errno value. */
@@ -136,13 +149,22 @@ set_dscp(int fd, int family, uint8_t dscp)
     return retval ? sock_errno() : 0;
 }
 
+/* Checks whether 'host_name' is an IPv4 or IPv6 address.  It is assumed
+ * that 'host_name' is valid.  Returns false if it is IPv4 address, true if
+ * it is IPv6 address. */
+bool
+addr_is_ipv6(const char *host_name)
+{
+    return strchr(host_name, ':') != NULL;
+}
+
 /* Translates 'host_name', which must be a string representation of an IP
  * address, into a numeric IP address in '*addr'.  Returns 0 if successful,
  * otherwise a positive errno value. */
 int
 lookup_ip(const char *host_name, struct in_addr *addr)
 {
-    if (!inet_pton(AF_INET, host_name, addr)) {
+    if (!ip_parse(host_name, &addr->s_addr)) {
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
         VLOG_ERR_RL(&rl, "\"%s\" is not a valid IP address", host_name);
         return ENOENT;
@@ -156,7 +178,7 @@ lookup_ip(const char *host_name, struct in_addr *addr)
 int
 lookup_ipv6(const char *host_name, struct in6_addr *addr)
 {
-    if (inet_pton(AF_INET6, host_name, addr) != 1) {
+    if (!ipv6_parse(host_name, addr)) {
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
         VLOG_ERR_RL(&rl, "\"%s\" is not a valid IPv6 address", host_name);
         return ENOENT;
@@ -179,7 +201,7 @@ lookup_hostname(const char *host_name, struct in_addr *addr)
     struct addrinfo *result;
     struct addrinfo hints;
 
-    if (inet_pton(AF_INET, host_name, addr)) {
+    if (ip_parse(host_name, &addr->s_addr)) {
         return 0;
     }
 
@@ -244,10 +266,26 @@ check_connection_completion(int fd)
         retval = poll(&pfd, 1, 0);
     } while (retval < 0 && errno == EINTR);
 #else
-    retval = WSAPoll(&pfd, 1, 0);
+    fd_set wrset, exset;
+    FD_ZERO(&wrset);
+    FD_ZERO(&exset);
+    FD_SET(fd, &exset);
+    FD_SET(fd, &wrset);
+    pfd.revents = 0;
+    struct timeval tv = { 0, 0 };
+    /* WSAPoll is broken on Windows, instead do a select */
+    retval = select(0, NULL, &wrset, &exset, &tv);
+    if (retval == 1) {
+        if (FD_ISSET(fd, &wrset)) {
+            pfd.revents |= pfd.events;
+        }
+        if (FD_ISSET(fd, &exset)) {
+            pfd.revents |= POLLERR;
+        }
+    }
 #endif
     if (retval == 1) {
-        if (pfd.revents & POLLERR) {
+        if (pfd.revents & (POLLERR | POLLHUP)) {
             ssize_t n = send(fd, "", 1, 0);
             if (n < 0) {
                 return sock_errno();
@@ -305,78 +343,170 @@ guess_netmask(ovs_be32 ip_)
             : htonl(0));                          /* ??? */
 }
 
-/* This is like strsep() except:
- *
- *    - The separator string is ":".
- *
- *    - Square brackets [] quote ":" separators and are removed from the
- *      tokens. */
 static char *
-parse_bracketed_token(char **pp)
+unbracket(char *s)
 {
-    char *p = *pp;
+    if (*s == '[') {
+        s++;
 
-    if (p == NULL) {
-        return NULL;
-    } else if (*p == '\0') {
-        *pp = NULL;
-        return p;
-    } else if (*p == '[') {
-        char *start = p + 1;
-        char *end = start + strcspn(start, "]");
-        *pp = (*end == '\0' ? NULL
-               : end[1] == ':' ? end + 2
-               : end + 1);
-        *end = '\0';
-        return start;
-    } else {
-        char *start = p;
-        char *end = start + strcspn(start, ":");
-        *pp = *end == '\0' ? NULL : end + 1;
-        *end = '\0';
-        return start;
+        char *end = strchr(s, '\0');
+        if (end[-1] == ']') {
+            end[-1] = '\0';
+        }
     }
+    return s;
+}
+
+/* 'host_index' is 0 if the host precedes the port within 's', 1 otherwise. */
+static void
+inet_parse_tokens__(char *s, int host_index, char **hostp, char **portp)
+{
+    char *colon = NULL;
+    bool in_brackets = false;
+    int n_colons = 0;
+    for (char *p = s; *p; p++) {
+        if (*p == '[') {
+            in_brackets = true;
+        } else if (*p == ']') {
+            in_brackets = false;
+        } else if (*p == ':' && !in_brackets) {
+            n_colons++;
+            colon = p;
+        }
+    }
+
+    *hostp = *portp = NULL;
+    if (n_colons > 1) {
+        *hostp = s;
+    } else {
+        char **tokens[2];
+        tokens[host_index] = hostp;
+        tokens[!host_index] = portp;
+
+        if (colon) {
+            *colon = '\0';
+            *tokens[1] = unbracket(colon + 1);
+        }
+        *tokens[0] = unbracket(s);
+    }
+}
+
+/* Parses 's', a string in the form "<host>[:<port>]", into its (required) host
+ * and (optional) port components, and stores pointers to them in '*hostp' and
+ * '*portp' respectively.  Always sets '*hostp' nonnull, although possibly to
+ * an empty string.  Can set '*portp' to the null string.
+ *
+ * Supports both IPv4 and IPv6.  IPv6 addresses may be quoted with square
+ * brackets.  Resolves ambiguous cases that might represent an IPv6 address or
+ * an IPv6 address and a port as representing just a host, e.g. "::1:2:3:4:80"
+ * is a host but "[::1:2:3:4]:80" is a host and a port.
+ *
+ * Modifies 's' and points '*hostp' and '*portp' (if nonnull) into it.
+ */
+void
+inet_parse_host_port_tokens(char *s, char **hostp, char **portp)
+{
+    inet_parse_tokens__(s, 0, hostp, portp);
+}
+
+/* Parses 's', a string in the form "<port>[:<host>]", into its port and host
+ * components, and stores pointers to them in '*portp' and '*hostp'
+ * respectively.  Either '*portp' and '*hostp' (but not both) can end up null.
+ *
+ * Supports both IPv4 and IPv6.  IPv6 addresses may be quoted with square
+ * brackets.  Resolves ambiguous cases that might represent an IPv6 address or
+ * an IPv6 address and a port as representing just a host, e.g. "::1:2:3:4:80"
+ * is a host but "[::1:2:3:4]:80" is a host and a port.
+ *
+ * Modifies 's' and points '*hostp' and '*portp' (if nonnull) into it.
+ */
+void
+inet_parse_port_host_tokens(char *s, char **portp, char **hostp)
+{
+    inet_parse_tokens__(s, 1, hostp, portp);
+}
+
+static bool
+parse_sockaddr_components_dns(struct sockaddr_storage *ss OVS_UNUSED,
+                              char *host_s,
+                              const char *port_s OVS_UNUSED,
+                              uint16_t default_port OVS_UNUSED,
+                              const char *s OVS_UNUSED)
+{
+    char *tmp_host_s;
+
+    dns_resolve(host_s, &tmp_host_s);
+    if (tmp_host_s != NULL) {
+        parse_sockaddr_components(ss, tmp_host_s, port_s,
+                                  default_port, s, false);
+        free(tmp_host_s);
+        return true;
+    }
+    return false;
 }
 
 static bool
 parse_sockaddr_components(struct sockaddr_storage *ss,
-                          const char *host_s,
+                          char *host_s,
                           const char *port_s, uint16_t default_port,
-                          const char *s)
+                          const char *s,
+                          bool resolve_host)
 {
-    struct sockaddr_in *sin = ALIGNED_CAST(struct sockaddr_in *, ss);
+    struct sockaddr_in *sin = sin_cast(sa_cast(ss));
     int port;
 
     if (port_s && port_s[0]) {
         if (!str_to_int(port_s, 10, &port) || port < 0 || port > 65535) {
             VLOG_ERR("%s: bad port number \"%s\"", s, port_s);
+            goto exit;
         }
     } else {
         port = default_port;
     }
 
     memset(ss, 0, sizeof *ss);
-    if (strchr(host_s, ':')) {
-        struct sockaddr_in6 *sin6
-            = ALIGNED_CAST(struct sockaddr_in6 *, ss);
+    if (host_s && strchr(host_s, ':')) {
+        struct sockaddr_in6 *sin6 = sin6_cast(sa_cast(ss));
+        char *addr = strsep(&host_s, "%");
 
         sin6->sin6_family = AF_INET6;
         sin6->sin6_port = htons(port);
-        if (!inet_pton(AF_INET6, host_s, sin6->sin6_addr.s6_addr)) {
-            VLOG_ERR("%s: bad IPv6 address \"%s\"", s, host_s);
+        if (!addr || !*addr || !ipv6_parse(addr, &sin6->sin6_addr)) {
             goto exit;
         }
+
+#ifdef HAVE_STRUCT_SOCKADDR_IN6_SIN6_SCOPE_ID
+        char *scope = strsep(&host_s, "%");
+        if (scope && *scope) {
+            if (!scope[strspn(scope, "0123456789")]) {
+                sin6->sin6_scope_id = atoi(scope);
+            } else {
+                sin6->sin6_scope_id = if_nametoindex(scope);
+                if (!sin6->sin6_scope_id) {
+                    VLOG_ERR("%s: bad IPv6 scope \"%s\" (%s)",
+                             s, scope, ovs_strerror(errno));
+                    goto exit;
+                }
+            }
+        }
+#endif
     } else {
         sin->sin_family = AF_INET;
         sin->sin_port = htons(port);
-        if (!inet_pton(AF_INET, host_s, &sin->sin_addr.s_addr)) {
-            VLOG_ERR("%s: bad IPv4 address \"%s\"", s, host_s);
-            goto exit;
+        if (host_s && !ip_parse(host_s, &sin->sin_addr.s_addr)) {
+            goto resolve;
         }
     }
 
     return true;
 
+resolve:
+    if (resolve_host && parse_sockaddr_components_dns(ss, host_s, port_s,
+                                                      default_port, s)) {
+        return true;
+    } else if (!resolve_host) {
+        VLOG_ERR("%s: bad IP address \"%s\"", s, host_s);
+    }
 exit:
     memset(ss, 0, sizeof *ss);
     return false;
@@ -384,32 +514,32 @@ exit:
 
 /* Parses 'target', which should be a string in the format "<host>[:<port>]".
  * <host>, which is required, may be an IPv4 address or an IPv6 address
- * enclosed in square brackets.  If 'default_port' is nonzero then <port> is
- * optional and defaults to 'default_port'.
+ * enclosed in square brackets.  If 'default_port' is nonnegative then <port>
+ * is optional and defaults to 'default_port' (use 0 to make the kernel choose
+ * an available port, although this isn't usually appropriate for active
+ * connections).  If 'default_port' is negative, then <port> is required.
+ * It resolves the host if 'resolve_host' is true.
  *
  * On success, returns true and stores the parsed remote address into '*ss'.
  * On failure, logs an error, stores zeros into '*ss', and returns false. */
 bool
-inet_parse_active(const char *target_, uint16_t default_port,
-                  struct sockaddr_storage *ss)
+inet_parse_active(const char *target_, int default_port,
+                  struct sockaddr_storage *ss, bool resolve_host)
 {
     char *target = xstrdup(target_);
-    const char *port;
-    const char *host;
-    char *p;
+    char *port, *host;
     bool ok;
 
-    p = target;
-    host = parse_bracketed_token(&p);
-    port = parse_bracketed_token(&p);
+    inet_parse_host_port_tokens(target, &host, &port);
     if (!host) {
         VLOG_ERR("%s: host must be specified", target_);
         ok = false;
-    } else if (!port && !default_port) {
+    } else if (!port && default_port < 0) {
         VLOG_ERR("%s: port must be specified", target_);
         ok = false;
     } else {
-        ok = parse_sockaddr_components(ss, host, port, default_port, target_);
+        ok = parse_sockaddr_components(ss, host, port, default_port,
+                                       target_, resolve_host);
     }
     if (!ok) {
         memset(ss, 0, sizeof *ss);
@@ -422,8 +552,8 @@ inet_parse_active(const char *target_, uint16_t default_port,
 /* Opens a non-blocking IPv4 or IPv6 socket of the specified 'style' and
  * connects to 'target', which should be a string in the format
  * "<host>[:<port>]".  <host>, which is required, may be an IPv4 address or an
- * IPv6 address enclosed in square brackets.  If 'default_port' is nonzero then
- * <port> is optional and defaults to 'default_port'.
+ * IPv6 address enclosed in square brackets.  If 'default_port' is nonnegative
+ * then <port> is optional and defaults to 'default_port'.
  *
  * 'style' should be SOCK_STREAM (for TCP) or SOCK_DGRAM (for UDP).
  *
@@ -438,7 +568,7 @@ inet_parse_active(const char *target_, uint16_t default_port,
  * should be in the range [0, 63] and will automatically be shifted to the
  * appropriately place in the IP tos field. */
 int
-inet_open_active(int style, const char *target, uint16_t default_port,
+inet_open_active(int style, const char *target, int default_port,
                  struct sockaddr_storage *ssp, int *fdp, uint8_t dscp)
 {
     struct sockaddr_storage ss;
@@ -446,7 +576,7 @@ inet_open_active(int style, const char *target, uint16_t default_port,
     int error;
 
     /* Parse. */
-    if (!inet_parse_active(target, default_port, &ss)) {
+    if (!inet_parse_active(target, default_port, &ss, true)) {
         error = EAFNOSUPPORT;
         goto exit;
     }
@@ -521,20 +651,16 @@ inet_parse_passive(const char *target_, int default_port,
                    struct sockaddr_storage *ss)
 {
     char *target = xstrdup(target_);
-    const char *port;
-    const char *host;
-    char *p;
+    char *port, *host;
     bool ok;
 
-    p = target;
-    port = parse_bracketed_token(&p);
-    host = parse_bracketed_token(&p);
+    inet_parse_port_host_tokens(target, &port, &host);
     if (!port && default_port < 0) {
         VLOG_ERR("%s: port must be specified", target_);
         ok = false;
     } else {
-        ok = parse_sockaddr_components(ss, host ? host : "0.0.0.0",
-                                       port, default_port, target_);
+        ok = parse_sockaddr_components(ss, host, port, default_port,
+                                       target_, true);
     }
     if (!ok) {
         memset(ss, 0, sizeof *ss);
@@ -600,7 +726,8 @@ inet_open_passive(int style, const char *target, int default_port,
     /* Bind. */
     if (bind(fd, (struct sockaddr *) &ss, ss_length(&ss)) < 0) {
         error = sock_errno();
-        VLOG_ERR("%s: bind: %s", target, sock_strerror(error));
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_ERR_RL(&rl, "%s: bind: %s", target, sock_strerror(error));
         goto error;
     }
 
@@ -644,6 +771,24 @@ error:
     }
     closesocket(fd);
     return -error;
+}
+
+/* Parses 'target', which may be an IPv4 address or an IPv6 address
+ * enclosed in square brackets.
+ *
+ * On success, returns true and stores the parsed remote address into '*ss'.
+ * On failure, logs an error, stores zeros into '*ss', and returns false. */
+bool
+inet_parse_address(const char *target_, struct sockaddr_storage *ss)
+{
+    char *target = xstrdup(target_);
+    char *host = unbracket(target);
+    bool ok = parse_sockaddr_components(ss, host, NULL, 0, target_, false);
+    if (!ok) {
+        memset(ss, 0, sizeof *ss);
+    }
+    free(target);
+    return ok;
 }
 
 int
@@ -782,11 +927,8 @@ describe_sockaddr(struct ds *string, int fd,
 
     if (!getaddr(fd, (struct sockaddr *) &ss, &len)) {
         if (ss.ss_family == AF_INET || ss.ss_family == AF_INET6) {
-            char addrbuf[SS_NTOP_BUFSIZE];
-
-            ds_put_format(string, "%s:%"PRIu16,
-                          ss_format_address(&ss, addrbuf, sizeof addrbuf),
-                          ss_get_port(&ss));
+            ss_format_address(&ss, string);
+            ds_put_format(string, ":%"PRIu16, ss_get_port(&ss));
 #ifndef _WIN32
         } else if (ss.ss_family == AF_UNIX) {
             struct sockaddr_un sun;
@@ -914,60 +1056,120 @@ describe_fd(int fd)
 #endif /* _WIN32 */
     return ds_steal_cstr(&string);
 }
-
 
-/* sockaddr_storage helpers. */
+/* sockaddr helpers. */
 
-/* Returns the IPv4 or IPv6 port in 'ss'. */
-uint16_t
-ss_get_port(const struct sockaddr_storage *ss)
+static struct sockaddr_in *
+sin_cast(const struct sockaddr *sa)
 {
-    if (ss->ss_family == AF_INET) {
-        const struct sockaddr_in *sin
-            = ALIGNED_CAST(const struct sockaddr_in *, ss);
-        return ntohs(sin->sin_port);
-    } else if (ss->ss_family == AF_INET6) {
-        const struct sockaddr_in6 *sin6
-            = ALIGNED_CAST(const struct sockaddr_in6 *, ss);
-        return ntohs(sin6->sin6_port);
+    return ALIGNED_CAST(struct sockaddr_in *, sa);
+}
+
+static struct sockaddr_in6 *
+sin6_cast(const struct sockaddr *sa)
+{
+    return ALIGNED_CAST(struct sockaddr_in6 *, sa);
+}
+
+/* Returns true if 'sa' represents an IPv4 or IPv6 address, false otherwise. */
+bool
+sa_is_ip(const struct sockaddr *sa)
+{
+    return sa->sa_family == AF_INET || sa->sa_family == AF_INET6;
+}
+
+/* Returns the IPv4 or IPv6 address in 'sa'.  Returns IPv4 addresses as
+ * v6-mapped. */
+struct in6_addr
+sa_get_address(const struct sockaddr *sa)
+{
+    ovs_assert(sa_is_ip(sa));
+    return (sa->sa_family == AF_INET
+            ? in6_addr_mapped_ipv4(sin_cast(sa)->sin_addr.s_addr)
+            : sin6_cast(sa)->sin6_addr);
+}
+
+/* Returns the IPv4 or IPv6 port in 'sa'. */
+uint16_t
+sa_get_port(const struct sockaddr *sa)
+{
+    ovs_assert(sa_is_ip(sa));
+    return ntohs(sa->sa_family == AF_INET
+                 ? sin_cast(sa)->sin_port
+                 : sin6_cast(sa)->sin6_port);
+}
+
+/* Returns true if 'name' is safe to include inside a network address field.
+ * We want to avoid names that include confusing punctuation, etc. */
+static bool OVS_UNUSED
+is_safe_name(const char *name)
+{
+    if (!name[0] || isdigit((unsigned char) name[0])) {
+        return false;
+    }
+    for (const char *p = name; *p; p++) {
+        if (!isalnum((unsigned char) *p) && *p != '-' && *p != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void
+sa_format_address__(const struct sockaddr *sa,
+                    const char *lbrack, const char *rbrack,
+                    struct ds *s)
+{
+    ovs_assert(sa_is_ip(sa));
+    if (sa->sa_family == AF_INET) {
+        ds_put_format(s, IP_FMT, IP_ARGS(sin_cast(sa)->sin_addr.s_addr));
     } else {
-        OVS_NOT_REACHED();
+        const struct sockaddr_in6 *sin6 = sin6_cast(sa);
+
+        ds_put_cstr(s, lbrack);
+        ds_reserve(s, s->length + INET6_ADDRSTRLEN);
+        char *tail = &s->string[s->length];
+        inet_ntop(AF_INET6, sin6->sin6_addr.s6_addr, tail, INET6_ADDRSTRLEN);
+        s->length += strlen(tail);
+
+#ifdef HAVE_STRUCT_SOCKADDR_IN6_SIN6_SCOPE_ID
+        uint32_t scope = sin6->sin6_scope_id;
+        if (scope) {
+            char namebuf[IF_NAMESIZE];
+            char *name = if_indextoname(scope, namebuf);
+            ds_put_char(s, '%');
+            if (name && is_safe_name(name)) {
+                ds_put_cstr(s, name);
+            } else {
+                ds_put_format(s, "%"PRIu32, scope);
+            }
+        }
+#endif
+
+        ds_put_cstr(s, rbrack);
     }
 }
 
-/* Formats the IPv4 or IPv6 address in 'ss' into the 'bufsize' bytes in 'buf'.
- * If 'ss' is an IPv6 address, puts square brackets around the address.
- * 'bufsize' should be at least SS_NTOP_BUFSIZE.
- *
- * Returns 'buf'. */
-char *
-ss_format_address(const struct sockaddr_storage *ss,
-                  char *buf, size_t bufsize)
+/* Formats the IPv4 or IPv6 address in 'sa' into 's'.  If 'sa' is an IPv6
+ * address, puts square brackets around the address. */
+void
+sa_format_address(const struct sockaddr *sa, struct ds *s)
 {
-    ovs_assert(bufsize >= SS_NTOP_BUFSIZE);
-    if (ss->ss_family == AF_INET) {
-        const struct sockaddr_in *sin
-            = ALIGNED_CAST(const struct sockaddr_in *, ss);
+    sa_format_address__(sa, "[", "]", s);
+}
 
-        snprintf(buf, bufsize, IP_FMT, IP_ARGS(sin->sin_addr.s_addr));
-    } else if (ss->ss_family == AF_INET6) {
-        const struct sockaddr_in6 *sin6
-            = ALIGNED_CAST(const struct sockaddr_in6 *, ss);
-
-        buf[0] = '[';
-        inet_ntop(AF_INET6, sin6->sin6_addr.s6_addr, buf + 1, bufsize - 1);
-        strcpy(strchr(buf, '\0'), "]");
-    } else {
-        OVS_NOT_REACHED();
-    }
-
-    return buf;
+/* Formats the IPv4 or IPv6 address in 'sa' into 's'.  Does not add square
+ * brackets around IPv6 addresses. */
+void
+sa_format_address_nobracks(const struct sockaddr *sa, struct ds *s)
+{
+    sa_format_address__(sa, "", "", s);
 }
 
 size_t
-ss_length(const struct sockaddr_storage *ss)
+sa_length(const struct sockaddr *sa)
 {
-    switch (ss->ss_family) {
+    switch (sa->sa_family) {
     case AF_INET:
         return sizeof(struct sockaddr_in);
 
@@ -978,7 +1180,51 @@ ss_length(const struct sockaddr_storage *ss)
         OVS_NOT_REACHED();
     }
 }
+
+/* sockaddr_storage helpers.  */
 
+static const struct sockaddr *
+sa_cast(const struct sockaddr_storage *ss)
+{
+    return ALIGNED_CAST(const struct sockaddr *, ss);
+}
+
+bool
+ss_is_ip(const struct sockaddr_storage *ss)
+{
+    return sa_is_ip(sa_cast(ss));
+}
+
+uint16_t
+ss_get_port(const struct sockaddr_storage *ss)
+{
+    return sa_get_port(sa_cast(ss));
+}
+
+struct in6_addr
+ss_get_address(const struct sockaddr_storage *ss)
+{
+    return sa_get_address(sa_cast(ss));
+}
+
+void
+ss_format_address(const struct sockaddr_storage *ss, struct ds *s)
+{
+    sa_format_address(sa_cast(ss), s);
+}
+
+void
+ss_format_address_nobracks(const struct sockaddr_storage *ss, struct ds *s)
+{
+    sa_format_address_nobracks(sa_cast(ss), s);
+}
+
+size_t
+ss_length(const struct sockaddr_storage *ss)
+{
+    return sa_length(sa_cast(ss));
+}
+
 /* For Windows socket calls, 'errno' is not set.  One has to call
  * WSAGetLastError() to get the error number and then pass it to
  * this function to get the correct error string.
@@ -994,3 +1240,100 @@ sock_strerror(int error)
     return ovs_strerror(error);
 #endif
 }
+
+#ifdef __linux__
+static int
+emulate_sendmmsg(int fd, struct mmsghdr *msgs, unsigned int n,
+                 unsigned int flags)
+{
+    for (unsigned int i = 0; i < n; i++) {
+        ssize_t retval = sendmsg(fd, &msgs[i].msg_hdr, flags);
+        if (retval < 0) {
+            return i ? i : retval;
+        }
+        msgs[i].msg_len = retval;
+    }
+    return n;
+}
+
+#ifndef HAVE_SENDMMSG
+int
+sendmmsg(int fd, struct mmsghdr *msgs, unsigned int n, unsigned int flags)
+{
+    return emulate_sendmmsg(fd, msgs, n, flags);
+}
+#else
+/* sendmmsg was redefined in lib/socket-util.c, should undef sendmmsg here
+ * to avoid recursion */
+#undef sendmmsg
+int
+wrap_sendmmsg(int fd, struct mmsghdr *msgs, unsigned int n, unsigned int flags)
+{
+    static bool sendmmsg_broken = false;
+    if (!sendmmsg_broken) {
+        int save_errno = errno;
+        int retval = sendmmsg(fd, msgs, n, flags);
+        if (retval >= 0 || errno != ENOSYS) {
+            return retval;
+        }
+        sendmmsg_broken = true;
+        errno = save_errno;
+    }
+    return emulate_sendmmsg(fd, msgs, n, flags);
+}
+#endif
+
+static int
+emulate_recvmmsg(int fd, struct mmsghdr *msgs, unsigned int n,
+                 int flags, struct timespec *timeout OVS_UNUSED)
+{
+    ovs_assert(!timeout);       /* XXX not emulated */
+
+    bool waitforone = flags & MSG_WAITFORONE;
+    flags &= ~MSG_WAITFORONE;
+
+    for (unsigned int i = 0; i < n; i++) {
+        ssize_t retval = recvmsg(fd, &msgs[i].msg_hdr, flags);
+        if (retval < 0) {
+            return i ? i : retval;
+        }
+        msgs[i].msg_len = retval;
+
+        if (waitforone) {
+            flags |= MSG_DONTWAIT;
+        }
+    }
+    return n;
+}
+
+#ifndef HAVE_SENDMMSG
+int
+recvmmsg(int fd, struct mmsghdr *msgs, unsigned int n,
+         int flags, struct timespec *timeout)
+{
+    return emulate_recvmmsg(fd, msgs, n, flags, timeout);
+}
+#else
+/* recvmmsg was redefined in lib/socket-util.c, should undef recvmmsg here
+ * to avoid recursion */
+#undef recvmmsg
+int
+wrap_recvmmsg(int fd, struct mmsghdr *msgs, unsigned int n,
+              int flags, struct timespec *timeout)
+{
+    ovs_assert(!timeout);       /* XXX not emulated */
+
+    static bool recvmmsg_broken = false;
+    if (!recvmmsg_broken) {
+        int save_errno = errno;
+        int retval = recvmmsg(fd, msgs, n, flags, timeout);
+        if (retval >= 0 || errno != ENOSYS) {
+            return retval;
+        }
+        recvmmsg_broken = true;
+        errno = save_errno;
+    }
+    return emulate_recvmmsg(fd, msgs, n, flags, timeout);
+}
+#endif
+#endif /* __linux__ */

@@ -26,11 +26,11 @@
 #define ETH_TYPE_LLDP   0x88cc
 
 /* Dummy MAC addresses */
-static const struct eth_addr chassis_mac = { { { 0x5e, 0x10, 0x8e, 0xe7, 0x84, 0xad } } };
-static const struct eth_addr eth_src = { { { 0x5e, 0x10, 0x8e, 0xe7, 0x84, 0xad } } };
+static const struct eth_addr chassis_mac = ETH_ADDR_C(5e,10,8e,e7,84,ad);
+static const struct eth_addr eth_src = ETH_ADDR_C(5e,10,8e,e7,84,ad);
 
 /* LLDP multicast address */
-static const struct eth_addr eth_addr_lldp = { { { 0x01, 0x80, 0xC2, 0x00, 0x00, 0x0e } } };
+static const struct eth_addr eth_addr_lldp = ETH_ADDR_C(01,80,c2,00,00,0e);
 
 /* Count of tests run */
 static int num_tests = 0;
@@ -47,8 +47,6 @@ check_received_port(struct lldpd_port *sport,
     assert(rport->p_id_len == sport->p_id_len);
     assert(strncmp(rport->p_id, sport->p_id, sport->p_id_len) == 0);
     assert(strcmp(rport->p_descr, sport->p_descr) == 0);
-
-    return;
 }
 
 
@@ -66,8 +64,6 @@ check_received_chassis(struct lldpd_chassis *schassis,
     assert(strcmp(rchassis->c_descr, schassis->c_descr) == 0);
     assert(rchassis->c_cap_available == schassis->c_cap_available);
     assert(rchassis->c_cap_enabled == schassis->c_cap_enabled);
-
-    return;
 }
 
 
@@ -96,7 +92,7 @@ check_received_aa(struct lldpd_port *sport,
            sport->p_element.system_id.rsvd2[1]);
 
     /* Should receive 2 mappings */
-    assert(!list_is_empty(&rport->p_isid_vlan_maps));
+    assert(!ovs_list_is_empty(&rport->p_isid_vlan_maps));
 
     /* For each received isid/vlan mapping */
     LIST_FOR_EACH (received_map, m_entries, &rport->p_isid_vlan_maps) {
@@ -113,8 +109,6 @@ check_received_aa(struct lldpd_port *sport,
         i++;
     }
     assert(i == 2);
-
-    return;
 }
 
 
@@ -187,7 +181,7 @@ test_aa_send(void)
     lldp = lldp_create_dummy();
     if ((lldp == NULL) ||
         (lldp->lldpd == NULL) ||
-        list_is_empty(&lldp->lldpd->g_hardware)) {
+        ovs_list_is_empty(&lldp->lldpd->g_hardware)) {
         printf("Error: unable to create dummy lldp instance");
         return 1;
     }
@@ -235,9 +229,9 @@ test_aa_send(void)
     map[1].isid_vlan_data.vlan    = map_init[1].isid_vlan_data.vlan;
     map[1].isid_vlan_data.isid    = map_init[1].isid_vlan_data.isid;
 
-    list_init(&hw->h_lport.p_isid_vlan_maps);
-    list_push_back(&hw->h_lport.p_isid_vlan_maps, &map[0].m_entries);
-    list_push_back(&hw->h_lport.p_isid_vlan_maps, &map[1].m_entries);
+    ovs_list_init(&hw->h_lport.p_isid_vlan_maps);
+    ovs_list_push_back(&hw->h_lport.p_isid_vlan_maps, &map[0].m_entries);
+    ovs_list_push_back(&hw->h_lport.p_isid_vlan_maps, &map[1].m_entries);
 
     /* Construct LLDPPDU (including Ethernet header) */
     eth_compose(&packet, eth_addr_lldp, eth_src, ETH_TYPE_LLDP, 0);
@@ -266,6 +260,11 @@ test_aa_send(void)
 
     /* Verify auto attach values */
     check_received_aa(&hardware.h_lport, nport, map_init);
+
+    lldpd_chassis_cleanup(nchassis, true);
+    lldpd_port_cleanup(nport, true);
+    free(nport);
+    lldp_destroy_dummy(lldp);
 
     return 0;
 }

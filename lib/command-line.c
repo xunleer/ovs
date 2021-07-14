@@ -19,7 +19,8 @@
 #include <getopt.h>
 #include <limits.h>
 #include <stdlib.h>
-#include "dynamic-string.h"
+#include "svec.h"
+#include "openvswitch/dynamic-string.h"
 #include "ovs-thread.h"
 #include "util.h"
 #include "openvswitch/vlog.h"
@@ -50,6 +51,137 @@ ovs_cmdl_long_options_to_short_options(const struct option options[])
     *p = '\0';
 
     return xstrdup(short_options);
+}
+
+static char * OVS_WARN_UNUSED_RESULT
+build_short_options(const struct option *long_options)
+{
+    char *tmp, *short_options;
+
+    tmp = ovs_cmdl_long_options_to_short_options(long_options);
+    short_options = xasprintf("+:%s", tmp);
+    free(tmp);
+
+    return short_options;
+}
+
+static const struct option *
+find_option_by_value(const struct option *options, int value)
+{
+    const struct option *o;
+
+    for (o = options; o->name; o++) {
+        if (o->val == value) {
+            return o;
+        }
+    }
+    return NULL;
+}
+
+/* Parses options set using environment variable.  The caller specifies the
+ * supported options in environment variable.  On success, adds the parsed
+ * env variables in 'argv', the number of options in 'argc', and returns argv.
+ *  */
+char **
+ovs_cmdl_env_parse_all(int *argcp, char *argv[], const char *env_options)
+{
+    ovs_assert(*argcp > 0);
+
+    struct svec args = SVEC_EMPTY_INITIALIZER;
+    svec_add(&args, argv[0]);
+    if (env_options) {
+        svec_parse_words(&args, env_options);
+    }
+    for (int i = 1; i < *argcp; i++) {
+        svec_add(&args, argv[i]);
+    }
+    svec_terminate(&args);
+
+    *argcp = args.n;
+    return args.names;
+}
+
+/* Parses the command-line options in 'argc' and 'argv'.  The caller specifies
+ * the supported options in 'options'.  On success, stores the parsed options
+ * in '*pop', the number of options in '*n_pop', and returns NULL.  On failure,
+ * returns an error message and zeros the output arguments. */
+char * OVS_WARN_UNUSED_RESULT
+ovs_cmdl_parse_all(int argc, char *argv[],
+                   const struct option *options,
+                   struct ovs_cmdl_parsed_option **pop, size_t *n_pop)
+{
+    /* Count number of options so we can have better assertions later. */
+    size_t n_options OVS_UNUSED = 0;
+    while (options[n_options].name) {
+        n_options++;
+    }
+
+    char *short_options = build_short_options(options);
+
+    struct ovs_cmdl_parsed_option *po = NULL;
+    size_t allocated_po = 0;
+    size_t n_po = 0;
+
+    char *error;
+
+    optind = 0;
+    opterr = 0;
+    for (;;) {
+        int idx = -1;
+        int c = getopt_long(argc, argv, short_options, options, &idx);
+        switch (c) {
+        case -1:
+            *pop = po;
+            *n_pop = n_po;
+            free(short_options);
+            return NULL;
+
+        case 0:
+            /* getopt_long() processed the option directly by setting a flag
+             * variable.  This is probably undesirable for use with this
+             * function. */
+            OVS_NOT_REACHED();
+
+        case '?':
+            if (optopt && find_option_by_value(options, optopt)) {
+                error = xasprintf("option '%s' doesn't allow an argument",
+                                  argv[optind - 1]);
+            } else if (optopt) {
+                error = xasprintf("unrecognized option '%c'", optopt);
+            } else {
+                error = xasprintf("unrecognized option '%s'",
+                                  argv[optind - 1]);
+            }
+            goto error;
+
+        case ':':
+            error = xasprintf("option '%s' requires an argument",
+                              argv[optind - 1]);
+            goto error;
+
+        default:
+            if (n_po >= allocated_po) {
+                po = x2nrealloc(po, &allocated_po, sizeof *po);
+            }
+            if (idx == -1) {
+                po[n_po].o = find_option_by_value(options, c);
+            } else {
+                ovs_assert(idx >= 0 && idx < n_options);
+                po[n_po].o = &options[idx];
+            }
+            po[n_po].arg = optarg;
+            n_po++;
+            break;
+        }
+    }
+    OVS_NOT_REACHED();
+
+error:
+    free(po);
+    *pop = NULL;
+    *n_pop = 0;
+    free(short_options);
+    return error;
 }
 
 /* Given the 'struct ovs_cmdl_command' array, prints the usage of all commands. */
@@ -87,20 +219,10 @@ ovs_cmdl_print_options(const struct option options[])
     ds_destroy(&ds);
 }
 
-/* Runs the command designated by argv[0] within the command table specified by
- * 'commands', which must be terminated by a command whose 'name' member is a
- * null pointer.
- *
- * Command-line options should be stripped off, so that a typical invocation
- * looks like:
- *    struct ovs_cmdl_context ctx = {
- *        .argc = argc - optind,
- *        .argv = argv + optind,
- *    };
- *    ovs_cmdl_run_command(&ctx, my_commands);
- * */
-void
-ovs_cmdl_run_command(struct ovs_cmdl_context *ctx, const struct ovs_cmdl_command commands[])
+static void
+ovs_cmdl_run_command__(struct ovs_cmdl_context *ctx,
+                       const struct ovs_cmdl_command commands[],
+                       bool read_only)
 {
     const struct ovs_cmdl_command *p;
 
@@ -118,6 +240,10 @@ ovs_cmdl_run_command(struct ovs_cmdl_context *ctx, const struct ovs_cmdl_command
                 VLOG_FATAL("'%s' command takes at most %d arguments",
                            p->name, p->max_args);
             } else {
+                if (p->mode == OVS_RW && read_only) {
+                    VLOG_FATAL("'%s' command does not work in read only mode",
+                               p->name);
+                }
                 p->handler(ctx);
                 if (ferror(stdout)) {
                     VLOG_FATAL("write to stdout failed");
@@ -131,6 +257,32 @@ ovs_cmdl_run_command(struct ovs_cmdl_context *ctx, const struct ovs_cmdl_command
     }
 
     VLOG_FATAL("unknown command '%s'; use --help for help", ctx->argv[0]);
+}
+
+/* Runs the command designated by argv[0] within the command table specified by
+ * 'commands', which must be terminated by a command whose 'name' member is a
+ * null pointer.
+ *
+ * Command-line options should be stripped off, so that a typical invocation
+ * looks like:
+ *    struct ovs_cmdl_context ctx = {
+ *        .argc = argc - optind,
+ *        .argv = argv + optind,
+ *    };
+ *    ovs_cmdl_run_command(&ctx, my_commands);
+ * */
+void
+ovs_cmdl_run_command(struct ovs_cmdl_context *ctx,
+                     const struct ovs_cmdl_command commands[])
+{
+    ovs_cmdl_run_command__(ctx, commands, false);
+}
+
+void
+ovs_cmdl_run_command_read_only(struct ovs_cmdl_context *ctx,
+                               const struct ovs_cmdl_command commands[])
+{
+    ovs_cmdl_run_command__(ctx, commands, true);
 }
 
 /* Process title. */

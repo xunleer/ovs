@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2009, 2010, 2011, 2012, 2014, 2015, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,13 +31,13 @@
 
 #include "command-line.h"
 #include "compiler.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
 #include "hash.h"
-#include "json.h"
+#include "openvswitch/json.h"
 #include "ovsdb-data.h"
 #include "ovsdb-idl.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "process.h"
 #include "stream.h"
 #include "stream-ssl.h"
@@ -65,7 +65,7 @@ static bool oneline;
 static bool dry_run;
 
 /* --timeout: Time to wait for a connection to 'db'. */
-static int timeout;
+static unsigned int timeout;
 
 /* Format for table output. */
 static struct table_style table_style = TABLE_STYLE_DEFAULT;
@@ -82,44 +82,44 @@ OVS_NO_RETURN static void usage(void);
 static void parse_options(int argc, char *argv[], struct shash *local_options);
 static void run_prerequisites(struct ctl_command[], size_t n_commands,
                               struct ovsdb_idl *);
-static void do_vtep_ctl(const char *args, struct ctl_command *, size_t n,
+static bool do_vtep_ctl(const char *args, struct ctl_command *, size_t n,
                         struct ovsdb_idl *);
 static struct vtep_ctl_lswitch *find_lswitch(struct vtep_ctl_context *,
+                                             const char *name,
+                                             bool must_exist);
+static struct vtep_ctl_lrouter *find_lrouter(struct vtep_ctl_context *,
                                              const char *name,
                                              bool must_exist);
 
 int
 main(int argc, char *argv[])
 {
-    extern struct vlog_module VLM_reconnect;
     struct ovsdb_idl *idl;
     struct ctl_command *commands;
     struct shash local_options;
     unsigned int seqno;
     size_t n_commands;
-    char *args;
 
     set_program_name(argv[0]);
     fatal_ignore_sigpipe();
     vlog_set_levels(NULL, VLF_CONSOLE, VLL_WARN);
-    vlog_set_levels(&VLM_reconnect, VLF_ANY_DESTINATION, VLL_WARN);
-    vteprec_init();
+    vlog_set_levels_from_string_assert("reconnect:warn");
 
     vtep_ctl_cmd_init();
 
-    /* Log our arguments.  This is often valuable for debugging systems. */
-    args = process_escape_args(argv);
-    VLOG(ctl_might_write_to_db(argv) ? VLL_INFO : VLL_DBG, "Called as %s", args);
-
     /* Parse command line. */
+    char *args = process_escape_args(argv);
     shash_init(&local_options);
     parse_options(argc, argv, &local_options);
-    commands = ctl_parse_commands(argc - optind, argv + optind, &local_options,
-                                  &n_commands);
-
-    if (timeout) {
-        time_alarm(timeout);
+    char *error = ctl_parse_commands(argc - optind, argv + optind,
+                                     &local_options, &commands, &n_commands);
+    if (error) {
+        ctl_fatal("%s", error);
     }
+    VLOG(ctl_might_write_to_db(commands, n_commands) ? VLL_INFO : VLL_DBG,
+         "Called as %s", args);
+
+    ctl_timeout_setup(timeout);
 
     /* Initialize IDL. */
     idl = the_idl = ovsdb_idl_create(db, &vteprec_idl_class, false, false);
@@ -135,10 +135,18 @@ main(int argc, char *argv[])
     seqno = ovsdb_idl_get_seqno(idl);
     for (;;) {
         ovsdb_idl_run(idl);
+        if (!ovsdb_idl_is_alive(idl)) {
+            int retval = ovsdb_idl_get_last_error(idl);
+            ctl_fatal("%s: database connection failed (%s)",
+                        db, ovs_retval_to_string(retval));
+        }
 
         if (seqno != ovsdb_idl_get_seqno(idl)) {
             seqno = ovsdb_idl_get_seqno(idl);
-            do_vtep_ctl(args, commands, n_commands, idl);
+            if (do_vtep_ctl(args, commands, n_commands, idl)) {
+                free(args);
+                exit(EXIT_SUCCESS);
+            }
         }
 
         if (seqno == ovsdb_idl_get_seqno(idl)) {
@@ -159,7 +167,8 @@ parse_options(int argc, char *argv[], struct shash *local_options)
         OPT_PEER_CA_CERT,
         OPT_LOCAL,
         VLOG_OPTION_ENUMS,
-        TABLE_OPTION_ENUMS
+        TABLE_OPTION_ENUMS,
+        SSL_OPTION_ENUMS,
     };
     static const struct option global_long_options[] = {
         {"db", required_argument, NULL, OPT_DB},
@@ -195,7 +204,6 @@ parse_options(int argc, char *argv[], struct shash *local_options)
     allocated_options = ARRAY_SIZE(global_long_options);
     n_options = n_global_long_options;
     ctl_add_cmd_options(&options, &n_options, &allocated_options, OPT_LOCAL);
-    table_style.format = TF_LIST;
 
     for (;;) {
         int idx;
@@ -216,7 +224,7 @@ parse_options(int argc, char *argv[], struct shash *local_options)
             break;
 
         case OPT_NO_SYSLOG:
-            vlog_set_levels(&VLM_vtep_ctl, VLF_SYSLOG, VLL_WARN);
+            vlog_set_levels(&this_module, VLF_SYSLOG, VLL_WARN);
             break;
 
         case OPT_DRY_RUN:
@@ -230,7 +238,7 @@ parse_options(int argc, char *argv[], struct shash *local_options)
             }
             shash_add_nocopy(local_options,
                              xasprintf("--%s", options[idx].name),
-                             optarg ? xstrdup(optarg) : NULL);
+                             nullable_xstrdup(optarg));
             break;
 
         case 'h':
@@ -242,10 +250,8 @@ parse_options(int argc, char *argv[], struct shash *local_options)
             exit(EXIT_SUCCESS);
 
         case 't':
-            timeout = strtoul(optarg, NULL, 10);
-            if (timeout < 0) {
-                ctl_fatal("value %s on -t or --timeout is invalid",
-                          optarg);
+            if (!str_to_uint(optarg, 10, &timeout) || !timeout) {
+                ctl_fatal("value %s on -t or --timeout is invalid", optarg);
             }
             break;
 
@@ -307,6 +313,7 @@ VTEP commands:\n\
 Manager commands:\n\
   get-manager                 print the managers\n\
   del-manager                 delete the managers\n\
+  [--inactivity-probe=MSECS]\n\
   set-manager TARGET...       set the list of managers to TARGET...\n\
 \n\
 Physical Switch commands:\n\
@@ -328,6 +335,14 @@ Logical Switch commands:\n\
   bind-ls PS PORT VLAN LS     bind LS to VLAN on PORT\n\
   unbind-ls PS PORT VLAN      unbind logical switch on VLAN from PORT\n\
   list-bindings PS PORT       list bindings for PORT on PS\n\
+  set-replication-mode LS MODE  set replication mode on LS\n\
+  get-replication-mode LS       get replication mode on LS\n\
+\n\
+Logical Router commands:\n\
+  add-lr LR                   create a new logical router named LR\n\
+  del-lr LR                   delete LR\n\
+  list-lr                     print the names of all the logical routers\n\
+  lr-exists LR                exit 2 if LR does not exist\n\
 \n\
 MAC binding commands:\n\
   add-ucast-local LS MAC [ENCAP] IP   add ucast local entry in LS\n\
@@ -344,6 +359,7 @@ MAC binding commands:\n\
   list-remote-macs LS                 list remote mac entries\n\
 \n\
 %s\
+%s\
 \n\
 Options:\n\
   --db=DATABASE               connect to DATABASE\n\
@@ -351,7 +367,9 @@ Options:\n\
   -t, --timeout=SECS          wait at most SECS seconds\n\
   --dry-run                   do not commit changes to database\n\
   --oneline                   print exactly one line of output per command\n",
-           program_name, program_name, ctl_get_db_cmd_usage(), ctl_default_db());
+           program_name, program_name, ctl_get_db_cmd_usage(),
+           ctl_list_db_tables_usage(), ctl_default_db());
+    table_usage();
     vlog_usage();
     printf("\
   --no-syslog                 equivalent to --verbose=vtep_ctl:syslog:warn\n");
@@ -432,6 +450,8 @@ struct vtep_ctl_context {
                              * struct vtep_ctl_lswitch. */
     struct shash plocs;     /* Maps from "<encap>+<dst_ip>" to
                              * struct vteprec_physical_locator. */
+    struct shash lrouters;  /* Maps from logical router name to
+                             * struct vtep_ctl_lrouter. */
 };
 
 /* Casts 'base' into 'struct vtep_ctl_context'. */
@@ -461,6 +481,11 @@ struct vtep_ctl_lswitch {
     struct shash ucast_remote;  /* Maps from mac to vteprec_ucast_macs_remote.*/
     struct shash mcast_local;   /* Maps from mac to vtep_ctl_mcast_mac. */
     struct shash mcast_remote;  /* Maps from mac to vtep_ctl_mcast_mac. */
+};
+
+struct vtep_ctl_lrouter {
+    const struct vteprec_logical_router *lr_cfg;
+    char *name;
 };
 
 struct vtep_ctl_mcast_mac {
@@ -501,7 +526,7 @@ add_port_to_cache(struct vtep_ctl_context *vtepctl_ctx,
     struct vtep_ctl_port *port;
 
     port = xmalloc(sizeof *port);
-    list_push_back(&ps->ports, &port->ports_node);
+    ovs_list_push_back(&ps->ports, &port->ports_node);
     port->port_cfg = port_cfg;
     port->ps = ps;
     shash_add(&vtepctl_ctx->ports, cache_name, port);
@@ -517,9 +542,10 @@ del_cached_port(struct vtep_ctl_context *vtepctl_ctx,
 {
     char *cache_name = xasprintf("%s+%s", port->ps->name, port->port_cfg->name);
 
-    list_remove(&port->ports_node);
+    ovs_list_remove(&port->ports_node);
     shash_find_and_delete(&vtepctl_ctx->ports, cache_name);
     vteprec_physical_port_delete(port->port_cfg);
+    shash_destroy(&port->bindings);
     free(cache_name);
     free(port);
 }
@@ -531,7 +557,7 @@ add_pswitch_to_cache(struct vtep_ctl_context *vtepctl_ctx,
     struct vtep_ctl_pswitch *ps = xmalloc(sizeof *ps);
     ps->ps_cfg = ps_cfg;
     ps->name = xstrdup(ps_cfg->name);
-    list_init(&ps->ports);
+    ovs_list_init(&ps->ports);
     shash_add(&vtepctl_ctx->pswitches, ps->name, ps);
 }
 
@@ -556,7 +582,7 @@ vtep_delete_pswitch(const struct vteprec_global *vtep_global,
 static void
 del_cached_pswitch(struct vtep_ctl_context *ctx, struct vtep_ctl_pswitch *ps)
 {
-    ovs_assert(list_is_empty(&ps->ports));
+    ovs_assert(ovs_list_is_empty(&ps->ports));
     if (ps->ps_cfg) {
         vteprec_physical_switch_delete(ps->ps_cfg);
         vtep_delete_pswitch(ctx->vtep_global, ps->ps_cfg);
@@ -643,6 +669,28 @@ del_cached_ls_binding(struct vtep_ctl_port *port, const char *vlan)
     shash_find_and_delete(&port->bindings, vlan);
 }
 
+static struct vtep_ctl_lrouter *
+add_lrouter_to_cache(struct vtep_ctl_context *vtepctl_ctx,
+                     const struct vteprec_logical_router *lr_cfg)
+{
+    struct vtep_ctl_lrouter *lr = xmalloc(sizeof *lr);
+    lr->lr_cfg = lr_cfg;
+    lr->name = xstrdup(lr_cfg->name);
+    shash_add(&vtepctl_ctx->lrouters, lr->name, lr);
+    return lr;
+}
+
+static void
+del_cached_lrouter(struct vtep_ctl_context *ctx, struct vtep_ctl_lrouter *lr)
+{
+    if (lr->lr_cfg) {
+        vteprec_logical_router_delete(lr->lr_cfg);
+    }
+    shash_find_and_delete(&ctx->lrouters, lr->name);
+    free(lr->name);
+    free(lr);
+}
+
 static struct vteprec_physical_locator *
 find_ploc(struct vtep_ctl_context *vtepctl_ctx, const char *encap,
           const char *dst_ip)
@@ -681,7 +729,7 @@ add_ploc_to_mcast_mac(struct vtep_ctl_mcast_mac *mcast_mac,
 
     ploc = xmalloc(sizeof *ploc);
     ploc->ploc_cfg = ploc_cfg;
-    list_push_back(&mcast_mac->locators, &ploc->locators_node);
+    ovs_list_push_back(&mcast_mac->locators, &ploc->locators_node);
 }
 
 static void
@@ -692,7 +740,7 @@ del_ploc_from_mcast_mac(struct vtep_ctl_mcast_mac *mcast_mac,
 
     LIST_FOR_EACH (ploc, locators_node, &mcast_mac->locators) {
         if (ploc->ploc_cfg == ploc_cfg) {
-            list_remove(&ploc->locators_node);
+            ovs_list_remove(&ploc->locators_node);
             free(ploc);
             return;
         }
@@ -713,7 +761,7 @@ add_mcast_mac_to_cache(struct vtep_ctl_context *vtepctl_ctx,
     mcast_shash = local ? &ls->mcast_local : &ls->mcast_remote;
 
     mcast_mac->ploc_set_cfg = ploc_set_cfg;
-    list_init(&mcast_mac->locators);
+    ovs_list_init(&mcast_mac->locators);
     shash_add(mcast_shash, mac, mcast_mac);
 
     for (i = 0; i < ploc_set_cfg->n_locators; i++) {
@@ -787,6 +835,13 @@ vtep_ctl_context_invalidate_cache(struct ctl_context *ctx)
     }
     shash_destroy(&vtepctl_ctx->lswitches);
     shash_destroy(&vtepctl_ctx->plocs);
+
+    SHASH_FOR_EACH (node, &vtepctl_ctx->lrouters) {
+        struct vtep_ctl_lrouter *lr = node->data;
+        free(lr->name);
+        free(lr);
+    }
+    shash_destroy(&vtepctl_ctx->lrouters);
 }
 
 static void
@@ -802,6 +857,10 @@ pre_get_info(struct ctl_context *ctx)
     ovsdb_idl_add_column(ctx->idl, &vteprec_physical_port_col_vlan_bindings);
 
     ovsdb_idl_add_column(ctx->idl, &vteprec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl,
+                         &vteprec_logical_switch_col_replication_mode);
+
+    ovsdb_idl_add_column(ctx->idl, &vteprec_logical_router_col_name);
 
     ovsdb_idl_add_column(ctx->idl, &vteprec_ucast_macs_local_col_MAC);
     ovsdb_idl_add_column(ctx->idl, &vteprec_ucast_macs_local_col_locator);
@@ -843,12 +902,14 @@ vtep_ctl_context_populate_cache(struct ctl_context *ctx)
     struct vtep_ctl_context *vtepctl_ctx = vtep_ctl_context_cast(ctx);
     const struct vteprec_global *vtep_global = vtepctl_ctx->vtep_global;
     const struct vteprec_logical_switch *ls_cfg;
+    const struct vteprec_logical_router *lr_cfg;
     const struct vteprec_ucast_macs_local *ucast_local_cfg;
     const struct vteprec_ucast_macs_remote *ucast_remote_cfg;
     const struct vteprec_mcast_macs_local *mcast_local_cfg;
     const struct vteprec_mcast_macs_remote *mcast_remote_cfg;
     const struct vteprec_tunnel *tunnel_cfg;
     struct sset pswitches, ports, lswitches;
+    struct sset lrouters;
     size_t i;
 
     if (vtepctl_ctx->cache_valid) {
@@ -860,6 +921,7 @@ vtep_ctl_context_populate_cache(struct ctl_context *ctx)
     shash_init(&vtepctl_ctx->ports);
     shash_init(&vtepctl_ctx->lswitches);
     shash_init(&vtepctl_ctx->plocs);
+    shash_init(&vtepctl_ctx->lrouters);
 
     sset_init(&pswitches);
     sset_init(&ports);
@@ -896,6 +958,17 @@ vtep_ctl_context_populate_cache(struct ctl_context *ctx)
         add_lswitch_to_cache(vtepctl_ctx, ls_cfg);
     }
     sset_destroy(&lswitches);
+
+    sset_init(&lrouters);
+    VTEPREC_LOGICAL_ROUTER_FOR_EACH (lr_cfg, ctx->idl) {
+        if (!sset_add(&lrouters, lr_cfg->name)) {
+            VLOG_WARN("%s: database contains duplicate logical router name",
+                      lr_cfg->name);
+            continue;
+        }
+        add_lrouter_to_cache(vtepctl_ctx, lr_cfg);
+    }
+    sset_destroy(&lrouters);
 
     VTEPREC_UCAST_MACS_LOCAL_FOR_EACH (ucast_local_cfg, ctx->idl) {
         struct vtep_ctl_lswitch *ls;
@@ -1016,7 +1089,6 @@ vtep_ctl_context_populate_cache(struct ctl_context *ctx)
             port = add_port_to_cache(vtepctl_ctx, ps, port_cfg);
 
             for (k = 0; k < port_cfg->n_vlan_bindings; k++) {
-                struct vteprec_logical_switch *ls_cfg;
                 struct vtep_ctl_lswitch *ls;
                 char *vlan;
 
@@ -1459,6 +1531,127 @@ cmd_unbind_ls(struct ctl_context *ctx)
 }
 
 static void
+cmd_set_replication_mode(struct ctl_context *ctx)
+{
+    struct vtep_ctl_context *vtepctl_ctx = vtep_ctl_context_cast(ctx);
+    struct vtep_ctl_lswitch *ls;
+    const char *ls_name = ctx->argv[1];
+
+    vtep_ctl_context_populate_cache(ctx);
+
+    if (strcmp(ctx->argv[2], "service_node") &&
+        strcmp(ctx->argv[2], "source_node")) {
+        ctl_fatal("Replication mode must be 'service_node' or 'source_node'");
+    }
+
+    ls = find_lswitch(vtepctl_ctx, ls_name, true);
+    vteprec_logical_switch_set_replication_mode(ls->ls_cfg, ctx->argv[2]);
+
+    vtep_ctl_context_invalidate_cache(ctx);
+}
+
+static void
+cmd_get_replication_mode(struct ctl_context *ctx)
+{
+    struct vtep_ctl_context *vtepctl_ctx = vtep_ctl_context_cast(ctx);
+    struct vtep_ctl_lswitch *ls;
+    const char *ls_name = ctx->argv[1];
+
+    vtep_ctl_context_populate_cache(ctx);
+
+    ls = find_lswitch(vtepctl_ctx, ls_name, true);
+    ds_put_format(&ctx->output, "%s\n", ls->ls_cfg->replication_mode);
+}
+
+static struct vtep_ctl_lrouter *
+find_lrouter(struct vtep_ctl_context *vtepctl_ctx,
+             const char *name, bool must_exist)
+{
+    struct vtep_ctl_lrouter *lr;
+
+    ovs_assert(vtepctl_ctx->cache_valid);
+
+    lr = shash_find_data(&vtepctl_ctx->lrouters, name);
+    if (must_exist && !lr) {
+        ctl_fatal("no logical router named %s", name);
+    }
+    return lr;
+}
+
+static void
+cmd_add_lr(struct ctl_context *ctx)
+{
+    struct vtep_ctl_context *vtepctl_ctx = vtep_ctl_context_cast(ctx);
+    const char *lr_name = ctx->argv[1];
+    bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
+    struct vteprec_logical_router *lr;
+
+    vtep_ctl_context_populate_cache(ctx);
+    if (find_lrouter(vtepctl_ctx, lr_name, false)) {
+        if (!may_exist) {
+            ctl_fatal("cannot create logical router %s because it "
+                      "already exists", lr_name);
+        }
+        return;
+    }
+
+    lr = vteprec_logical_router_insert(ctx->txn);
+    vteprec_logical_router_set_name(lr, lr_name);
+
+    vtep_ctl_context_invalidate_cache(ctx);
+}
+
+static void
+del_lrouter(struct vtep_ctl_context *vtepctl_ctx, struct vtep_ctl_lrouter *lr)
+{
+    del_cached_lrouter(vtepctl_ctx, lr);
+}
+
+static void
+cmd_del_lr(struct ctl_context *ctx)
+{
+    struct vtep_ctl_context *vtepctl_ctx = vtep_ctl_context_cast(ctx);
+    bool must_exist = !shash_find(&ctx->options, "--if-exists");
+    struct vtep_ctl_lrouter *lr;
+
+    vtep_ctl_context_populate_cache(ctx);
+    lr = find_lrouter(vtepctl_ctx, ctx->argv[1], must_exist);
+    if (lr) {
+        del_lrouter(vtepctl_ctx, lr);
+    }
+}
+
+static void
+cmd_list_lr(struct ctl_context *ctx)
+{
+    struct vtep_ctl_context *vtepctl_ctx = vtep_ctl_context_cast(ctx);
+    struct shash_node *node;
+    struct svec lrouters;
+
+    vtep_ctl_context_populate_cache(ctx);
+
+    svec_init(&lrouters);
+    SHASH_FOR_EACH (node, &vtepctl_ctx->lrouters) {
+        struct vtep_ctl_lrouter *lr = node->data;
+
+        svec_add(&lrouters, lr->name);
+    }
+    output_sorted(&lrouters, &ctx->output);
+    svec_destroy(&lrouters);
+}
+
+static void
+cmd_lr_exists(struct ctl_context *ctx)
+{
+    struct vtep_ctl_context *vtepctl_ctx = vtep_ctl_context_cast(ctx);
+
+    vtep_ctl_context_populate_cache(ctx);
+    if (!find_lrouter(vtepctl_ctx, ctx->argv[1], false)) {
+        vtep_ctl_exit(2);
+    }
+}
+
+static void
 add_ucast_entry(struct ctl_context *ctx, bool local)
 {
     struct vtep_ctl_context *vtepctl_ctx = vtep_ctl_context_cast(ctx);
@@ -1579,7 +1772,7 @@ commit_mcast_entries(struct vtep_ctl_mcast_mac *mcast_mac)
     size_t n_locators;
     int i;
 
-    n_locators = list_size(&mcast_mac->locators);
+    n_locators = ovs_list_size(&mcast_mac->locators);
     ovs_assert(n_locators);
 
     locators = xmalloc(n_locators * sizeof *locators);
@@ -1688,7 +1881,7 @@ del_mcast_entry(struct ctl_context *ctx,
     mcast_mac->ploc_set_cfg = ploc_set_cfg;
 
     del_ploc_from_mcast_mac(mcast_mac, ploc_cfg);
-    if (list_is_empty(&mcast_mac->locators)) {
+    if (ovs_list_is_empty(&mcast_mac->locators)) {
         struct shash_node *node = shash_find(mcast_shash, mac);
 
         vteprec_physical_locator_set_delete(ploc_set_cfg);
@@ -1902,6 +2095,7 @@ pre_manager(struct ctl_context *ctx)
 {
     ovsdb_idl_add_column(ctx->idl, &vteprec_global_col_managers);
     ovsdb_idl_add_column(ctx->idl, &vteprec_manager_col_target);
+    ovsdb_idl_add_column(ctx->idl, &vteprec_manager_col_inactivity_probe);
 }
 
 static void
@@ -1954,10 +2148,13 @@ cmd_del_manager(struct ctl_context *ctx)
 }
 
 static void
-insert_managers(struct vtep_ctl_context *vtepctl_ctx, char *targets[], size_t n)
+insert_managers(struct vtep_ctl_context *vtepctl_ctx, char *targets[],
+                size_t n, struct shash *options)
 {
     struct vteprec_manager **managers;
     size_t i;
+    const char *inactivity_probe = shash_find_data(options,
+                                                   "--inactivity-probe");
 
     /* Insert each manager in a new row in Manager table. */
     managers = xmalloc(n * sizeof *managers);
@@ -1967,6 +2164,10 @@ insert_managers(struct vtep_ctl_context *vtepctl_ctx, char *targets[], size_t n)
         }
         managers[i] = vteprec_manager_insert(vtepctl_ctx->base.txn);
         vteprec_manager_set_target(managers[i], targets[i]);
+        if (inactivity_probe) {
+            int64_t msecs = atoll(inactivity_probe);
+            vteprec_manager_set_inactivity_probe(managers[i], &msecs, 1);
+        }
     }
 
     /* Store uuids of new Manager rows in 'managers' column. */
@@ -1982,64 +2183,25 @@ cmd_set_manager(struct ctl_context *ctx)
 
     verify_managers(vtepctl_ctx->vtep_global);
     delete_managers(vtepctl_ctx);
-    insert_managers(vtepctl_ctx, &ctx->argv[1], n);
+    insert_managers(vtepctl_ctx, &ctx->argv[1], n, &ctx->options);
 }
 
 /* Parameter commands. */
-static const struct ctl_table_class tables[] = {
-    {&vteprec_table_global,
-     {{&vteprec_table_global, NULL, NULL},
-      {NULL, NULL, NULL}}},
+static const struct ctl_table_class tables[VTEPREC_N_TABLES] = {
+    [VTEPREC_TABLE_LOGICAL_SWITCH].row_ids[0]
+    = {&vteprec_logical_switch_col_name, NULL, NULL},
 
-    {&vteprec_table_logical_binding_stats,
-     {{NULL, NULL, NULL},
-      {NULL, NULL, NULL}}},
+    [VTEPREC_TABLE_MANAGER].row_ids[0]
+    = {&vteprec_manager_col_target, NULL, NULL},
 
-    {&vteprec_table_logical_switch,
-     {{&vteprec_table_logical_switch, &vteprec_logical_switch_col_name, NULL},
-      {NULL, NULL, NULL}}},
+    [VTEPREC_TABLE_PHYSICAL_PORT].row_ids[0]
+    = {&vteprec_physical_port_col_name, NULL, NULL},
 
-    {&vteprec_table_ucast_macs_local,
-     {{NULL, NULL, NULL},
-      {NULL, NULL, NULL}}},
+    [VTEPREC_TABLE_PHYSICAL_SWITCH].row_ids[0]
+    = {&vteprec_physical_switch_col_name, NULL, NULL},
 
-    {&vteprec_table_ucast_macs_remote,
-     {{NULL, NULL, NULL},
-      {NULL, NULL, NULL}}},
-
-    {&vteprec_table_mcast_macs_local,
-     {{NULL, NULL, NULL},
-      {NULL, NULL, NULL}}},
-
-    {&vteprec_table_mcast_macs_remote,
-     {{NULL, NULL, NULL},
-      {NULL, NULL, NULL}}},
-
-    {&vteprec_table_manager,
-     {{&vteprec_table_manager, &vteprec_manager_col_target, NULL},
-      {NULL, NULL, NULL}}},
-
-    {&vteprec_table_physical_locator,
-     {{NULL, NULL, NULL},
-      {NULL, NULL, NULL}}},
-
-    {&vteprec_table_physical_locator_set,
-     {{NULL, NULL, NULL},
-      {NULL, NULL, NULL}}},
-
-    {&vteprec_table_physical_port,
-     {{&vteprec_table_physical_port, &vteprec_physical_port_col_name, NULL},
-      {NULL, NULL, NULL}}},
-
-    {&vteprec_table_physical_switch,
-     {{&vteprec_table_physical_switch, &vteprec_physical_switch_col_name, NULL},
-      {NULL, NULL, NULL}}},
-
-    {&vteprec_table_tunnel,
-     {{NULL, NULL, NULL},
-      {NULL, NULL, NULL}}},
-
-    {NULL, {{NULL, NULL, NULL}, {NULL, NULL, NULL}}}
+    [VTEPREC_TABLE_LOGICAL_ROUTER].row_ids[0]
+    = {&vteprec_logical_router_col_name, NULL, NULL},
 };
 
 
@@ -2098,6 +2260,9 @@ run_prerequisites(struct ctl_command *commands, size_t n_commands,
 
             vtep_ctl_context_init(&vtepctl_ctx, c, idl, NULL, NULL, NULL);
             (c->syntax->prerequisites)(&vtepctl_ctx.base);
+            if (vtepctl_ctx.base.error) {
+                ctl_fatal("%s", vtepctl_ctx.base.error);
+            }
             vtep_ctl_context_done(&vtepctl_ctx, c);
 
             ovs_assert(!c->output.string);
@@ -2106,7 +2271,7 @@ run_prerequisites(struct ctl_command *commands, size_t n_commands,
     }
 }
 
-static void
+static bool
 do_vtep_ctl(const char *args, struct ctl_command *commands,
             size_t n_commands, struct ovsdb_idl *idl)
 {
@@ -2143,6 +2308,9 @@ do_vtep_ctl(const char *args, struct ctl_command *commands,
         if (c->syntax->run) {
             (c->syntax->run)(&vtepctl_ctx.base);
         }
+        if (vtepctl_ctx.base.error) {
+            ctl_fatal("%s", vtepctl_ctx.base.error);
+        }
         vtep_ctl_context_done_command(&vtepctl_ctx, c);
 
         if (vtepctl_ctx.base.try_again) {
@@ -2178,6 +2346,9 @@ do_vtep_ctl(const char *args, struct ctl_command *commands,
             if (c->syntax->postprocess) {
                 vtep_ctl_context_init(&vtepctl_ctx, c, idl, txn, vtep_global, symtab);
                 (c->syntax->postprocess)(&vtepctl_ctx.base);
+                if (vtepctl_ctx.base.error) {
+                    ctl_fatal("%s", vtepctl_ctx.base.error);
+                }
                 vtep_ctl_context_done(&vtepctl_ctx, c);
             }
         }
@@ -2254,7 +2425,7 @@ do_vtep_ctl(const char *args, struct ctl_command *commands,
 
     ovsdb_idl_destroy(idl);
 
-    exit(EXIT_SUCCESS);
+    return true;
 
 try_again:
     /* Our transaction needs to be rerun, or a prerequisite was not met.  Free
@@ -2270,6 +2441,7 @@ try_again:
         free(c->table);
     }
     free(error);
+    return false;
 }
 
 static const struct ctl_command_syntax vtep_commands[] = {
@@ -2294,6 +2466,16 @@ static const struct ctl_command_syntax vtep_commands[] = {
     {"list-bindings", 2, 2, NULL, pre_get_info, cmd_list_bindings, NULL, "", RO},
     {"bind-ls", 4, 4, NULL, pre_get_info, cmd_bind_ls, NULL, "", RO},
     {"unbind-ls", 3, 3, NULL, pre_get_info, cmd_unbind_ls, NULL, "", RO},
+    {"set-replication-mode", 2, 2, "LS MODE", pre_get_info,
+        cmd_set_replication_mode, NULL, "", RW},
+    {"get-replication-mode", 1, 1, "LS", pre_get_info,
+        cmd_get_replication_mode, NULL, "", RO},
+
+    /* Logical Router commands. */
+    {"add-lr", 1, 1, NULL, pre_get_info, cmd_add_lr, NULL, "--may-exist", RW},
+    {"del-lr", 1, 1, NULL, pre_get_info, cmd_del_lr, NULL, "--if-exists", RW},
+    {"list-lr", 0, 0, NULL, pre_get_info, cmd_list_lr, NULL, "", RO},
+    {"lr-exists", 1, 1, NULL, pre_get_info, cmd_lr_exists, NULL, "", RO},
 
     /* MAC binding commands. */
     {"add-ucast-local", 3, 4, NULL, pre_get_info, cmd_add_ucast_local, NULL,
@@ -2324,8 +2506,8 @@ static const struct ctl_command_syntax vtep_commands[] = {
     /* Manager commands. */
     {"get-manager", 0, 0, NULL, pre_manager, cmd_get_manager, NULL, "", RO},
     {"del-manager", 0, 0, NULL, pre_manager, cmd_del_manager, NULL, "", RW},
-    {"set-manager", 1, INT_MAX, NULL, pre_manager, cmd_set_manager, NULL, "",
-     RW},
+    {"set-manager", 1, INT_MAX, NULL, pre_manager, cmd_set_manager, NULL,
+     "--inactivity-probe=", RW},
 
     {NULL, 0, 0, NULL, NULL, NULL, NULL, NULL, RO},
 };
@@ -2334,6 +2516,7 @@ static const struct ctl_command_syntax vtep_commands[] = {
 static void
 vtep_ctl_cmd_init(void)
 {
-    ctl_init(tables, cmd_show_tables, vtep_ctl_exit);
+    ctl_init(&vteprec_idl_class, vteprec_table_classes, tables,
+             cmd_show_tables, vtep_ctl_exit);
     ctl_register_commands(vtep_commands);
 }

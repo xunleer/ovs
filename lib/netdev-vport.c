@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2010, 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2010, 2011, 2012, 2013, 2014, 2017 Nicira, Inc.
+ * Copyright (c) 2016 Red Hat, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,92 +23,59 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <net/if.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <netinet/ip6.h>
 #include <sys/ioctl.h>
 
 #include "byte-order.h"
-#include "csum.h"
 #include "daemon.h"
 #include "dirs.h"
 #include "dpif.h"
-#include "dp-packet.h"
-#include "dynamic-string.h"
-#include "flow.h"
-#include "hash.h"
-#include "hmap.h"
-#include "list.h"
+#include "netdev.h"
+#include "netdev-native-tnl.h"
 #include "netdev-provider.h"
-#include "odp-netlink.h"
-#include "dp-packet.h"
+#include "netdev-vport-private.h"
+#include "openvswitch/dynamic-string.h"
 #include "ovs-router.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "route-table.h"
-#include "shash.h"
+#include "simap.h"
+#include "smap.h"
 #include "socket-util.h"
-#include "openvswitch/vlog.h"
 #include "unaligned.h"
 #include "unixctl.h"
-#include "util.h"
+#include "openvswitch/vlog.h"
+#include "openvswitch/ofp-parse.h"
+#ifdef __linux__
+#include "netdev-linux.h"
+#endif
 
 VLOG_DEFINE_THIS_MODULE(netdev_vport);
-static struct vlog_rate_limit err_rl = VLOG_RATE_LIMIT_INIT(60, 5);
 
 #define GENEVE_DST_PORT 6081
 #define VXLAN_DST_PORT 4789
 #define LISP_DST_PORT 4341
 #define STT_DST_PORT 7471
 
-#define VXLAN_HLEN   (sizeof(struct eth_header) +         \
-                      sizeof(struct ip_header)  +         \
-                      sizeof(struct udp_header) +         \
-                      sizeof(struct vxlanhdr))
-
-#define GENEVE_BASE_HLEN   (sizeof(struct eth_header) +         \
-                            sizeof(struct ip_header)  +         \
-                            sizeof(struct udp_header) +         \
-                            sizeof(struct genevehdr))
-
 #define DEFAULT_TTL 64
-
-struct netdev_vport {
-    struct netdev up;
-
-    /* Protects all members below. */
-    struct ovs_mutex mutex;
-
-    struct eth_addr etheraddr;
-    struct netdev_stats stats;
-
-    /* Tunnels. */
-    struct netdev_tunnel_config tnl_cfg;
-    char egress_iface[IFNAMSIZ];
-    bool carrier_status;
-
-    /* Patch Ports. */
-    char *peer;
-};
-
-struct vport_class {
-    const char *dpif_port;
-    struct netdev_class netdev_class;
-};
 
 /* Last read of the route-table's change number. */
 static uint64_t rt_change_seqno;
 
-static int netdev_vport_construct(struct netdev *);
 static int get_patch_config(const struct netdev *netdev, struct smap *args);
 static int get_tunnel_config(const struct netdev *, struct smap *args);
 static bool tunnel_check_status_change__(struct netdev_vport *);
+static void update_vxlan_global_cfg(struct netdev *,
+                                    struct netdev_tunnel_config *,
+                                    struct netdev_tunnel_config *);
 
-static uint16_t tnl_udp_port_min = 32768;
-static uint16_t tnl_udp_port_max = 61000;
-
-static bool
-is_vport_class(const struct netdev_class *class)
-{
-    return class->construct == netdev_vport_construct;
-}
+struct vport_class {
+    const char *dpif_port;
+    struct netdev_class netdev_class;
+    struct simap global_cfg_tracker;
+};
 
 bool
 netdev_vport_is_vport_class(const struct netdev_class *class)
@@ -115,18 +83,11 @@ netdev_vport_is_vport_class(const struct netdev_class *class)
     return is_vport_class(class);
 }
 
-static const struct vport_class *
+static struct vport_class *
 vport_class_cast(const struct netdev_class *class)
 {
     ovs_assert(is_vport_class(class));
     return CONTAINER_OF(class, struct vport_class, netdev_class);
-}
-
-static struct netdev_vport *
-netdev_vport_cast(const struct netdev *netdev)
-{
-    ovs_assert(is_vport_class(netdev_get_class(netdev)));
-    return CONTAINER_OF(netdev, struct netdev_vport, up);
 }
 
 static const struct netdev_tunnel_config *
@@ -143,14 +104,6 @@ netdev_vport_is_patch(const struct netdev *netdev)
     return class->get_config == get_patch_config;
 }
 
-bool
-netdev_vport_is_layer3(const struct netdev *dev)
-{
-    const char *type = netdev_get_type(dev);
-
-    return (!strcmp("lisp", type));
-}
-
 static bool
 netdev_vport_needs_dst_port(const struct netdev *dev)
 {
@@ -159,7 +112,8 @@ netdev_vport_needs_dst_port(const struct netdev *dev)
 
     return (class->get_config == get_tunnel_config &&
             (!strcmp("geneve", type) || !strcmp("vxlan", type) ||
-             !strcmp("lisp", type) || !strcmp("stt", type)) );
+             !strcmp("lisp", type) || !strcmp("stt", type) ||
+             !strcmp("gtpu", type) || !strcmp("bareudp",type)));
 }
 
 const char *
@@ -197,15 +151,6 @@ netdev_vport_get_dpif_port(const struct netdev *netdev,
     }
 }
 
-char *
-netdev_vport_get_dpif_port_strdup(const struct netdev *netdev)
-{
-    char namebuf[NETDEV_VPORT_NAME_BUFSIZE];
-
-    return xstrdup(netdev_vport_get_dpif_port(netdev, namebuf,
-                                              sizeof namebuf));
-}
-
 /* Whenever the route-table change number is incremented,
  * netdev_vport_route_changed() should be called to update
  * the corresponding tunnel interface status. */
@@ -222,7 +167,7 @@ netdev_vport_route_changed(void)
 
         ovs_mutex_lock(&netdev->mutex);
         /* Finds all tunnel vports. */
-        if (netdev->tnl_cfg.ip_dst) {
+        if (ipv6_addr_is_set(&netdev->tnl_cfg.ipv6_dst)) {
             if (tunnel_check_status_change__(netdev)) {
                 netdev_change_seq_changed(netdev_);
             }
@@ -242,24 +187,41 @@ netdev_vport_alloc(void)
     return &netdev->up;
 }
 
-static int
+int
 netdev_vport_construct(struct netdev *netdev_)
 {
+    const struct netdev_class *class = netdev_get_class(netdev_);
+    const char *dpif_port = netdev_vport_class_get_dpif_port(class);
     struct netdev_vport *dev = netdev_vport_cast(netdev_);
+    const char *p, *name = netdev_get_name(netdev_);
     const char *type = netdev_get_type(netdev_);
+    uint16_t port = 0;
 
     ovs_mutex_init(&dev->mutex);
     eth_addr_random(&dev->etheraddr);
 
-    /* Add a default destination port for tunnel ports if none specified. */
+    if (name && dpif_port && (strlen(name) > strlen(dpif_port) + 1) &&
+        (!strncmp(name, dpif_port, strlen(dpif_port)))) {
+        p = name + strlen(dpif_port) + 1;
+        port = atoi(p);
+    }
+
+    /* If a destination port for tunnel ports is specified in the netdev
+     * name, use it instead of the default one. Otherwise, use the default
+     * destination port */
     if (!strcmp(type, "geneve")) {
-        dev->tnl_cfg.dst_port = htons(GENEVE_DST_PORT);
+        dev->tnl_cfg.dst_port = port ? htons(port) : htons(GENEVE_DST_PORT);
     } else if (!strcmp(type, "vxlan")) {
-        dev->tnl_cfg.dst_port = htons(VXLAN_DST_PORT);
+        dev->tnl_cfg.dst_port = port ? htons(port) : htons(VXLAN_DST_PORT);
+        update_vxlan_global_cfg(netdev_, NULL, &dev->tnl_cfg);
     } else if (!strcmp(type, "lisp")) {
-        dev->tnl_cfg.dst_port = htons(LISP_DST_PORT);
+        dev->tnl_cfg.dst_port = port ? htons(port) : htons(LISP_DST_PORT);
     } else if (!strcmp(type, "stt")) {
-        dev->tnl_cfg.dst_port = htons(STT_DST_PORT);
+        dev->tnl_cfg.dst_port = port ? htons(port) : htons(STT_DST_PORT);
+    } else if (!strcmp(type, "gtpu")) {
+        dev->tnl_cfg.dst_port = port ? htons(port) : htons(GTPU_DST_PORT);
+    } else if (!strcmp(type, "bareudp")) {
+        dev->tnl_cfg.dst_port = htons(port);
     }
 
     dev->tnl_cfg.dont_fragment = true;
@@ -271,6 +233,11 @@ static void
 netdev_vport_destruct(struct netdev *netdev_)
 {
     struct netdev_vport *netdev = netdev_vport_cast(netdev_);
+    const char *type = netdev_get_type(netdev_);
+
+    if (!strcmp(type, "vxlan")) {
+        update_vxlan_global_cfg(netdev_, &netdev->tnl_cfg, NULL);
+    }
 
     free(netdev->peer);
     ovs_mutex_destroy(&netdev->mutex);
@@ -316,15 +283,17 @@ tunnel_check_status_change__(struct netdev_vport *netdev)
 {
     char iface[IFNAMSIZ];
     bool status = false;
-    ovs_be32 route;
-    ovs_be32 gw;
+    struct in6_addr *route;
+    struct in6_addr gw;
+    uint32_t mark;
 
     iface[0] = '\0';
-    route = netdev->tnl_cfg.ip_dst;
-    if (ovs_router_lookup4(route, iface, &gw)) {
+    route = &netdev->tnl_cfg.ipv6_dst;
+    mark = netdev->tnl_cfg.egress_pkt_mark;
+    if (ovs_router_lookup(mark, route, iface, NULL, &gw)) {
         struct netdev *egress_netdev;
 
-        if (!netdev_open(iface, "system", &egress_netdev)) {
+        if (!netdev_open(iface, NULL, &egress_netdev)) {
             status = netdev_get_carrier(egress_netdev);
             netdev_close(egress_netdev);
         }
@@ -332,7 +301,7 @@ tunnel_check_status_change__(struct netdev_vport *netdev)
 
     if (strcmp(netdev->egress_iface, iface)
         || netdev->carrier_status != status) {
-        ovs_strlcpy(netdev->egress_iface, iface, IFNAMSIZ);
+        ovs_strlcpy_arrays(netdev->egress_iface, iface);
         netdev->carrier_status = status;
 
         return true;
@@ -371,7 +340,7 @@ netdev_vport_update_flags(struct netdev *netdev OVS_UNUSED,
 }
 
 static void
-netdev_vport_run(void)
+netdev_vport_run(const struct netdev_class *netdev_class OVS_UNUSED)
 {
     uint64_t seq;
 
@@ -384,7 +353,7 @@ netdev_vport_run(void)
 }
 
 static void
-netdev_vport_wait(void)
+netdev_vport_wait(const struct netdev_class *netdev_class OVS_UNUSED)
 {
     uint64_t seq;
 
@@ -425,18 +394,192 @@ parse_key(const struct smap *args, const char *name,
 }
 
 static int
-set_tunnel_config(struct netdev *dev_, const struct smap *args)
+parse_tunnel_ip(const char *value, bool accept_mcast, bool *flow,
+                struct in6_addr *ipv6, uint16_t *protocol)
+{
+    if (!strcmp(value, "flow")) {
+        *flow = true;
+        *protocol = 0;
+        return 0;
+    }
+    if (addr_is_ipv6(value)) {
+        if (lookup_ipv6(value, ipv6)) {
+            return ENOENT;
+        }
+        if (!accept_mcast && ipv6_addr_is_multicast(ipv6)) {
+            return EINVAL;
+        }
+        *protocol = ETH_TYPE_IPV6;
+    } else {
+        struct in_addr ip;
+        if (lookup_ip(value, &ip)) {
+            return ENOENT;
+        }
+        if (!accept_mcast && ip_is_multicast(ip.s_addr)) {
+            return EINVAL;
+        }
+        in6_addr_set_mapped_ipv4(ipv6, ip.s_addr);
+        *protocol = ETH_TYPE_IP;
+    }
+    return 0;
+}
+
+enum tunnel_layers {
+    TNL_L2 = 1 << 0,       /* 1 if a tunnel type can carry Ethernet traffic. */
+    TNL_L3 = 1 << 1        /* 1 if a tunnel type can carry L3 traffic. */
+};
+static enum tunnel_layers
+tunnel_supported_layers(const char *type,
+                        const struct netdev_tunnel_config *tnl_cfg)
+{
+    if (!strcmp(type, "lisp")) {
+        return TNL_L3;
+    } else if (!strcmp(type, "gre")) {
+        return TNL_L2 | TNL_L3;
+    } else if (!strcmp(type, "vxlan")
+               && tnl_cfg->exts & (1 << OVS_VXLAN_EXT_GPE)) {
+        return TNL_L2 | TNL_L3;
+    } else if (!strcmp(type, "gtpu")) {
+        return TNL_L3;
+    } else if (!strcmp(type, "bareudp")) {
+        return TNL_L3;
+    } else {
+        return TNL_L2;
+    }
+}
+static enum netdev_pt_mode
+default_pt_mode(enum tunnel_layers layers)
+{
+    return layers == TNL_L3 ? NETDEV_PT_LEGACY_L3 : NETDEV_PT_LEGACY_L2;
+}
+
+static char *
+vxlan_get_port_ext_gbp_str(uint16_t port, bool gbp,
+                           char namebuf[], size_t bufsize)
+{
+    snprintf(namebuf, bufsize, "dst_port_%d%s",
+             port, gbp ? "_gbp" : "");
+
+    return namebuf;
+}
+
+static void
+update_vxlan_global_cfg(struct netdev *netdev,
+                        struct netdev_tunnel_config *old_cfg,
+                        struct netdev_tunnel_config *new_cfg)
+{
+    unsigned int count;
+    char namebuf[20];
+    const char *type = netdev_get_type(netdev);
+    struct vport_class *vclass = vport_class_cast(netdev_get_class(netdev));
+
+    if (strcmp(type, "vxlan") ||
+        (old_cfg != NULL && new_cfg != NULL &&
+         old_cfg->dst_port == new_cfg->dst_port &&
+         old_cfg->exts == new_cfg->exts)) {
+        return;
+    }
+
+    if (old_cfg != NULL) {
+        vxlan_get_port_ext_gbp_str(ntohs(old_cfg->dst_port),
+                                   old_cfg->exts &
+                                   (1 << OVS_VXLAN_EXT_GBP),
+                                   namebuf, sizeof(namebuf));
+
+        count = simap_get(&vclass->global_cfg_tracker, namebuf);
+        if (count != 0) {
+            if (--count) {
+                simap_put(&vclass->global_cfg_tracker, namebuf, count);
+            } else {
+                simap_find_and_delete(&vclass->global_cfg_tracker, namebuf);
+           }
+        }
+    }
+
+    if (new_cfg != NULL) {
+        vxlan_get_port_ext_gbp_str(ntohs(new_cfg->dst_port),
+                                   new_cfg->exts &
+                                   (1 << OVS_VXLAN_EXT_GBP),
+                                   namebuf, sizeof(namebuf));
+
+        simap_increase(&vclass->global_cfg_tracker, namebuf, 1);
+    }
+}
+
+static bool
+is_concomitant_vxlan_tunnel_present(struct netdev_vport *dev,
+                                    const struct netdev_tunnel_config *tnl_cfg)
+{
+    char namebuf[20];
+    const char *type = netdev_get_type(&dev->up);
+    struct vport_class *vclass = vport_class_cast(netdev_get_class(&dev->up));
+
+    if (strcmp(type, "vxlan")) {
+        return false;
+    }
+
+    if (dev->tnl_cfg.dst_port == tnl_cfg->dst_port &&
+        (dev->tnl_cfg.exts & (1 << OVS_VXLAN_EXT_GBP)) ==
+        (tnl_cfg->exts & (1 << OVS_VXLAN_EXT_GBP))) {
+
+        if (ntohs(dev->tnl_cfg.dst_port) == VXLAN_DST_PORT) {
+            /* Special case where we kept the default port/gbp, only ok if
+               the opposite of the default does not exits */
+            vxlan_get_port_ext_gbp_str(ntohs(tnl_cfg->dst_port),
+                                       !(tnl_cfg->exts &
+                                         (1 << OVS_VXLAN_EXT_GBP)),
+                                       namebuf, sizeof(namebuf));
+
+            if (simap_get(&vclass->global_cfg_tracker, namebuf) > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* Same port: ok if no one is left with the previous configuration */
+    if (dev->tnl_cfg.dst_port == tnl_cfg->dst_port) {
+        vxlan_get_port_ext_gbp_str(ntohs(dev->tnl_cfg.dst_port),
+                                   dev->tnl_cfg.exts &
+                                   (1 << OVS_VXLAN_EXT_GBP),
+                                   namebuf, sizeof(namebuf));
+
+        if (simap_get(&vclass->global_cfg_tracker, namebuf) > 1) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /* Different port: ok if the opposite gbp option does not yet exists */
+    vxlan_get_port_ext_gbp_str(ntohs(tnl_cfg->dst_port),
+                               !(tnl_cfg->exts &
+                                 (1 << OVS_VXLAN_EXT_GBP)),
+                               namebuf, sizeof(namebuf));
+
+    if (simap_get(&vclass->global_cfg_tracker, namebuf) > 0) {
+        return true;
+    }
+
+    return false;
+}
+
+static int
+set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
 {
     struct netdev_vport *dev = netdev_vport_cast(dev_);
     const char *name = netdev_get_name(dev_);
     const char *type = netdev_get_type(dev_);
-    bool ipsec_mech_set, needs_dst_port, has_csum;
+    struct ds errors = DS_EMPTY_INITIALIZER;
+    bool needs_dst_port, has_csum, has_seq;
+    uint16_t dst_proto = 0, src_proto = 0;
     struct netdev_tunnel_config tnl_cfg;
     struct smap_node *node;
+    int err;
 
     has_csum = strstr(type, "gre") || strstr(type, "geneve") ||
                strstr(type, "stt") || strstr(type, "vxlan");
-    ipsec_mech_set = false;
+    has_seq = strstr(type, "gre");
     memset(&tnl_cfg, 0, sizeof tnl_cfg);
 
     /* Add a default destination port for tunnel ports if none specified. */
@@ -456,34 +599,34 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
         tnl_cfg.dst_port = htons(STT_DST_PORT);
     }
 
+    if (!strcmp(type, "gtpu")) {
+        tnl_cfg.dst_port = htons(GTPU_DST_PORT);
+    }
+
     needs_dst_port = netdev_vport_needs_dst_port(dev_);
-    tnl_cfg.ipsec = strstr(type, "ipsec");
     tnl_cfg.dont_fragment = true;
 
     SMAP_FOR_EACH (node, args) {
         if (!strcmp(node->key, "remote_ip")) {
-            struct in_addr in_addr;
-            if (!strcmp(node->value, "flow")) {
-                tnl_cfg.ip_dst_flow = true;
-                tnl_cfg.ip_dst = htonl(0);
-            } else if (lookup_ip(node->value, &in_addr)) {
-                VLOG_WARN("%s: bad %s 'remote_ip'", name, type);
-            } else if (ip_is_multicast(in_addr.s_addr)) {
-                VLOG_WARN("%s: multicast remote_ip="IP_FMT" not allowed",
-                          name, IP_ARGS(in_addr.s_addr));
-                return EINVAL;
-            } else {
-                tnl_cfg.ip_dst = in_addr.s_addr;
+            err = parse_tunnel_ip(node->value, false, &tnl_cfg.ip_dst_flow,
+                                  &tnl_cfg.ipv6_dst, &dst_proto);
+            switch (err) {
+            case ENOENT:
+                ds_put_format(&errors, "%s: bad %s 'remote_ip'\n", name, type);
+                break;
+            case EINVAL:
+                ds_put_format(&errors,
+                              "%s: multicast remote_ip=%s not allowed\n",
+                              name, node->value);
+                goto out;
             }
         } else if (!strcmp(node->key, "local_ip")) {
-            struct in_addr in_addr;
-            if (!strcmp(node->value, "flow")) {
-                tnl_cfg.ip_src_flow = true;
-                tnl_cfg.ip_src = htonl(0);
-            } else if (lookup_ip(node->value, &in_addr)) {
-                VLOG_WARN("%s: bad %s 'local_ip'", name, type);
-            } else {
-                tnl_cfg.ip_src = in_addr.s_addr;
+            err = parse_tunnel_ip(node->value, true, &tnl_cfg.ip_src_flow,
+                                  &tnl_cfg.ipv6_src, &src_proto);
+            switch (err) {
+            case ENOENT:
+                ds_put_format(&errors, "%s: bad %s 'local_ip'\n", name, type);
+                break;
             }
         } else if (!strcmp(node->key, "tos")) {
             if (!strcmp(node->value, "inherit")) {
@@ -495,7 +638,8 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
                 if (*endptr == '\0' && tos == (tos & IP_DSCP_MASK)) {
                     tnl_cfg.tos = tos;
                 } else {
-                    VLOG_WARN("%s: invalid TOS %s", name, node->value);
+                    ds_put_format(&errors, "%s: invalid TOS %s\n", name,
+                                  node->value);
                 }
             }
         } else if (!strcmp(node->key, "ttl")) {
@@ -510,42 +654,20 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
             if (!strcmp(node->value, "true")) {
                 tnl_cfg.csum = true;
             }
+        } else if (!strcmp(node->key, "seq") && has_seq) {
+            if (!strcmp(node->value, "true")) {
+                tnl_cfg.set_seq = true;
+            }
         } else if (!strcmp(node->key, "df_default")) {
             if (!strcmp(node->value, "false")) {
                 tnl_cfg.dont_fragment = false;
             }
-        } else if (!strcmp(node->key, "peer_cert") && tnl_cfg.ipsec) {
-            if (smap_get(args, "certificate")) {
-                ipsec_mech_set = true;
-            } else {
-                const char *use_ssl_cert;
-
-                /* If the "use_ssl_cert" is true, then "certificate" and
-                 * "private_key" will be pulled from the SSL table.  The
-                 * use of this option is strongly discouraged, since it
-                 * will like be removed when multiple SSL configurations
-                 * are supported by OVS.
-                 */
-                use_ssl_cert = smap_get(args, "use_ssl_cert");
-                if (!use_ssl_cert || strcmp(use_ssl_cert, "true")) {
-                    VLOG_ERR("%s: 'peer_cert' requires 'certificate' argument",
-                             name);
-                    return EINVAL;
-                }
-                ipsec_mech_set = true;
-            }
-        } else if (!strcmp(node->key, "psk") && tnl_cfg.ipsec) {
-            ipsec_mech_set = true;
-        } else if (tnl_cfg.ipsec
-                && (!strcmp(node->key, "certificate")
-                    || !strcmp(node->key, "private_key")
-                    || !strcmp(node->key, "use_ssl_cert"))) {
-            /* Ignore options not used by the netdev. */
         } else if (!strcmp(node->key, "key") ||
                    !strcmp(node->key, "in_key") ||
-                   !strcmp(node->key, "out_key")) {
+                   !strcmp(node->key, "out_key") ||
+                   !strcmp(node->key, "packet_type")) {
             /* Handled separately below. */
-        } else if (!strcmp(node->key, "exts")) {
+        } else if (!strcmp(node->key, "exts") && !strcmp(type, "vxlan")) {
             char *str = xstrdup(node->value);
             char *ext, *save_ptr = NULL;
 
@@ -555,61 +677,166 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
             while (ext) {
                 if (!strcmp(type, "vxlan") && !strcmp(ext, "gbp")) {
                     tnl_cfg.exts |= (1 << OVS_VXLAN_EXT_GBP);
+                } else if (!strcmp(type, "vxlan") && !strcmp(ext, "gpe")) {
+                    tnl_cfg.exts |= (1 << OVS_VXLAN_EXT_GPE);
                 } else {
-                    VLOG_WARN("%s: unknown extension '%s'", name, ext);
+                    ds_put_format(&errors, "%s: unknown extension '%s'\n",
+                                  name, ext);
                 }
 
                 ext = strtok_r(NULL, ",", &save_ptr);
             }
 
             free(str);
+        } else if (!strcmp(node->key, "egress_pkt_mark")) {
+            tnl_cfg.egress_pkt_mark = strtoul(node->value, NULL, 10);
+            tnl_cfg.set_egress_pkt_mark = true;
+        } else if (!strcmp(node->key, "erspan_idx")) {
+            if (!strcmp(node->value, "flow")) {
+                tnl_cfg.erspan_idx_flow = true;
+            } else {
+                tnl_cfg.erspan_idx_flow = false;
+                tnl_cfg.erspan_idx = strtol(node->value, NULL, 16);
+
+                if (tnl_cfg.erspan_idx & ~ERSPAN_IDX_MASK) {
+                    ds_put_format(&errors, "%s: invalid erspan index: %s\n",
+                                  name, node->value);
+                    err = EINVAL;
+                    goto out;
+                }
+            }
+        } else if (!strcmp(node->key, "erspan_ver")) {
+            if (!strcmp(node->value, "flow")) {
+                tnl_cfg.erspan_ver_flow = true;
+                tnl_cfg.erspan_idx_flow = true;
+                tnl_cfg.erspan_dir_flow = true;
+                tnl_cfg.erspan_hwid_flow = true;
+            } else {
+                tnl_cfg.erspan_ver_flow = false;
+                tnl_cfg.erspan_ver = atoi(node->value);
+
+                if (tnl_cfg.erspan_ver != 1 && tnl_cfg.erspan_ver != 2) {
+                    ds_put_format(&errors, "%s: invalid erspan version: %s\n",
+                                  name, node->value);
+                    err = EINVAL;
+                    goto out;
+                }
+            }
+        } else if (!strcmp(node->key, "erspan_dir")) {
+            if (!strcmp(node->value, "flow")) {
+                tnl_cfg.erspan_dir_flow = true;
+            } else {
+                tnl_cfg.erspan_dir_flow = false;
+                tnl_cfg.erspan_dir = atoi(node->value);
+
+                if (tnl_cfg.erspan_dir != 0 && tnl_cfg.erspan_dir != 1) {
+                    ds_put_format(&errors, "%s: invalid erspan direction: %s\n",
+                                  name, node->value);
+                    err = EINVAL;
+                    goto out;
+                }
+            }
+        } else if (!strcmp(node->key, "erspan_hwid")) {
+            if (!strcmp(node->value, "flow")) {
+                tnl_cfg.erspan_hwid_flow = true;
+            } else {
+                tnl_cfg.erspan_hwid_flow = false;
+                tnl_cfg.erspan_hwid = strtol(node->value, NULL, 16);
+
+                if (tnl_cfg.erspan_hwid & ~(ERSPAN_HWID_MASK >> 4)) {
+                    ds_put_format(&errors, "%s: invalid erspan hardware ID: %s\n",
+                                  name, node->value);
+                    err = EINVAL;
+                    goto out;
+                }
+            }
+        } else if (!strcmp(node->key, "payload_type")) {
+            if (!strcmp(node->value, "mpls")) {
+                 tnl_cfg.payload_ethertype = htons(ETH_TYPE_MPLS);
+                 tnl_cfg.exts |= (1 << OVS_BAREUDP_EXT_MULTIPROTO_MODE);
+            } else if (!strcmp(node->value, "ip")) {
+                 tnl_cfg.payload_ethertype = htons(ETH_TYPE_IP);
+                 tnl_cfg.exts |= (1 << OVS_BAREUDP_EXT_MULTIPROTO_MODE);
+            } else {
+                 uint16_t payload_ethertype;
+
+                 if (str_to_u16(node->value, "payload_type",
+                                &payload_ethertype)) {
+                     err = EINVAL;
+                     goto out;
+                 }
+                 tnl_cfg.payload_ethertype = htons(payload_ethertype);
+            }
+        } else if (!strcmp(node->key, "remote_cert") ||
+                   !strcmp(node->key, "remote_name") ||
+                   !strcmp(node->key, "psk")) {
+            /* When configuring OVS for IPsec, these keys may be set in the
+               tunnel port's 'options' column. 'ovs-vswitchd' does not directly
+               use them, but they are read by 'ovs-monitor-ipsec'. In order to
+               suppress the "unknown %s argument" warning message below, we
+               handle them here by ignoring them. */
         } else {
-            VLOG_WARN("%s: unknown %s argument '%s'", name, type, node->key);
+            ds_put_format(&errors, "%s: unknown %s argument '%s'\n", name,
+                          type, node->key);
         }
     }
 
-    if (tnl_cfg.ipsec) {
-        static struct ovs_mutex mutex = OVS_MUTEX_INITIALIZER;
-        static pid_t pid = 0;
-
-#ifndef _WIN32
-        ovs_mutex_lock(&mutex);
-        if (pid <= 0) {
-            char *file_name = xasprintf("%s/%s", ovs_rundir(),
-                                        "ovs-monitor-ipsec.pid");
-            pid = read_pidfile(file_name);
-            free(file_name);
+    enum tunnel_layers layers = tunnel_supported_layers(type, &tnl_cfg);
+    const char *full_type = (strcmp(type, "vxlan") ? type
+                             : (tnl_cfg.exts & (1 << OVS_VXLAN_EXT_GPE)
+                                ? "VXLAN-GPE" : "VXLAN (without GPE)"));
+    const char *packet_type = smap_get(args, "packet_type");
+    if (!packet_type) {
+        tnl_cfg.pt_mode = default_pt_mode(layers);
+    } else if (!strcmp(packet_type, "legacy_l2")) {
+        tnl_cfg.pt_mode = NETDEV_PT_LEGACY_L2;
+        if (!(layers & TNL_L2)) {
+            ds_put_format(&errors, "%s: legacy_l2 configured on %s tunnel "
+                          "that cannot carry L2 traffic\n",
+                          name, full_type);
+            err = EINVAL;
+            goto out;
         }
-        ovs_mutex_unlock(&mutex);
-#endif
-
-        if (pid < 0) {
-            VLOG_ERR("%s: IPsec requires the ovs-monitor-ipsec daemon",
-                     name);
-            return EINVAL;
+    } else if (!strcmp(packet_type, "legacy_l3")) {
+        tnl_cfg.pt_mode = NETDEV_PT_LEGACY_L3;
+        if (!(layers & TNL_L3)) {
+            ds_put_format(&errors, "%s: legacy_l3 configured on %s tunnel "
+                          "that cannot carry L3 traffic\n",
+                          name, full_type);
+            err = EINVAL;
+            goto out;
         }
-
-        if (smap_get(args, "peer_cert") && smap_get(args, "psk")) {
-            VLOG_ERR("%s: cannot define both 'peer_cert' and 'psk'", name);
-            return EINVAL;
-        }
-
-        if (!ipsec_mech_set) {
-            VLOG_ERR("%s: IPsec requires an 'peer_cert' or psk' argument",
-                     name);
-            return EINVAL;
-        }
+    } else if (!strcmp(packet_type, "ptap")) {
+        tnl_cfg.pt_mode = NETDEV_PT_AWARE;
+    } else {
+        ds_put_format(&errors, "%s: unknown packet_type '%s'\n",
+                      name, packet_type);
+        err = EINVAL;
+        goto out;
     }
 
-    if (!tnl_cfg.ip_dst && !tnl_cfg.ip_dst_flow) {
-        VLOG_ERR("%s: %s type requires valid 'remote_ip' argument",
-                 name, type);
-        return EINVAL;
+    if (!ipv6_addr_is_set(&tnl_cfg.ipv6_dst) && !tnl_cfg.ip_dst_flow) {
+        ds_put_format(&errors,
+                      "%s: %s type requires valid 'remote_ip' argument\n",
+                      name, type);
+        err = EINVAL;
+        goto out;
     }
     if (tnl_cfg.ip_src_flow && !tnl_cfg.ip_dst_flow) {
-        VLOG_ERR("%s: %s type requires 'remote_ip=flow' with 'local_ip=flow'",
-                 name, type);
-        return EINVAL;
+        ds_put_format(&errors,
+                      "%s: %s type requires 'remote_ip=flow' "
+                      "with 'local_ip=flow'\n",
+                      name, type);
+        err = EINVAL;
+        goto out;
+    }
+    if (src_proto && dst_proto && src_proto != dst_proto) {
+        ds_put_format(&errors,
+                      "%s: 'remote_ip' and 'local_ip' "
+                      "has to be of the same address family\n",
+                      name);
+        err = EINVAL;
+        goto out;
     }
     if (!tnl_cfg.ttl) {
         tnl_cfg.ttl = DEFAULT_TTL;
@@ -623,6 +850,16 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
                                &tnl_cfg.out_key_present,
                                &tnl_cfg.out_key_flow);
 
+    if (is_concomitant_vxlan_tunnel_present(dev, &tnl_cfg)) {
+        ds_put_format(&errors, "%s: VXLAN-GBP, and non-VXLAN-GBP "
+                      "tunnels can't be configured on the same "
+                      "dst_port\n",
+                      name);
+        err = EEXIST;
+        goto out;
+    }
+    update_vxlan_global_cfg(dev_, &dev->tnl_cfg, &tnl_cfg);
+
     ovs_mutex_lock(&dev->mutex);
     if (memcmp(&dev->tnl_cfg, &tnl_cfg, sizeof tnl_cfg)) {
         dev->tnl_cfg = tnl_cfg;
@@ -631,27 +868,41 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
     }
     ovs_mutex_unlock(&dev->mutex);
 
-    return 0;
+    err = 0;
+
+out:
+    if (errors.length) {
+        ds_chomp(&errors, '\n');
+        VLOG_WARN("%s", ds_cstr(&errors));
+        if (err) {
+            *errp = ds_steal_cstr(&errors);
+        }
+    }
+
+    ds_destroy(&errors);
+
+    return err;
 }
 
 static int
 get_tunnel_config(const struct netdev *dev, struct smap *args)
 {
     struct netdev_vport *netdev = netdev_vport_cast(dev);
+    const char *type = netdev_get_type(dev);
     struct netdev_tunnel_config tnl_cfg;
 
     ovs_mutex_lock(&netdev->mutex);
     tnl_cfg = netdev->tnl_cfg;
     ovs_mutex_unlock(&netdev->mutex);
 
-    if (tnl_cfg.ip_dst) {
-        smap_add_format(args, "remote_ip", IP_FMT, IP_ARGS(tnl_cfg.ip_dst));
+    if (ipv6_addr_is_set(&tnl_cfg.ipv6_dst)) {
+        smap_add_ipv6(args, "remote_ip", &tnl_cfg.ipv6_dst);
     } else if (tnl_cfg.ip_dst_flow) {
         smap_add(args, "remote_ip", "flow");
     }
 
-    if (tnl_cfg.ip_src) {
-        smap_add_format(args, "local_ip", IP_FMT, IP_ARGS(tnl_cfg.ip_src));
+    if (ipv6_addr_is_set(&tnl_cfg.ipv6_src)) {
+        smap_add_ipv6(args, "local_ip", &tnl_cfg.ipv6_src);
     } else if (tnl_cfg.ip_src_flow) {
         smap_add(args, "local_ip", "flow");
     }
@@ -691,12 +942,13 @@ get_tunnel_config(const struct netdev *dev, struct smap *args)
 
     if (tnl_cfg.dst_port) {
         uint16_t dst_port = ntohs(tnl_cfg.dst_port);
-        const char *type = netdev_get_type(dev);
 
         if ((!strcmp("geneve", type) && dst_port != GENEVE_DST_PORT) ||
             (!strcmp("vxlan", type) && dst_port != VXLAN_DST_PORT) ||
             (!strcmp("lisp", type) && dst_port != LISP_DST_PORT) ||
-            (!strcmp("stt", type) && dst_port != STT_DST_PORT)) {
+            (!strcmp("stt", type) && dst_port != STT_DST_PORT) ||
+            (!strcmp("gtpu", type) && dst_port != GTPU_DST_PORT) ||
+            !strcmp("bareudp", type)) {
             smap_add_format(args, "dst_port", "%d", dst_port);
         }
     }
@@ -705,8 +957,61 @@ get_tunnel_config(const struct netdev *dev, struct smap *args)
         smap_add(args, "csum", "true");
     }
 
+    if (tnl_cfg.set_seq) {
+        smap_add(args, "seq", "true");
+    }
+
+    enum tunnel_layers layers = tunnel_supported_layers(type, &tnl_cfg);
+    if (tnl_cfg.pt_mode != default_pt_mode(layers)) {
+        smap_add(args, "packet_type",
+                 tnl_cfg.pt_mode == NETDEV_PT_LEGACY_L2 ? "legacy_l2"
+                 : tnl_cfg.pt_mode == NETDEV_PT_LEGACY_L3 ? "legacy_l3"
+                 : "ptap");
+    }
+
     if (!tnl_cfg.dont_fragment) {
         smap_add(args, "df_default", "false");
+    }
+
+    if (tnl_cfg.set_egress_pkt_mark) {
+        smap_add_format(args, "egress_pkt_mark",
+                        "%"PRIu32, tnl_cfg.egress_pkt_mark);
+    }
+
+    if (!strcmp("erspan", type) || !strcmp("ip6erspan", type)) {
+        if (tnl_cfg.erspan_ver_flow) {
+            /* since version number is not determined,
+             * assume print all other as flow
+             */
+            smap_add(args, "erspan_ver", "flow");
+            smap_add(args, "erspan_idx", "flow");
+            smap_add(args, "erspan_dir", "flow");
+            smap_add(args, "erspan_hwid", "flow");
+        } else {
+            smap_add_format(args, "erspan_ver", "%d", tnl_cfg.erspan_ver);
+
+            if (tnl_cfg.erspan_ver == 1) {
+                if (tnl_cfg.erspan_idx_flow) {
+                    smap_add(args, "erspan_idx", "flow");
+                } else {
+                    smap_add_format(args, "erspan_idx", "0x%x",
+                                    tnl_cfg.erspan_idx);
+                }
+            } else if (tnl_cfg.erspan_ver == 2) {
+                if (tnl_cfg.erspan_dir_flow) {
+                    smap_add(args, "erspan_dir", "flow");
+                } else {
+                    smap_add_format(args, "erspan_dir", "%d",
+                                    tnl_cfg.erspan_dir);
+                }
+                if (tnl_cfg.erspan_hwid_flow) {
+                    smap_add(args, "erspan_hwid", "flow");
+                } else {
+                    smap_add_format(args, "erspan_hwid", "0x%x",
+                                    tnl_cfg.erspan_hwid);
+                }
+            }
+        }
     }
 
     return 0;
@@ -779,7 +1084,7 @@ get_patch_config(const struct netdev *dev_, struct smap *args)
 }
 
 static int
-set_patch_config(struct netdev *dev_, const struct smap *args)
+set_patch_config(struct netdev *dev_, const struct smap *args, char **errp)
 {
     struct netdev_vport *dev = netdev_vport_cast(dev_);
     const char *name = netdev_get_name(dev_);
@@ -787,17 +1092,19 @@ set_patch_config(struct netdev *dev_, const struct smap *args)
 
     peer = smap_get(args, "peer");
     if (!peer) {
-        VLOG_ERR("%s: patch type requires valid 'peer' argument", name);
+        VLOG_ERR_BUF(errp, "%s: patch type requires valid 'peer' argument",
+                     name);
         return EINVAL;
     }
 
     if (smap_count(args) > 1) {
-        VLOG_ERR("%s: patch type takes only a 'peer' argument", name);
+        VLOG_ERR_BUF(errp, "%s: patch type takes only a 'peer' argument",
+                     name);
         return EINVAL;
     }
 
     if (!strcmp(name, peer)) {
-        VLOG_ERR("%s: patch peer must not be self", name);
+        VLOG_ERR_BUF(errp, "%s: patch peer must not be self", name);
         return EINVAL;
     }
 
@@ -813,646 +1120,169 @@ set_patch_config(struct netdev *dev_, const struct smap *args)
 }
 
 static int
-get_stats(const struct netdev *netdev, struct netdev_stats *stats)
+netdev_vport_get_stats(const struct netdev *netdev, struct netdev_stats *stats)
 {
     struct netdev_vport *dev = netdev_vport_cast(netdev);
 
     ovs_mutex_lock(&dev->mutex);
-    *stats = dev->stats;
+    /* Passing only collected counters */
+    stats->tx_packets = dev->stats.tx_packets;
+    stats->tx_bytes = dev->stats.tx_bytes;
+    stats->rx_packets = dev->stats.rx_packets;
+    stats->rx_bytes = dev->stats.rx_bytes;
     ovs_mutex_unlock(&dev->mutex);
 
     return 0;
 }
+
+static enum netdev_pt_mode
+netdev_vport_get_pt_mode(const struct netdev *netdev)
+{
+    struct netdev_vport *dev = netdev_vport_cast(netdev);
+
+    return dev->tnl_cfg.pt_mode;
+}
+
 
 
-/* Tunnel push pop ops. */
-
-static struct ip_header *
-ip_hdr(void *eth)
-{
-    return (void *)((char *)eth + sizeof (struct eth_header));
-}
-
-static struct gre_base_hdr *
-gre_hdr(struct ip_header *ip)
-{
-     return (void *)((char *)ip + sizeof (struct ip_header));
-}
-
-static void *
-ip_extract_tnl_md(struct dp_packet *packet, struct flow_tnl *tnl)
-{
-    struct ip_header *nh;
-    void *l4;
-    int l3_size;
-
-    nh = dp_packet_l3(packet);
-    l4 = dp_packet_l4(packet);
-
-    if (!nh || !l4) {
-        return NULL;
-    }
-
-    if (csum(nh, IP_IHL(nh->ip_ihl_ver) * 4)) {
-        VLOG_WARN_RL(&err_rl, "ip packet has invalid checksum");
-        return NULL;
-    }
-
-    if (IP_VER(nh->ip_ihl_ver) != 4) {
-        VLOG_WARN_RL(&err_rl, "ipv4 packet has invalid version (%d)",
-                     IP_VER(nh->ip_ihl_ver));
-        return NULL;
-    }
-
-    l3_size = dp_packet_size(packet) -
-              ((char *)nh - (char *)dp_packet_data(packet));
-
-    if (ntohs(nh->ip_tot_len) > l3_size) {
-        VLOG_WARN_RL(&err_rl, "ip packet is truncated (IP length %d, actual %d)",
-                     ntohs(nh->ip_tot_len), l3_size);
-        return NULL;
-    }
-
-    if (IP_IHL(nh->ip_ihl_ver) * 4 > sizeof(struct ip_header)) {
-        VLOG_WARN_RL(&err_rl, "ip options not supported on tunnel packets "
-                     "(%d bytes)", IP_IHL(nh->ip_ihl_ver) * 4);
-        return NULL;
-    }
-
-    tnl->ip_src = get_16aligned_be32(&nh->ip_src);
-    tnl->ip_dst = get_16aligned_be32(&nh->ip_dst);
-    tnl->ip_tos = nh->ip_tos;
-    tnl->ip_ttl = nh->ip_ttl;
-
-    return l4;
-}
-
-/* Pushes the 'size' bytes of 'header' into the headroom of 'packet',
- * reallocating the packet if necessary.  'header' should contain an Ethernet
- * header, followed by an IPv4 header (without options), and an L4 header.
- *
- * This function sets the IP header's ip_tot_len field (which should be zeroed
- * as part of 'header') and puts its value into '*ip_tot_size' as well.  Also
- * updates IP header checksum.
- *
- * Return pointer to the L4 header added to 'packet'. */
-static void *
-push_ip_header(struct dp_packet *packet,
-               const void *header, int size, int *ip_tot_size)
-{
-    struct eth_header *eth;
-    struct ip_header *ip;
-
-    eth = dp_packet_push_uninit(packet, size);
-    *ip_tot_size = dp_packet_size(packet) - sizeof (struct eth_header);
-
-    memcpy(eth, header, size);
-    ip = ip_hdr(eth);
-    ip->ip_tot_len = htons(*ip_tot_size);
-
-
-    ip->ip_csum = recalc_csum16(ip->ip_csum, 0, ip->ip_tot_len);
-
-    return ip + 1;
-}
-
-static void *
-udp_extract_tnl_md(struct dp_packet *packet, struct flow_tnl *tnl)
-{
-    struct udp_header *udp;
-
-    udp = ip_extract_tnl_md(packet, tnl);
-    if (!udp) {
-        return NULL;
-    }
-
-    if (udp->udp_csum) {
-        uint32_t csum = packet_csum_pseudoheader(dp_packet_l3(packet));
-
-        csum = csum_continue(csum, udp, dp_packet_size(packet) -
-                             ((const unsigned char *)udp -
-                              (const unsigned char *)dp_packet_l2(packet)));
-        if (csum_finish(csum)) {
-            return NULL;
-        }
-        tnl->flags |= FLOW_TNL_F_CSUM;
-    }
-
-    tnl->tp_src = udp->udp_src;
-    tnl->tp_dst = udp->udp_dst;
-
-    return udp + 1;
-}
-
-static ovs_be16
-get_src_port(struct dp_packet *packet)
-{
-    uint32_t hash;
-
-    hash = dp_packet_get_rss_hash(packet);
-
-    return htons((((uint64_t) hash * (tnl_udp_port_max - tnl_udp_port_min)) >> 32) +
-                 tnl_udp_port_min);
-}
-
-static void
-push_udp_header(struct dp_packet *packet,
-                const struct ovs_action_push_tnl *data)
-{
-    struct udp_header *udp;
-    int ip_tot_size;
-
-    udp = push_ip_header(packet, data->header, data->header_len, &ip_tot_size);
-
-    /* set udp src port */
-    udp->udp_src = get_src_port(packet);
-    udp->udp_len = htons(ip_tot_size - sizeof (struct ip_header));
-
-    if (udp->udp_csum) {
-        uint32_t csum = packet_csum_pseudoheader(ip_hdr(dp_packet_data(packet)));
-
-        csum = csum_continue(csum, udp,
-                             ip_tot_size - sizeof (struct ip_header));
-        udp->udp_csum = csum_finish(csum);
-
-        if (!udp->udp_csum) {
-            udp->udp_csum = htons(0xffff);
-        }
-    }
-}
-
-static void *
-udp_build_header(struct netdev_tunnel_config *tnl_cfg,
-                 const struct flow *tnl_flow,
-                 struct ovs_action_push_tnl *data)
-{
-    struct ip_header *ip;
-    struct udp_header *udp;
-
-    ip = ip_hdr(data->header);
-    ip->ip_proto = IPPROTO_UDP;
-
-    udp = (struct udp_header *) (ip + 1);
-    udp->udp_dst = tnl_cfg->dst_port;
-
-    if (tnl_flow->tunnel.flags & FLOW_TNL_F_CSUM) {
-        /* Write a value in now to mark that we should compute the checksum
-         * later. 0xffff is handy because it is transparent to the
-         * calculation. */
-        udp->udp_csum = htons(0xffff);
-    }
-
-    return udp + 1;
-}
-
+#ifdef __linux__
 static int
-gre_header_len(ovs_be16 flags)
+netdev_vport_get_ifindex(const struct netdev *netdev_)
 {
-    int hlen = sizeof(struct eth_header) +
-               sizeof(struct ip_header) + 4;
+    char buf[NETDEV_VPORT_NAME_BUFSIZE];
+    const char *name = netdev_vport_get_dpif_port(netdev_, buf, sizeof(buf));
 
-    if (flags & htons(GRE_CSUM)) {
-        hlen += 4;
-    }
-    if (flags & htons(GRE_KEY)) {
-        hlen += 4;
-    }
-    if (flags & htons(GRE_SEQ)) {
-        hlen += 4;
-    }
-    return hlen;
+    return linux_get_ifindex(name);
 }
 
-static int
-parse_gre_header(struct dp_packet *packet,
-                 struct flow_tnl *tnl)
-{
-    const struct gre_base_hdr *greh;
-    ovs_16aligned_be32 *options;
-    int hlen;
-
-    greh = ip_extract_tnl_md(packet, tnl);
-    if (!greh) {
-        return -EINVAL;
-    }
-
-    if (greh->flags & ~(htons(GRE_CSUM | GRE_KEY | GRE_SEQ))) {
-        return -EINVAL;
-    }
-
-    if (greh->protocol != htons(ETH_TYPE_TEB)) {
-        return -EINVAL;
-    }
-
-    hlen = gre_header_len(greh->flags);
-    if (hlen > dp_packet_size(packet)) {
-        return -EINVAL;
-    }
-
-    options = (ovs_16aligned_be32 *)(greh + 1);
-    if (greh->flags & htons(GRE_CSUM)) {
-        ovs_be16 pkt_csum;
-
-        pkt_csum = csum(greh, dp_packet_size(packet) -
-                              ((const unsigned char *)greh -
-                               (const unsigned char *)dp_packet_l2(packet)));
-        if (pkt_csum) {
-            return -EINVAL;
-        }
-        tnl->flags = FLOW_TNL_F_CSUM;
-        options++;
-    }
-
-    if (greh->flags & htons(GRE_KEY)) {
-        tnl->tun_id = (OVS_FORCE ovs_be64) ((OVS_FORCE uint64_t)(get_16aligned_be32(options)) << 32);
-        tnl->flags |= FLOW_TNL_F_KEY;
-        options++;
-    }
-
-    if (greh->flags & htons(GRE_SEQ)) {
-        options++;
-    }
-
-    return hlen;
-}
-
-static void
-pkt_metadata_init_tnl(struct pkt_metadata *md)
-{
-    /* Zero up through the tunnel metadata options. The length and table
-     * are before this and as long as they are empty, the options won't
-     * be looked at. */
-    memset(md, 0, offsetof(struct pkt_metadata, tunnel.metadata.opts));
-}
-
-static int
-netdev_gre_pop_header(struct dp_packet *packet)
-{
-    struct pkt_metadata *md = &packet->md;
-    struct flow_tnl *tnl = &md->tunnel;
-    int hlen = sizeof(struct eth_header) +
-               sizeof(struct ip_header) + 4;
-
-    pkt_metadata_init_tnl(md);
-    if (hlen > dp_packet_size(packet)) {
-        return EINVAL;
-    }
-
-    hlen = parse_gre_header(packet, tnl);
-    if (hlen < 0) {
-        return -hlen;
-    }
-
-    dp_packet_reset_packet(packet, hlen);
-
-    return 0;
-}
-
-static void
-netdev_gre_push_header(struct dp_packet *packet,
-                       const struct ovs_action_push_tnl *data)
-{
-    struct gre_base_hdr *greh;
-    int ip_tot_size;
-
-    greh = push_ip_header(packet, data->header, data->header_len, &ip_tot_size);
-
-    if (greh->flags & htons(GRE_CSUM)) {
-        ovs_be16 *csum_opt = (ovs_be16 *) (greh + 1);
-        *csum_opt = csum(greh, ip_tot_size - sizeof (struct ip_header));
-    }
-}
-
-static int
-netdev_gre_build_header(const struct netdev *netdev,
-                        struct ovs_action_push_tnl *data,
-                        const struct flow *tnl_flow)
-{
-    struct netdev_vport *dev = netdev_vport_cast(netdev);
-    struct netdev_tunnel_config *tnl_cfg;
-    struct ip_header *ip;
-    struct gre_base_hdr *greh;
-    ovs_16aligned_be32 *options;
-    int hlen;
-
-    /* XXX: RCUfy tnl_cfg. */
-    ovs_mutex_lock(&dev->mutex);
-    tnl_cfg = &dev->tnl_cfg;
-
-    ip = ip_hdr(data->header);
-    ip->ip_proto = IPPROTO_GRE;
-
-    greh = gre_hdr(ip);
-    greh->protocol = htons(ETH_TYPE_TEB);
-    greh->flags = 0;
-
-    options = (ovs_16aligned_be32 *) (greh + 1);
-    if (tnl_flow->tunnel.flags & FLOW_TNL_F_CSUM) {
-        greh->flags |= htons(GRE_CSUM);
-        put_16aligned_be32(options, 0);
-        options++;
-    }
-
-    if (tnl_cfg->out_key_present) {
-        greh->flags |= htons(GRE_KEY);
-        put_16aligned_be32(options, (OVS_FORCE ovs_be32)
-                                    ((OVS_FORCE uint64_t) tnl_flow->tunnel.tun_id >> 32));
-        options++;
-    }
-
-    ovs_mutex_unlock(&dev->mutex);
-
-    hlen = (uint8_t *) options - (uint8_t *) greh;
-
-    data->header_len = sizeof(struct eth_header) +
-                       sizeof(struct ip_header)  + hlen;
-    data->tnl_type = OVS_VPORT_TYPE_GRE;
-    return 0;
-}
-
-static int
-netdev_vxlan_pop_header(struct dp_packet *packet)
-{
-    struct pkt_metadata *md = &packet->md;
-    struct flow_tnl *tnl = &md->tunnel;
-    struct vxlanhdr *vxh;
-
-    pkt_metadata_init_tnl(md);
-    if (VXLAN_HLEN > dp_packet_size(packet)) {
-        return EINVAL;
-    }
-
-    vxh = udp_extract_tnl_md(packet, tnl);
-    if (!vxh) {
-        return EINVAL;
-    }
-
-    if (get_16aligned_be32(&vxh->vx_flags) != htonl(VXLAN_FLAGS) ||
-       (get_16aligned_be32(&vxh->vx_vni) & htonl(0xff))) {
-        VLOG_WARN_RL(&err_rl, "invalid vxlan flags=%#x vni=%#x\n",
-                     ntohl(get_16aligned_be32(&vxh->vx_flags)),
-                     ntohl(get_16aligned_be32(&vxh->vx_vni)));
-        return EINVAL;
-    }
-    tnl->tun_id = htonll(ntohl(get_16aligned_be32(&vxh->vx_vni)) >> 8);
-    tnl->flags |= FLOW_TNL_F_KEY;
-
-    dp_packet_reset_packet(packet, VXLAN_HLEN);
-
-    return 0;
-}
-
-static int
-netdev_vxlan_build_header(const struct netdev *netdev,
-                          struct ovs_action_push_tnl *data,
-                          const struct flow *tnl_flow)
-{
-    struct netdev_vport *dev = netdev_vport_cast(netdev);
-    struct netdev_tunnel_config *tnl_cfg;
-    struct vxlanhdr *vxh;
-
-    /* XXX: RCUfy tnl_cfg. */
-    ovs_mutex_lock(&dev->mutex);
-    tnl_cfg = &dev->tnl_cfg;
-
-    vxh = udp_build_header(tnl_cfg, tnl_flow, data);
-
-    put_16aligned_be32(&vxh->vx_flags, htonl(VXLAN_FLAGS));
-    put_16aligned_be32(&vxh->vx_vni, htonl(ntohll(tnl_flow->tunnel.tun_id) << 8));
-
-    ovs_mutex_unlock(&dev->mutex);
-    data->header_len = VXLAN_HLEN;
-    data->tnl_type = OVS_VPORT_TYPE_VXLAN;
-    return 0;
-}
-
-static int
-netdev_geneve_pop_header(struct dp_packet *packet)
-{
-    struct pkt_metadata *md = &packet->md;
-    struct flow_tnl *tnl = &md->tunnel;
-    struct genevehdr *gnh;
-    unsigned int hlen, opts_len;
-
-    pkt_metadata_init_tnl(md);
-    if (GENEVE_BASE_HLEN > dp_packet_size(packet)) {
-        VLOG_WARN_RL(&err_rl, "geneve packet too small: min header=%u packet size=%u\n",
-                     (unsigned int)GENEVE_BASE_HLEN, dp_packet_size(packet));
-        return EINVAL;
-    }
-
-    gnh = udp_extract_tnl_md(packet, tnl);
-    if (!gnh) {
-        return EINVAL;
-    }
-
-    opts_len = gnh->opt_len * 4;
-    hlen = GENEVE_BASE_HLEN + opts_len;
-    if (hlen > dp_packet_size(packet)) {
-        VLOG_WARN_RL(&err_rl, "geneve packet too small: header len=%u packet size=%u\n",
-                     hlen, dp_packet_size(packet));
-        return EINVAL;
-    }
-
-    if (gnh->ver != 0) {
-        VLOG_WARN_RL(&err_rl, "unknown geneve version: %"PRIu8"\n", gnh->ver);
-        return EINVAL;
-    }
-
-    if (gnh->proto_type != htons(ETH_TYPE_TEB)) {
-        VLOG_WARN_RL(&err_rl, "unknown geneve encapsulated protocol: %#x\n",
-                     ntohs(gnh->proto_type));
-        return EINVAL;
-    }
-
-    tnl->flags |= gnh->oam ? FLOW_TNL_F_OAM : 0;
-    tnl->tun_id = htonll(ntohl(get_16aligned_be32(&gnh->vni)) >> 8);
-    tnl->flags |= FLOW_TNL_F_KEY;
-
-    memcpy(tnl->metadata.opts.gnv, gnh->options, opts_len);
-    tnl->metadata.present.len = opts_len;
-    tnl->flags |= FLOW_TNL_F_UDPIF;
-
-    dp_packet_reset_packet(packet, hlen);
-
-    return 0;
-}
-
-static int
-netdev_geneve_build_header(const struct netdev *netdev,
-                           struct ovs_action_push_tnl *data,
-                           const struct flow *tnl_flow)
-{
-    struct netdev_vport *dev = netdev_vport_cast(netdev);
-    struct netdev_tunnel_config *tnl_cfg;
-    struct genevehdr *gnh;
-    int opt_len;
-    bool crit_opt;
-
-    /* XXX: RCUfy tnl_cfg. */
-    ovs_mutex_lock(&dev->mutex);
-    tnl_cfg = &dev->tnl_cfg;
-
-    gnh = udp_build_header(tnl_cfg, tnl_flow, data);
-
-    put_16aligned_be32(&gnh->vni, htonl(ntohll(tnl_flow->tunnel.tun_id) << 8));
-
-    ovs_mutex_unlock(&dev->mutex);
-
-    opt_len = tun_metadata_to_geneve_header(&tnl_flow->tunnel,
-                                            gnh->options, &crit_opt);
-
-    gnh->opt_len = opt_len / 4;
-    gnh->oam = !!(tnl_flow->tunnel.flags & FLOW_TNL_F_OAM);
-    gnh->critical = crit_opt ? 1 : 0;
-    gnh->proto_type = htons(ETH_TYPE_TEB);
-
-    data->header_len = GENEVE_BASE_HLEN + opt_len;
-    data->tnl_type = OVS_VPORT_TYPE_GENEVE;
-    return 0;
-}
-
-static void
-netdev_vport_range(struct unixctl_conn *conn, int argc,
-                   const char *argv[], void *aux OVS_UNUSED)
-{
-    int val1, val2;
-
-    if (argc < 3) {
-        struct ds ds = DS_EMPTY_INITIALIZER;
-
-        ds_put_format(&ds, "Tunnel UDP source port range: %"PRIu16"-%"PRIu16"\n",
-                            tnl_udp_port_min, tnl_udp_port_max);
-
-        unixctl_command_reply(conn, ds_cstr(&ds));
-        ds_destroy(&ds);
-        return;
-    }
-
-    if (argc != 3) {
-        return;
-    }
-
-    val1 = atoi(argv[1]);
-    if (val1 <= 0 || val1 > UINT16_MAX) {
-        unixctl_command_reply(conn, "Invalid min.");
-        return;
-    }
-    val2 = atoi(argv[2]);
-    if (val2 <= 0 || val2 > UINT16_MAX) {
-        unixctl_command_reply(conn, "Invalid max.");
-        return;
-    }
-
-    if (val1 > val2) {
-        tnl_udp_port_min = val2;
-        tnl_udp_port_max = val1;
-    } else {
-        tnl_udp_port_min = val1;
-        tnl_udp_port_max = val2;
-    }
-    seq_change(tnl_conf_seq);
-
-    unixctl_command_reply(conn, "OK");
-}
-
-
-#define VPORT_FUNCTIONS(GET_CONFIG, SET_CONFIG,             \
-                        GET_TUNNEL_CONFIG, GET_STATUS,      \
-                        BUILD_HEADER,                       \
-                        PUSH_HEADER, POP_HEADER)            \
-    NULL,                                                   \
-    netdev_vport_run,                                       \
-    netdev_vport_wait,                                      \
-                                                            \
-    netdev_vport_alloc,                                     \
-    netdev_vport_construct,                                 \
-    netdev_vport_destruct,                                  \
-    netdev_vport_dealloc,                                   \
-    GET_CONFIG,                                             \
-    SET_CONFIG,                                             \
-    GET_TUNNEL_CONFIG,                                      \
-    BUILD_HEADER,                                           \
-    PUSH_HEADER,                                            \
-    POP_HEADER,                                             \
-    NULL,                       /* get_numa_id */           \
-    NULL,                       /* set_multiq */            \
-                                                            \
-    NULL,                       /* send */                  \
-    NULL,                       /* send_wait */             \
-                                                            \
-    netdev_vport_set_etheraddr,                             \
-    netdev_vport_get_etheraddr,                             \
-    NULL,                       /* get_mtu */               \
-    NULL,                       /* set_mtu */               \
-    NULL,                       /* get_ifindex */           \
-    NULL,                       /* get_carrier */           \
-    NULL,                       /* get_carrier_resets */    \
-    NULL,                       /* get_miimon */            \
-    get_stats,                                              \
-                                                            \
-    NULL,                       /* get_features */          \
-    NULL,                       /* set_advertisements */    \
-                                                            \
-    NULL,                       /* set_policing */          \
-    NULL,                       /* get_qos_types */         \
-    NULL,                       /* get_qos_capabilities */  \
-    NULL,                       /* get_qos */               \
-    NULL,                       /* set_qos */               \
-    NULL,                       /* get_queue */             \
-    NULL,                       /* set_queue */             \
-    NULL,                       /* delete_queue */          \
-    NULL,                       /* get_queue_stats */       \
-    NULL,                       /* queue_dump_start */      \
-    NULL,                       /* queue_dump_next */       \
-    NULL,                       /* queue_dump_done */       \
-    NULL,                       /* dump_queue_stats */      \
-                                                            \
-    NULL,                       /* get_in4 */               \
-    NULL,                       /* set_in4 */               \
-    NULL,                       /* get_in6 */               \
-    NULL,                       /* add_router */            \
-    NULL,                       /* get_next_hop */          \
-    GET_STATUS,                                             \
-    NULL,                       /* arp_lookup */            \
-                                                            \
-    netdev_vport_update_flags,                              \
-                                                            \
-    NULL,                   /* rx_alloc */                  \
-    NULL,                   /* rx_construct */              \
-    NULL,                   /* rx_destruct */               \
-    NULL,                   /* rx_dealloc */                \
-    NULL,                   /* rx_recv */                   \
-    NULL,                   /* rx_wait */                   \
-    NULL,                   /* rx_drain */
-
-
-#define TUNNEL_CLASS(NAME, DPIF_PORT, BUILD_HEADER, PUSH_HEADER, POP_HEADER)   \
-    { DPIF_PORT,                                                               \
-        { NAME, VPORT_FUNCTIONS(get_tunnel_config,                             \
-                                set_tunnel_config,                             \
-                                get_netdev_tunnel_config,                      \
-                                tunnel_get_status,                             \
-                                BUILD_HEADER, PUSH_HEADER, POP_HEADER) }}
+#define NETDEV_VPORT_GET_IFINDEX netdev_vport_get_ifindex
+#else /* !__linux__ */
+#define NETDEV_VPORT_GET_IFINDEX NULL
+#endif /* __linux__ */
+
+#define VPORT_FUNCTIONS_COMMON                      \
+    .run = netdev_vport_run,                        \
+    .wait = netdev_vport_wait,                      \
+    .alloc = netdev_vport_alloc,                    \
+    .construct = netdev_vport_construct,            \
+    .destruct = netdev_vport_destruct,              \
+    .dealloc = netdev_vport_dealloc,                \
+    .set_etheraddr = netdev_vport_set_etheraddr,    \
+    .get_etheraddr = netdev_vport_get_etheraddr,    \
+    .get_stats = netdev_vport_get_stats,            \
+    .get_pt_mode = netdev_vport_get_pt_mode,        \
+    .update_flags = netdev_vport_update_flags
+
+#define TUNNEL_FUNCTIONS_COMMON                     \
+    VPORT_FUNCTIONS_COMMON,                         \
+    .get_config = get_tunnel_config,                \
+    .set_config = set_tunnel_config,                \
+    .get_tunnel_config = get_netdev_tunnel_config,  \
+    .get_status = tunnel_get_status
 
 void
 netdev_vport_tunnel_register(void)
 {
     /* The name of the dpif_port should be short enough to accomodate adding
      * a port number to the end if one is necessary. */
-    static const struct vport_class vport_classes[] = {
-        TUNNEL_CLASS("geneve", "genev_sys", netdev_geneve_build_header,
-                                            push_udp_header,
-                                            netdev_geneve_pop_header),
-        TUNNEL_CLASS("gre", "gre_sys", netdev_gre_build_header,
-                                       netdev_gre_push_header,
-                                       netdev_gre_pop_header),
-        TUNNEL_CLASS("ipsec_gre", "gre_sys", NULL, NULL, NULL),
-        TUNNEL_CLASS("vxlan", "vxlan_sys", netdev_vxlan_build_header,
-                                           push_udp_header,
-                                           netdev_vxlan_pop_header),
-        TUNNEL_CLASS("lisp", "lisp_sys", NULL, NULL, NULL),
-        TUNNEL_CLASS("stt", "stt_sys", NULL, NULL, NULL),
+    static struct vport_class vport_classes[] = {
+        { "genev_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "geneve",
+              .build_header = netdev_geneve_build_header,
+              .push_header = netdev_tnl_push_udp_header,
+              .pop_header = netdev_geneve_pop_header,
+              .get_ifindex = NETDEV_VPORT_GET_IFINDEX,
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "gre_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "gre",
+              .build_header = netdev_gre_build_header,
+              .push_header = netdev_gre_push_header,
+              .pop_header = netdev_gre_pop_header,
+              .get_ifindex = NETDEV_VPORT_GET_IFINDEX,
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "vxlan_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "vxlan",
+              .build_header = netdev_vxlan_build_header,
+              .push_header = netdev_tnl_push_udp_header,
+              .pop_header = netdev_vxlan_pop_header,
+              .get_ifindex = NETDEV_VPORT_GET_IFINDEX
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "lisp_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "lisp"
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "stt_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "stt"
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "erspan_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "erspan",
+              .build_header = netdev_erspan_build_header,
+              .push_header = netdev_erspan_push_header,
+              .pop_header = netdev_erspan_pop_header
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "ip6erspan_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "ip6erspan",
+              .build_header = netdev_erspan_build_header,
+              .push_header = netdev_erspan_push_header,
+              .pop_header = netdev_erspan_pop_header
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "ip6gre_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "ip6gre",
+              .build_header = netdev_gre_build_header,
+              .push_header = netdev_gre_push_header,
+              .pop_header = netdev_gre_pop_header,
+              .get_ifindex = NETDEV_VPORT_GET_IFINDEX,
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "gtpu_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "gtpu",
+              .build_header = netdev_gtpu_build_header,
+              .push_header = netdev_gtpu_push_header,
+              .pop_header = netdev_gtpu_pop_header,
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "udp_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "bareudp",
+              .get_ifindex = NETDEV_VPORT_GET_IFINDEX,
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+
     };
     static struct ovsthread_once once = OVSTHREAD_ONCE_INITIALIZER;
 
@@ -1460,11 +1290,12 @@ netdev_vport_tunnel_register(void)
         int i;
 
         for (i = 0; i < ARRAY_SIZE(vport_classes); i++) {
+            simap_init(&vport_classes[i].global_cfg_tracker);
             netdev_register_provider(&vport_classes[i].netdev_class);
         }
 
         unixctl_command_register("tnl/egress_port_range", "min max", 0, 2,
-                                 netdev_vport_range, NULL);
+                                 netdev_tnl_egress_port_range, NULL);
 
         ovsthread_once_done(&once);
     }
@@ -1473,11 +1304,15 @@ netdev_vport_tunnel_register(void)
 void
 netdev_vport_patch_register(void)
 {
-    static const struct vport_class patch_class =
-        { NULL,
-            { "patch", VPORT_FUNCTIONS(get_patch_config,
-                                       set_patch_config,
-                                       NULL,
-                                       NULL, NULL, NULL, NULL) }};
+    static struct vport_class patch_class = {
+        NULL,
+        { VPORT_FUNCTIONS_COMMON,
+          .type = "patch",
+          .get_config = get_patch_config,
+          .set_config = set_patch_config,
+        },
+        {{NULL, NULL, 0, 0}}
+    };
+    simap_init(&patch_class.global_cfg_tracker);
     netdev_register_provider(&patch_class.netdev_class);
 }

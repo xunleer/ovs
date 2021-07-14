@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2009-2012, 2014-2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 #include <config.h>
 
-#include "json.h"
+#include "openvswitch/json.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -24,11 +24,12 @@
 #include <limits.h>
 #include <string.h>
 
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "hash.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "unicode.h"
 #include "util.h"
+#include "uuid.h"
 
 /* The type of a JSON token. */
 enum json_token_type {
@@ -58,7 +59,7 @@ struct json_token {
         double real;
         long long int integer;
         const char *string;
-    } u;
+    };
 };
 
 enum json_lex_state {
@@ -169,7 +170,7 @@ struct json *
 json_string_create_nocopy(char *s)
 {
     struct json *json = json_create(JSON_STRING);
-    json->u.string = s;
+    json->string = s;
     return json;
 }
 
@@ -183,9 +184,9 @@ struct json *
 json_array_create_empty(void)
 {
     struct json *json = json_create(JSON_ARRAY);
-    json->u.array.elems = NULL;
-    json->u.array.n = 0;
-    json->u.array.n_allocated = 0;
+    json->array.elems = NULL;
+    json->array.n = 0;
+    json->array.n_allocated = 0;
     return json;
 }
 
@@ -214,9 +215,9 @@ struct json *
 json_array_create(struct json **elements, size_t n)
 {
     struct json *json = json_create(JSON_ARRAY);
-    json->u.array.elems = elements;
-    json->u.array.n = n;
-    json->u.array.n_allocated = n;
+    json->array.elems = elements;
+    json->array.n = n;
+    json->array.n_allocated = n;
     return json;
 }
 
@@ -251,8 +252,8 @@ struct json *
 json_object_create(void)
 {
     struct json *json = json_create(JSON_OBJECT);
-    json->u.object = xmalloc(sizeof *json->u.object);
-    shash_init(json->u.object);
+    json->object = xmalloc(sizeof *json->object);
+    shash_init(json->object);
     return json;
 }
 
@@ -260,7 +261,7 @@ struct json *
 json_integer_create(long long int integer)
 {
     struct json *json = json_create(JSON_INTEGER);
-    json->u.integer = integer;
+    json->integer = integer;
     return json;
 }
 
@@ -268,14 +269,20 @@ struct json *
 json_real_create(double real)
 {
     struct json *json = json_create(JSON_REAL);
-    json->u.real = real;
+    json->real = real;
     return json;
 }
 
 void
 json_object_put(struct json *json, const char *name, struct json *value)
 {
-    json_destroy(shash_replace(json->u.object, name, value));
+    json_destroy(shash_replace(json->object, name, value));
+}
+
+void
+json_object_put_nocopy(struct json *json, char *name, struct json *value)
+{
+    json_destroy(shash_replace_nocopy(json->object, name, value));
 }
 
 void
@@ -284,25 +291,36 @@ json_object_put_string(struct json *json, const char *name, const char *value)
     json_object_put(json, name, json_string_create(value));
 }
 
+void OVS_PRINTF_FORMAT(3, 4)
+json_object_put_format(struct json *json,
+                       const char *name, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    json_object_put(json, name,
+                    json_string_create_nocopy(xvasprintf(format, args)));
+    va_end(args);
+}
+
 const char *
 json_string(const struct json *json)
 {
     ovs_assert(json->type == JSON_STRING);
-    return json->u.string;
+    return json->string;
 }
 
 struct json_array *
 json_array(const struct json *json)
 {
     ovs_assert(json->type == JSON_ARRAY);
-    return CONST_CAST(struct json_array *, &json->u.array);
+    return CONST_CAST(struct json_array *, &json->array);
 }
 
 struct shash *
 json_object(const struct json *json)
 {
     ovs_assert(json->type == JSON_OBJECT);
-    return CONST_CAST(struct shash *, json->u.object);
+    return CONST_CAST(struct shash *, json->object);
 }
 
 bool
@@ -316,14 +334,14 @@ double
 json_real(const struct json *json)
 {
     ovs_assert(json->type == JSON_REAL || json->type == JSON_INTEGER);
-    return json->type == JSON_REAL ? json->u.real : json->u.integer;
+    return json->type == JSON_REAL ? json->real : json->integer;
 }
 
 int64_t
 json_integer(const struct json *json)
 {
     ovs_assert(json->type == JSON_INTEGER);
-    return json->u.integer;
+    return json->integer;
 }
 
 static void json_destroy_object(struct shash *object);
@@ -333,18 +351,18 @@ static void json_destroy_array(struct json_array *array);
 void
 json_destroy(struct json *json)
 {
-    if (json) {
+    if (json && !--json->count) {
         switch (json->type) {
         case JSON_OBJECT:
-            json_destroy_object(json->u.object);
+            json_destroy_object(json->object);
             break;
 
         case JSON_ARRAY:
-            json_destroy_array(&json->u.array);
+            json_destroy_array(&json->array);
             break;
 
         case JSON_STRING:
-            free(json->u.string);
+            free(json->string);
             break;
 
         case JSON_NULL:
@@ -392,17 +410,17 @@ static struct json *json_clone_array(const struct json_array *array);
 
 /* Returns a deep copy of 'json'. */
 struct json *
-json_clone(const struct json *json)
+json_deep_clone(const struct json *json)
 {
     switch (json->type) {
     case JSON_OBJECT:
-        return json_clone_object(json->u.object);
+        return json_clone_object(json->object);
 
     case JSON_ARRAY:
-        return json_clone_array(&json->u.array);
+        return json_clone_array(&json->array);
 
     case JSON_STRING:
-        return json_string_create(json->u.string);
+        return json_string_create(json->string);
 
     case JSON_NULL:
     case JSON_FALSE:
@@ -410,15 +428,30 @@ json_clone(const struct json *json)
         return json_create(json->type);
 
     case JSON_INTEGER:
-        return json_integer_create(json->u.integer);
+        return json_integer_create(json->integer);
 
     case JSON_REAL:
-        return json_real_create(json->u.real);
+        return json_real_create(json->real);
 
     case JSON_N_TYPES:
     default:
         OVS_NOT_REACHED();
     }
+}
+
+/* Returns 'json', with the reference count incremented. */
+struct json *
+json_clone(const struct json *json_)
+{
+    struct json *json = CONST_CAST(struct json *, json_);
+    json->count++;
+    return json;
+}
+
+struct json *
+json_nullable_clone(const struct json *json)
+{
+    return json ? json_clone(json) : NULL;
 }
 
 static struct json *
@@ -482,13 +515,13 @@ json_hash(const struct json *json, size_t basis)
 {
     switch (json->type) {
     case JSON_OBJECT:
-        return json_hash_object(json->u.object, basis);
+        return json_hash_object(json->object, basis);
 
     case JSON_ARRAY:
-        return json_hash_array(&json->u.array, basis);
+        return json_hash_array(&json->array, basis);
 
     case JSON_STRING:
-        return hash_string(json->u.string, basis);
+        return hash_string(json->string, basis);
 
     case JSON_NULL:
     case JSON_FALSE:
@@ -496,10 +529,10 @@ json_hash(const struct json *json, size_t basis)
         return hash_int(json->type << 8, basis);
 
     case JSON_INTEGER:
-        return hash_int(json->u.integer, basis);
+        return hash_int(json->integer, basis);
 
     case JSON_REAL:
-        return hash_double(json->u.real, basis);
+        return hash_double(json->real, basis);
 
     case JSON_N_TYPES:
     default:
@@ -547,19 +580,23 @@ json_equal_array(const struct json_array *a, const struct json_array *b)
 bool
 json_equal(const struct json *a, const struct json *b)
 {
-    if (a->type != b->type) {
+    if (a == b) {
+        return true;
+    } else if (!a || !b) {
+        return false;
+    } else if (a->type != b->type) {
         return false;
     }
 
     switch (a->type) {
     case JSON_OBJECT:
-        return json_equal_object(a->u.object, b->u.object);
+        return json_equal_object(a->object, b->object);
 
     case JSON_ARRAY:
-        return json_equal_array(&a->u.array, &b->u.array);
+        return json_equal_array(&a->array, &b->array);
 
     case JSON_STRING:
-        return !strcmp(a->u.string, b->u.string);
+        return !strcmp(a->string, b->string);
 
     case JSON_NULL:
     case JSON_FALSE:
@@ -567,10 +604,10 @@ json_equal(const struct json *a, const struct json *b)
         return true;
 
     case JSON_INTEGER:
-        return a->u.integer == b->u.integer;
+        return a->integer == b->integer;
 
     case JSON_REAL:
-        return a->u.real == b->u.real;
+        return a->real == b->real;
 
     case JSON_N_TYPES:
     default:
@@ -681,16 +718,21 @@ json_lex_number(struct json_parser *p)
         exponent = 0;
         do {
             if (exponent >= INT_MAX / 10) {
-                json_error(p, "exponent outside valid range");
-                return;
+                goto bad_exponent;
             }
             exponent = exponent * 10 + (*cp - '0');
             cp++;
         } while (isdigit((unsigned char) *cp));
 
         if (negative_exponent) {
+            if (pow10 < INT_MIN + exponent) {
+                goto bad_exponent;
+            }
             pow10 -= exponent;
         } else {
+            if (pow10 > INT_MAX - exponent) {
+                goto bad_exponent;
+            }
             pow10 += exponent;
         }
     }
@@ -705,7 +747,7 @@ json_lex_number(struct json_parser *p)
      * We suppress negative zeros as a matter of policy. */
     if (!significand) {
         token.type = T_INTEGER;
-        token.u.integer = 0;
+        token.integer = 0;
         json_parser_input(p, &token);
         return;
     }
@@ -724,22 +766,26 @@ json_lex_number(struct json_parser *p)
                                ? (unsigned long long int) LLONG_MAX + 1
                                : LLONG_MAX)) {
             token.type = T_INTEGER;
-            token.u.integer = negative ? -significand : significand;
+            token.integer = negative ? -significand : significand;
             json_parser_input(p, &token);
             return;
         }
     }
 
     token.type = T_REAL;
-    if (!str_to_double(ds_cstr(&p->buffer), &token.u.real)) {
+    if (!str_to_double(ds_cstr(&p->buffer), &token.real)) {
         json_error(p, "number outside valid range");
         return;
     }
     /* Suppress negative zero. */
-    if (token.u.real == 0) {
-        token.u.real = 0;
+    if (token.real == 0) {
+        token.real = 0;
     }
     json_parser_input(p, &token);
+    return;
+
+bad_exponent:
+    json_error(p, "exponent outside valid range");
 }
 
 static const char *
@@ -885,7 +931,7 @@ json_string_escape(const char *in, struct ds *out)
 {
     struct json json = {
         .type = JSON_STRING,
-        .u.string = CONST_CAST(char *, in),
+        .string = CONST_CAST(char *, in),
     };
     json_to_ds(&json, 0, out);
 }
@@ -896,7 +942,7 @@ json_parser_input_string(struct json_parser *p, const char *s)
     struct json_token token;
 
     token.type = T_STRING;
-    token.u.string = s;
+    token.string = s;
     json_parser_input(p, &token);
 }
 
@@ -1186,8 +1232,7 @@ json_parser_put_value(struct json_parser *p, struct json *value)
 {
     struct json_parser_node *node = json_parser_top(p);
     if (node->json->type == JSON_OBJECT) {
-        json_object_put(node->json, p->member_name, value);
-        free(p->member_name);
+        json_object_put_nocopy(node->json, p->member_name, value);
         p->member_name = NULL;
     } else if (node->json->type == JSON_ARRAY) {
         json_array_add(node->json, value);
@@ -1262,15 +1307,15 @@ json_parse_value(struct json_parser *p, struct json_token *token,
         return;
 
     case T_INTEGER:
-        value = json_integer_create(token->u.integer);
+        value = json_integer_create(token->integer);
         break;
 
     case T_REAL:
-        value = json_real_create(token->u.real);
+        value = json_real_create(token->real);
         break;
 
     case T_STRING:
-        value = json_string_create(token->u.string);
+        value = json_string_create(token->string);
         break;
 
     case T_EOF:
@@ -1343,7 +1388,7 @@ json_parser_input(struct json_parser *p, struct json_token *token)
         /* Fall through. */
     case JSON_PARSE_OBJECT_NAME:
         if (token->type == T_STRING) {
-            p->member_name = xstrdup(token->u.string);
+            p->member_name = xstrdup(token->string);
             p->parse_state = JSON_PARSE_OBJECT_COLON;
         } else {
             json_error(p, "syntax error parsing object expecting string");
@@ -1405,6 +1450,7 @@ json_create(enum json_type type)
 {
     struct json *json = xmalloc(sizeof *json);
     json->type = type;
+    json->count = 1;
     return json;
 }
 
@@ -1498,23 +1544,23 @@ json_serialize(const struct json *json, struct json_serializer *s)
         break;
 
     case JSON_OBJECT:
-        json_serialize_object(json->u.object, s);
+        json_serialize_object(json->object, s);
         break;
 
     case JSON_ARRAY:
-        json_serialize_array(&json->u.array, s);
+        json_serialize_array(&json->array, s);
         break;
 
     case JSON_INTEGER:
-        ds_put_format(ds, "%lld", json->u.integer);
+        ds_put_format(ds, "%lld", json->integer);
         break;
 
     case JSON_REAL:
-        ds_put_format(ds, "%.*g", DBL_DIG, json->u.real);
+        ds_put_format(ds, "%.*g", DBL_DIG, json->real);
         break;
 
     case JSON_STRING:
-        json_serialize_string(json->u.string, ds);
+        json_serialize_string(json->string, ds);
         break;
 
     case JSON_N_TYPES:
@@ -1610,49 +1656,53 @@ json_serialize_array(const struct json_array *array, struct json_serializer *s)
     ds_put_char(ds, ']');
 }
 
+static const char *chars_escaping[256] = {
+        "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005", "\\u0006", "\\u0007",
+        "\\b", "\\t", "\\n", "\\u000b", "\\f", "\\r", "\\u000e", "\\u000f",
+        "\\u0010", "\\u0011", "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017",
+        "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d", "\\u001e", "\\u001f",
+        " ", "!", "\\\"", "#", "$", "%", "&", "'",
+        "(", ")", "*", "+", ",", "-", ".", "/",
+        "0", "1", "2", "3", "4", "5", "6", "7",
+        "8", "9", ":", ";", "<", "=", ">", "?",
+        "@", "A", "B", "C", "D", "E", "F", "G",
+        "H", "I", "J", "K", "L", "M", "N", "O",
+        "P", "Q", "R", "S", "T", "U", "V", "W",
+        "X", "Y", "Z", "[", "\\\\", "]", "^", "_",
+        "`", "a", "b", "c", "d", "e", "f", "g",
+        "h", "i", "j", "k", "l", "m", "n", "o",
+        "p", "q", "r", "s", "t", "u", "v", "w",
+        "x", "y", "z", "{", "|", "}", "~", "\x7f",
+        "\x80", "\x81", "\x82", "\x83", "\x84", "\x85", "\x86", "\x87",
+        "\x88", "\x89", "\x8a", "\x8b", "\x8c", "\x8d", "\x8e", "\x8f",
+        "\x90", "\x91", "\x92", "\x93", "\x94", "\x95", "\x96", "\x97",
+        "\x98", "\x99", "\x9a", "\x9b", "\x9c", "\x9d", "\x9e", "\x9f",
+        "\xa0", "\xa1", "\xa2", "\xa3", "\xa4", "\xa5", "\xa6", "\xa7",
+        "\xa8", "\xa9", "\xaa", "\xab", "\xac", "\xad", "\xae", "\xaf",
+        "\xb0", "\xb1", "\xb2", "\xb3", "\xb4", "\xb5", "\xb6", "\xb7",
+        "\xb8", "\xb9", "\xba", "\xbb", "\xbc", "\xbd", "\xbe", "\xbf",
+        "\xc0", "\xc1", "\xc2", "\xc3", "\xc4", "\xc5", "\xc6", "\xc7",
+        "\xc8", "\xc9", "\xca", "\xcb", "\xcc", "\xcd", "\xce", "\xcf",
+        "\xd0", "\xd1", "\xd2", "\xd3", "\xd4", "\xd5", "\xd6", "\xd7",
+        "\xd8", "\xd9", "\xda", "\xdb", "\xdc", "\xdd", "\xde", "\xdf",
+        "\xe0", "\xe1", "\xe2", "\xe3", "\xe4", "\xe5", "\xe6", "\xe7",
+        "\xe8", "\xe9", "\xea", "\xeb", "\xec", "\xed", "\xee", "\xef",
+        "\xf0", "\xf1", "\xf2", "\xf3", "\xf4", "\xf5", "\xf6", "\xf7",
+        "\xf8", "\xf9", "\xfa", "\xfb", "\xfc", "\xfd", "\xfe", "\xff"
+};
+
 static void
 json_serialize_string(const char *string, struct ds *ds)
 {
     uint8_t c;
+    uint8_t c2;
+    const char *escape;
 
     ds_put_char(ds, '"');
     while ((c = *string++) != '\0') {
-        switch (c) {
-        case '"':
-            ds_put_cstr(ds, "\\\"");
-            break;
-
-        case '\\':
-            ds_put_cstr(ds, "\\\\");
-            break;
-
-        case '\b':
-            ds_put_cstr(ds, "\\b");
-            break;
-
-        case '\f':
-            ds_put_cstr(ds, "\\f");
-            break;
-
-        case '\n':
-            ds_put_cstr(ds, "\\n");
-            break;
-
-        case '\r':
-            ds_put_cstr(ds, "\\r");
-            break;
-
-        case '\t':
-            ds_put_cstr(ds, "\\t");
-            break;
-
-        default:
-            if (c >= 32) {
-                ds_put_char(ds, c);
-            } else {
-                ds_put_format(ds, "\\u%04x", c);
-            }
-            break;
+        escape = chars_escaping[c];
+        while ((c2 = *escape++) != '\0') {
+            ds_put_char(ds, c2);
         }
     }
     ds_put_char(ds, '"');

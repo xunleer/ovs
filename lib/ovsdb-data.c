@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2010, 2011, 2012, 2014 Nicira, Inc.
+/* Copyright (c) 2009, 2010, 2011, 2012, 2014, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +22,17 @@
 #include <inttypes.h>
 #include <limits.h>
 
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "hash.h"
 #include "ovs-thread.h"
 #include "ovsdb-error.h"
 #include "ovsdb-parser.h"
-#include "json.h"
-#include "shash.h"
+#include "openvswitch/json.h"
+#include "openvswitch/shash.h"
 #include "smap.h"
 #include "sort.h"
 #include "unicode.h"
+#include "util.h"
 
 static struct json *
 wrap_json(const char *name, struct json *wrapped)
@@ -261,16 +262,16 @@ unwrap_json(const struct json *json, const char *name,
             enum json_type value_type, const struct json **value)
 {
     if (json->type != JSON_ARRAY
-        || json->u.array.n != 2
-        || json->u.array.elems[0]->type != JSON_STRING
-        || (name && strcmp(json->u.array.elems[0]->u.string, name))
-        || json->u.array.elems[1]->type != value_type)
+        || json->array.n != 2
+        || json->array.elems[0]->type != JSON_STRING
+        || (name && strcmp(json->array.elems[0]->string, name))
+        || json->array.elems[1]->type != value_type)
     {
         *value = NULL;
         return ovsdb_syntax_error(json, NULL, "expected [\"%s\", <%s>]", name,
                                   json_type_to_string(value_type));
     }
-    *value = json->u.array.elems[1];
+    *value = json->array.elems[1];
     return NULL;
 }
 
@@ -278,11 +279,11 @@ static struct ovsdb_error *
 parse_json_pair(const struct json *json,
                 const struct json **elem0, const struct json **elem1)
 {
-    if (json->type != JSON_ARRAY || json->u.array.n != 2) {
+    if (json->type != JSON_ARRAY || json->array.n != 2) {
         return ovsdb_syntax_error(json, NULL, "expected 2-element array");
     }
-    *elem0 = json->u.array.elems[0];
-    *elem1 = json->u.array.elems[1];
+    *elem0 = json->array.elems[0];
+    *elem1 = json->array.elems[1];
     return NULL;
 }
 
@@ -292,8 +293,8 @@ ovsdb_symbol_referenced(struct ovsdb_symbol *symbol,
 {
     ovs_assert(base->type == OVSDB_TYPE_UUID);
 
-    if (base->u.uuid.refTableName) {
-        switch (base->u.uuid.refType) {
+    if (base->uuid.refTableName) {
+        switch (base->uuid.refType) {
         case OVSDB_REF_STRONG:
             symbol->strong_ref = true;
             break;
@@ -301,6 +302,25 @@ ovsdb_symbol_referenced(struct ovsdb_symbol *symbol,
             symbol->weak_ref = true;
             break;
         }
+    }
+}
+
+static union ovsdb_atom *
+alloc_default_atoms(enum ovsdb_atomic_type type, size_t n)
+{
+    if (type != OVSDB_TYPE_VOID && n) {
+        union ovsdb_atom *atoms;
+        unsigned int i;
+
+        atoms = xmalloc(n * sizeof *atoms);
+        for (i = 0; i < n; i++) {
+            ovsdb_atom_init_default(&atoms[i], type);
+        }
+        return atoms;
+    } else {
+        /* Avoid wasting memory in the n == 0 case, because xmalloc(0) is
+         * treated as xmalloc(1). */
+        return NULL;
     }
 }
 
@@ -357,17 +377,17 @@ ovsdb_atom_from_json__(union ovsdb_atom *atom,
 
     case OVSDB_TYPE_INTEGER:
         if (json->type == JSON_INTEGER) {
-            atom->integer = json->u.integer;
+            atom->integer = json->integer;
             return NULL;
         }
         break;
 
     case OVSDB_TYPE_REAL:
         if (json->type == JSON_INTEGER) {
-            atom->real = json->u.integer;
+            atom->real = json->integer;
             return NULL;
         } else if (json->type == JSON_REAL) {
-            atom->real = json->u.real;
+            atom->real = json->real;
             return NULL;
         }
         break;
@@ -384,7 +404,7 @@ ovsdb_atom_from_json__(union ovsdb_atom *atom,
 
     case OVSDB_TYPE_STRING:
         if (json->type == JSON_STRING) {
-            atom->string = xstrdup(json->u.string);
+            atom->string = xstrdup(json->string);
             return NULL;
         }
         break;
@@ -467,6 +487,7 @@ ovsdb_atom_to_json(const union ovsdb_atom *atom, enum ovsdb_atomic_type type)
 
 static char *
 ovsdb_atom_from_string__(union ovsdb_atom *atom,
+                         union ovsdb_atom **range_end_atom,
                          const struct ovsdb_base_type *base, const char *s,
                          struct ovsdb_symbol_table *symtab)
 {
@@ -477,9 +498,20 @@ ovsdb_atom_from_string__(union ovsdb_atom *atom,
         OVS_NOT_REACHED();
 
     case OVSDB_TYPE_INTEGER: {
-        long long int integer;
-        if (!str_to_llong(s, 10, &integer)) {
-            return xasprintf("\"%s\" is not a valid integer", s);
+        long long int integer, end;
+        if (range_end_atom
+            && str_to_llong_range(s, 10, &integer, &end)) {
+            if (end < integer) {
+                return xasprintf("\"%s\" is not a valid range. "
+                    "Range end cannot be before start.", s);
+            }
+            *range_end_atom = alloc_default_atoms(type, 1);
+            if (!(*range_end_atom)) {
+                return xasprintf("\"%s\" is not a valid range", s);
+            }
+            (*range_end_atom)->integer = end;
+        } else if (!str_to_llong(s, 10, &integer)) {
+            return xasprintf("\"%s\" is not a valid integer or range", s);
         }
         atom->integer = integer;
     }
@@ -548,10 +580,13 @@ ovsdb_atom_from_string__(union ovsdb_atom *atom,
     return NULL;
 }
 
-/* Initializes 'atom' to a value of type 'base' parsed from 's', which takes
- * one of the following forms:
+/* Initializes 'atom' and optionally 'range_end_atom' to a value of type 'base'
+ * parsed from 's', which takes one of the following forms:
  *
- *      - OVSDB_TYPE_INTEGER: A decimal integer optionally preceded by a sign.
+ *      - OVSDB_TYPE_INTEGER: A decimal integer optionally preceded by a sign
+ *        or two decimal integers optionally preceded by a sign and separated
+ *        by a hyphen, representing inclusive range of integers
+ *        ['atom', 'range_end_atom'].
  *
  *      - OVSDB_TYPE_REAL: A floating-point number in the format accepted by
  *        strtod().
@@ -573,25 +608,63 @@ ovsdb_atom_from_string__(union ovsdb_atom *atom,
  * Returns a null pointer if successful, otherwise an error message describing
  * the problem.  On failure, the contents of 'atom' are indeterminate.  The
  * caller is responsible for freeing the atom or the error.
+ *
+ * Does not attempt to parse range if 'range_end_atom' is a null pointer.
+ * Dynamically allocates ovdsb_atom and stores its address in '*range_end_atom'
+ * if successfully parses range. Caller is responsible for deallocating
+ * the memory by calling 'ovsdb_atom_destroy' and then 'free' on the address.
+ * Does not allocate memory and sets '*range_end_atom' to a null pointer
+ * if does not parse a range or fails for any reason.
  */
 char *
 ovsdb_atom_from_string(union ovsdb_atom *atom,
+                       union ovsdb_atom **range_end_atom,
                        const struct ovsdb_base_type *base, const char *s,
                        struct ovsdb_symbol_table *symtab)
 {
     struct ovsdb_error *error;
     char *msg;
 
-    msg = ovsdb_atom_from_string__(atom, base, s, symtab);
+    if (range_end_atom) {
+        *range_end_atom = NULL;
+    }
+
+    msg = ovsdb_atom_from_string__(atom, range_end_atom, base, s, symtab);
     if (msg) {
         return msg;
     }
 
     error = ovsdb_atom_check_constraints(atom, base);
+
+    if (!error && range_end_atom && *range_end_atom) {
+        /* Check range constraints */
+        int64_t start = atom->integer;
+        int64_t end = (*range_end_atom)->integer;
+        if (base->enum_) {
+            for (int64_t i = start + 1; i <= end; i++) {
+                union ovsdb_atom ai = { .integer = i };
+                error = ovsdb_atom_check_constraints(&ai, base);
+                if (error) {
+                    break;
+                }
+            }
+        } else {
+            error = ovsdb_atom_check_constraints(*range_end_atom, base);
+        }
+
+        if (!error) {
+            error = ovsdb_atom_range_check_size(start, end);
+        }
+    }
+
     if (error) {
         ovsdb_atom_destroy(atom, base->type);
-        msg = ovsdb_error_to_string(error);
-        ovsdb_error_destroy(error);
+        if (range_end_atom && *range_end_atom) {
+            ovsdb_atom_destroy(*range_end_atom, base->type);
+            free(*range_end_atom);
+            *range_end_atom = NULL;
+        }
+        msg = ovsdb_error_to_string_free(error);
     }
     return msg;
 }
@@ -601,6 +674,7 @@ string_needs_quotes(const char *s)
 {
     const char *p = s;
     unsigned char c;
+    struct uuid uuid;
 
     c = *p++;
     if (!isalpha(c) && c != '_') {
@@ -608,12 +682,16 @@ string_needs_quotes(const char *s)
     }
 
     while ((c = *p++) != '\0') {
-        if (!isalpha(c) && c != '_' && c != '-' && c != '.') {
+        if (!isalpha(c) && !isdigit(c) && c != '_' && c != '-' && c != '.') {
             return true;
         }
     }
 
     if (!strcmp(s, "true") || !strcmp(s, "false")) {
+        return true;
+    }
+
+    if (uuid_from_string(&uuid, s)) {
         return true;
     }
 
@@ -647,7 +725,7 @@ ovsdb_atom_to_string(const union ovsdb_atom *atom, enum ovsdb_atomic_type type,
             struct json json;
 
             json.type = JSON_STRING;
-            json.u.string = atom->string;
+            json.string = atom->string;
             json_to_ds(&json, 0, out);
         } else {
             ds_put_cstr(out, atom->string);
@@ -744,54 +822,54 @@ ovsdb_atom_check_constraints(const union ovsdb_atom *atom,
         OVS_NOT_REACHED();
 
     case OVSDB_TYPE_INTEGER:
-        if (atom->integer >= base->u.integer.min
-            && atom->integer <= base->u.integer.max) {
+        if (atom->integer >= base->integer.min
+            && atom->integer <= base->integer.max) {
             return NULL;
-        } else if (base->u.integer.min != INT64_MIN) {
-            if (base->u.integer.max != INT64_MAX) {
+        } else if (base->integer.min != INT64_MIN) {
+            if (base->integer.max != INT64_MAX) {
                 return ovsdb_error("constraint violation",
                                    "%"PRId64" is not in the valid range "
                                    "%"PRId64" to %"PRId64" (inclusive)",
                                    atom->integer,
-                                   base->u.integer.min, base->u.integer.max);
+                                   base->integer.min, base->integer.max);
             } else {
                 return ovsdb_error("constraint violation",
                                    "%"PRId64" is less than minimum allowed "
                                    "value %"PRId64,
-                                   atom->integer, base->u.integer.min);
+                                   atom->integer, base->integer.min);
             }
         } else {
             return ovsdb_error("constraint violation",
                                "%"PRId64" is greater than maximum allowed "
                                "value %"PRId64,
-                               atom->integer, base->u.integer.max);
+                               atom->integer, base->integer.max);
         }
         OVS_NOT_REACHED();
 
     case OVSDB_TYPE_REAL:
-        if (atom->real >= base->u.real.min && atom->real <= base->u.real.max) {
+        if (atom->real >= base->real.min && atom->real <= base->real.max) {
             return NULL;
-        } else if (base->u.real.min != -DBL_MAX) {
-            if (base->u.real.max != DBL_MAX) {
+        } else if (base->real.min != -DBL_MAX) {
+            if (base->real.max != DBL_MAX) {
                 return ovsdb_error("constraint violation",
                                    "%.*g is not in the valid range "
                                    "%.*g to %.*g (inclusive)",
                                    DBL_DIG, atom->real,
-                                   DBL_DIG, base->u.real.min,
-                                   DBL_DIG, base->u.real.max);
+                                   DBL_DIG, base->real.min,
+                                   DBL_DIG, base->real.max);
             } else {
                 return ovsdb_error("constraint violation",
                                    "%.*g is less than minimum allowed "
                                    "value %.*g",
                                    DBL_DIG, atom->real,
-                                   DBL_DIG, base->u.real.min);
+                                   DBL_DIG, base->real.min);
             }
         } else {
             return ovsdb_error("constraint violation",
                                "%.*g is greater than maximum allowed "
                                "value %.*g",
                                DBL_DIG, atom->real,
-                               DBL_DIG, base->u.real.max);
+                               DBL_DIG, base->real.max);
         }
         OVS_NOT_REACHED();
 
@@ -799,7 +877,7 @@ ovsdb_atom_check_constraints(const union ovsdb_atom *atom,
         return NULL;
 
     case OVSDB_TYPE_STRING:
-        return check_string_constraints(atom->string, &base->u.string);
+        return check_string_constraints(atom->string, &base->string);
 
     case OVSDB_TYPE_UUID:
         return NULL;
@@ -810,25 +888,6 @@ ovsdb_atom_check_constraints(const union ovsdb_atom *atom,
     }
 }
 
-static union ovsdb_atom *
-alloc_default_atoms(enum ovsdb_atomic_type type, size_t n)
-{
-    if (type != OVSDB_TYPE_VOID && n) {
-        union ovsdb_atom *atoms;
-        unsigned int i;
-
-        atoms = xmalloc(n * sizeof *atoms);
-        for (i = 0; i < n; i++) {
-            ovsdb_atom_init_default(&atoms[i], type);
-        }
-        return atoms;
-    } else {
-        /* Avoid wasting memory in the n == 0 case, because xmalloc(0) is
-         * treated as xmalloc(1). */
-        return NULL;
-    }
-}
-
 /* Initializes 'datum' as an empty datum.  (An empty datum can be treated as
  * any type.) */
 void
@@ -958,6 +1017,10 @@ static void
 free_data(enum ovsdb_atomic_type type,
           union ovsdb_atom *atoms, size_t n_atoms)
 {
+    if (!atoms) {
+        return;
+    }
+
     if (ovsdb_atom_needs_destruction(type)) {
         unsigned int i;
         for (i = 0; i < n_atoms; i++) {
@@ -1164,9 +1227,9 @@ ovsdb_datum_from_json__(struct ovsdb_datum *datum,
 
     if (ovsdb_type_is_map(type)
         || (json->type == JSON_ARRAY
-            && json->u.array.n > 0
-            && json->u.array.elems[0]->type == JSON_STRING
-            && !strcmp(json->u.array.elems[0]->u.string, "set"))) {
+            && json->array.n > 0
+            && json->array.elems[0]->type == JSON_STRING
+            && !strcmp(json->array.elems[0]->string, "set"))) {
         bool is_map = ovsdb_type_is_map(type);
         const char *class = is_map ? "map" : "set";
         const struct json *inner;
@@ -1178,18 +1241,25 @@ ovsdb_datum_from_json__(struct ovsdb_datum *datum,
             return error;
         }
 
-        n = inner->u.array.n;
+        n = inner->array.n;
         if (n < type->n_min || n > type->n_max) {
-            return ovsdb_syntax_error(json, NULL, "%s must have %u to "
-                                      "%u members but %"PRIuSIZE" are present",
-                                      class, type->n_min, type->n_max, n);
+            if (type->n_min == 1 && type->n_max == 1) {
+                return ovsdb_syntax_error(json, NULL, "%s must have exactly "
+                                          "one member but %"PRIuSIZE" "
+                                          "are present", class, n);
+            } else {
+                return ovsdb_syntax_error(json, NULL, "%s must have %u to "
+                                          "%u members but %"PRIuSIZE" are "
+                                          "present",
+                                          class, type->n_min, type->n_max, n);
+            }
         }
 
         datum->n = 0;
         datum->keys = xmalloc(n * sizeof *datum->keys);
         datum->values = is_map ? xmalloc(n * sizeof *datum->values) : NULL;
         for (i = 0; i < n; i++) {
-            const struct json *element = inner->u.array.elems[i];
+            const struct json *element = inner->array.elems[i];
             const struct json *key = NULL;
             const struct json *value = NULL;
 
@@ -1248,7 +1318,7 @@ ovsdb_datum_from_json__(struct ovsdb_datum *datum,
  * If 'symtab' is nonnull, then named UUIDs in 'symtab' are accepted.  Refer to
  * RFC 7047 for information about this, and for the syntax that this function
  * accepts. */
-struct ovsdb_error *
+struct ovsdb_error * OVS_WARN_UNUSED_RESULT
 ovsdb_datum_from_json(struct ovsdb_datum *datum,
                       const struct ovsdb_type *type,
                       const struct json *json,
@@ -1268,6 +1338,93 @@ ovsdb_datum_from_json(struct ovsdb_datum *datum,
     return error;
 }
 
+/* Parses 'json' as a datum of the type described by 'type' for internal
+ * use. This function is similar to 'ovsdb_datum_from_json', except the
+ * member size of set or map is not checked.
+ *
+ * The datum generated should be used then discard. It is not suitable
+ * for storing into IDL because of the possible member size violation.  */
+struct ovsdb_error * OVS_WARN_UNUSED_RESULT
+ovsdb_transient_datum_from_json(struct ovsdb_datum *datum,
+                                const struct ovsdb_type *type,
+                                const struct json *json)
+{
+    struct ovsdb_type relaxed_type = *type;
+
+    relaxed_type.n_min = 0;
+    relaxed_type.n_max = UINT_MAX;
+
+    return ovsdb_datum_from_json(datum, &relaxed_type, json, NULL);
+}
+
+/* Parses 'json' as a datum of the type described by 'type', but ignoring all
+ * constraints. */
+struct ovsdb_error * OVS_WARN_UNUSED_RESULT
+ovsdb_unconstrained_datum_from_json(struct ovsdb_datum *datum,
+                                    const struct ovsdb_type *type,
+                                    const struct json *json)
+{
+    struct ovsdb_type relaxed_type;
+
+    ovsdb_base_type_init(&relaxed_type.key, type->key.type);
+    ovsdb_base_type_init(&relaxed_type.value, type->value.type);
+    relaxed_type.n_min = 0;
+    relaxed_type.n_max = UINT_MAX;
+
+    return ovsdb_datum_from_json(datum, &relaxed_type, json, NULL);
+}
+
+static struct json *
+ovsdb_base_to_json(const union ovsdb_atom *atom,
+                   const struct ovsdb_base_type *base,
+                   bool use_row_names)
+{
+    if (!use_row_names
+        || base->type != OVSDB_TYPE_UUID
+        || !base->uuid.refTableName) {
+        return ovsdb_atom_to_json(atom, base->type);
+    } else {
+        return json_array_create_2(
+            json_string_create("named-uuid"),
+            json_string_create_nocopy(ovsdb_data_row_name(&atom->uuid)));
+    }
+}
+
+static struct json *
+ovsdb_datum_to_json__(const struct ovsdb_datum *datum,
+                      const struct ovsdb_type *type,
+                      bool use_row_names)
+{
+    if (ovsdb_type_is_map(type)) {
+        struct json **elems;
+        size_t i;
+
+        elems = xmalloc(datum->n * sizeof *elems);
+        for (i = 0; i < datum->n; i++) {
+            elems[i] = json_array_create_2(
+                ovsdb_base_to_json(&datum->keys[i], &type->key,
+                                   use_row_names),
+                ovsdb_base_to_json(&datum->values[i], &type->value,
+                                   use_row_names));
+        }
+
+        return wrap_json("map", json_array_create(elems, datum->n));
+    } else if (datum->n == 1) {
+        return ovsdb_base_to_json(&datum->keys[0], &type->key, use_row_names);
+    } else {
+        struct json **elems;
+        size_t i;
+
+        elems = xmalloc(datum->n * sizeof *elems);
+        for (i = 0; i < datum->n; i++) {
+            elems[i] = ovsdb_base_to_json(&datum->keys[i], &type->key,
+                                          use_row_names);
+        }
+
+        return wrap_json("set", json_array_create(elems, datum->n));
+    }
+}
+
 /* Converts 'datum', of the specified 'type', to JSON format, and returns the
  * JSON.  The caller is responsible for freeing the returned JSON.
  *
@@ -1278,31 +1435,14 @@ struct json *
 ovsdb_datum_to_json(const struct ovsdb_datum *datum,
                     const struct ovsdb_type *type)
 {
-    if (ovsdb_type_is_map(type)) {
-        struct json **elems;
-        size_t i;
+    return ovsdb_datum_to_json__(datum, type, false);
+}
 
-        elems = xmalloc(datum->n * sizeof *elems);
-        for (i = 0; i < datum->n; i++) {
-            elems[i] = json_array_create_2(
-                ovsdb_atom_to_json(&datum->keys[i], type->key.type),
-                ovsdb_atom_to_json(&datum->values[i], type->value.type));
-        }
-
-        return wrap_json("map", json_array_create(elems, datum->n));
-    } else if (datum->n == 1) {
-        return ovsdb_atom_to_json(&datum->keys[0], type->key.type);
-    } else {
-        struct json **elems;
-        size_t i;
-
-        elems = xmalloc(datum->n * sizeof *elems);
-        for (i = 0; i < datum->n; i++) {
-            elems[i] = ovsdb_atom_to_json(&datum->keys[i], type->key.type);
-        }
-
-        return wrap_json("set", json_array_create(elems, datum->n));
-    }
+struct json *
+ovsdb_datum_to_json_with_row_names(const struct ovsdb_datum *datum,
+                                   const struct ovsdb_type *type)
+{
+    return ovsdb_datum_to_json__(datum, type, true);
 }
 
 static const char *
@@ -1316,13 +1456,15 @@ skip_spaces(const char *p)
 
 static char *
 parse_atom_token(const char **s, const struct ovsdb_base_type *base,
-                 union ovsdb_atom *atom, struct ovsdb_symbol_table *symtab)
+                 union ovsdb_atom *atom, union ovsdb_atom **range_end_atom,
+                 struct ovsdb_symbol_table *symtab)
 {
     char *token, *error;
 
     error = ovsdb_token_parse(s, &token);
     if (!error) {
-        error = ovsdb_atom_from_string(atom, base, token, symtab);
+        error = ovsdb_atom_from_string(atom, range_end_atom,
+                                       base, token, symtab);
         free(token);
     }
     return error;
@@ -1331,36 +1473,49 @@ parse_atom_token(const char **s, const struct ovsdb_base_type *base,
 static char *
 parse_key_value(const char **s, const struct ovsdb_type *type,
                 union ovsdb_atom *key, union ovsdb_atom *value,
-                struct ovsdb_symbol_table *symtab)
+                struct ovsdb_symbol_table *symtab,
+                union ovsdb_atom **range_end_key)
 {
     const char *start = *s;
     char *error;
 
-    error = parse_atom_token(s, &type->key, key, symtab);
+    error = parse_atom_token(s, &type->key, key, range_end_key, symtab);
+
     if (!error && type->value.type != OVSDB_TYPE_VOID) {
         *s = skip_spaces(*s);
         if (**s == '=') {
             (*s)++;
             *s = skip_spaces(*s);
-            error = parse_atom_token(s, &type->value, value, symtab);
+            error = parse_atom_token(s, &type->value, value, NULL, symtab);
         } else {
             error = xasprintf("%s: syntax error at \"%c\" expecting \"=\"",
                               start, **s);
         }
         if (error) {
             ovsdb_atom_destroy(key, type->key.type);
+            if (range_end_key && *range_end_key) {
+                ovsdb_atom_destroy(*range_end_key, type->key.type);
+                free(*range_end_key);
+                *range_end_key = NULL;
+            }
         }
     }
     return error;
 }
 
 static void
-free_key_value(const struct ovsdb_type *type,
-               union ovsdb_atom *key, union ovsdb_atom *value)
+free_key_value_range(const struct ovsdb_type *type,
+                     union ovsdb_atom *key, union ovsdb_atom *value,
+                     union ovsdb_atom **range_end_atom)
 {
     ovsdb_atom_destroy(key, type->key.type);
     if (type->value.type != OVSDB_TYPE_VOID) {
         ovsdb_atom_destroy(value, type->value.type);
+    }
+    if (range_end_atom && *range_end_atom) {
+        ovsdb_atom_destroy(*range_end_atom, type->key.type);
+        free(*range_end_atom);
+        *range_end_atom = NULL;
     }
 }
 
@@ -1403,6 +1558,7 @@ ovsdb_datum_from_string(struct ovsdb_datum *datum,
 
     while (*p && *p != end_delim) {
         union ovsdb_atom key, value;
+        union ovsdb_atom *range_end_key = NULL;
 
         if (ovsdb_token_is_delim(*p)) {
             char *type_str = ovsdb_type_to_english(type);
@@ -1413,12 +1569,13 @@ ovsdb_datum_from_string(struct ovsdb_datum *datum,
         }
 
         /* Add to datum. */
-        error = parse_key_value(&p, type, &key, &value, symtab);
+        error = parse_key_value(&p, type, &key, &value,
+                                symtab, &range_end_key);
         if (error) {
             goto error;
         }
-        ovsdb_datum_add_unsafe(datum, &key, &value, type);
-        free_key_value(type, &key, &value);
+        ovsdb_datum_add_unsafe(datum, &key, &value, type, range_end_key);
+        free_key_value_range(type, &key, &value, &range_end_key);
 
         /* Skip optional white space and comma. */
         p = skip_spaces(p);
@@ -1522,28 +1679,38 @@ ovsdb_datum_to_bare(const struct ovsdb_datum *datum,
     }
 }
 
-/* Initializes 'datum' as a string-to-string map whose contents are taken from
- * 'smap'.  Destroys 'smap'. */
+/* Initializes 'datum' as a string-to-string map whose contents are copied from
+ * 'smap', which is not modified. */
 void
-ovsdb_datum_from_smap(struct ovsdb_datum *datum, struct smap *smap)
+ovsdb_datum_from_smap(struct ovsdb_datum *datum, const struct smap *smap)
 {
-    struct smap_node *node, *next;
-    size_t i;
-
     datum->n = smap_count(smap);
     datum->keys = xmalloc(datum->n * sizeof *datum->keys);
     datum->values = xmalloc(datum->n * sizeof *datum->values);
 
-    i = 0;
-    SMAP_FOR_EACH_SAFE (node, next, smap) {
-        smap_steal(smap, node,
-                   &datum->keys[i].string, &datum->values[i].string);
+    struct smap_node *node;
+    size_t i = 0;
+    SMAP_FOR_EACH (node, smap) {
+        datum->keys[i].string = xstrdup(node->key);
+        datum->values[i].string = xstrdup(node->value);
         i++;
     }
     ovs_assert(i == datum->n);
 
-    smap_destroy(smap);
     ovsdb_datum_sort_unique(datum, OVSDB_TYPE_STRING, OVSDB_TYPE_STRING);
+}
+
+struct ovsdb_error * OVS_WARN_UNUSED_RESULT
+ovsdb_datum_convert(struct ovsdb_datum *dst,
+                    const struct ovsdb_type *dst_type,
+                    const struct ovsdb_datum *src,
+                    const struct ovsdb_type *src_type)
+{
+    struct json *json = ovsdb_datum_to_json(src, src_type);
+    struct ovsdb_error *error = ovsdb_datum_from_json(dst, dst_type, json,
+                                                      NULL);
+    json_destroy(json);
+    return error;
 }
 
 static uint32_t
@@ -1743,10 +1910,15 @@ ovsdb_datum_remove_unsafe(struct ovsdb_datum *datum, size_t idx,
 }
 
 /* Adds the element with the given 'key' and 'value' to 'datum', which must
- * have the specified 'type'.
+ * have the specified 'type'. Optionally if 'range_end_atom' is not
+ * a null pointer, adds a set of integers to 'datum' from inclusive
+ * range ['key', 'range_end_atom'].
  *
  * This function always allocates memory, so it is not an efficient way to add
  * a number of elements to a datum.
+ *
+ * When adding a range of integers, this function allocates the memory once
+ * for the whole range.
  *
  * This function does not maintain ovsdb_datum invariants.  Use
  * ovsdb_datum_sort() to check and restore these invariants.  (But a datum with
@@ -1755,15 +1927,24 @@ void
 ovsdb_datum_add_unsafe(struct ovsdb_datum *datum,
                        const union ovsdb_atom *key,
                        const union ovsdb_atom *value,
-                       const struct ovsdb_type *type)
+                       const struct ovsdb_type *type,
+                       const union ovsdb_atom *range_end_atom)
 {
-    size_t idx = datum->n++;
+    size_t idx = datum->n;
+    datum->n += range_end_atom ?
+                (range_end_atom->integer - key->integer + 1) : 1;
     datum->keys = xrealloc(datum->keys, datum->n * sizeof *datum->keys);
-    ovsdb_atom_clone(&datum->keys[idx], key, type->key.type);
-    if (type->value.type != OVSDB_TYPE_VOID) {
-        datum->values = xrealloc(datum->values,
-                                 datum->n * sizeof *datum->values);
-        ovsdb_atom_clone(&datum->values[idx], value, type->value.type);
+    if (range_end_atom && key->integer <= range_end_atom->integer) {
+        for (int64_t i = key->integer; i <= range_end_atom->integer; i++) {
+            datum->keys[idx++].integer = i;
+        }
+    } else {
+        ovsdb_atom_clone(&datum->keys[idx], key, type->key.type);
+        if (type->value.type != OVSDB_TYPE_VOID) {
+            datum->values = xrealloc(datum->values,
+                                     datum->n * sizeof *datum->values);
+            ovsdb_atom_clone(&datum->values[idx], value, type->value.type);
+        }
     }
 }
 
@@ -1796,10 +1977,8 @@ ovsdb_datum_union(struct ovsdb_datum *a, const struct ovsdb_datum *b,
         }
     }
     if (n != a->n) {
-        struct ovsdb_error *error;
         a->n = n;
-        error = ovsdb_datum_sort(a, type->key.type);
-        ovs_assert(!error);
+        ovs_assert(!ovsdb_datum_sort(a, type->key.type));
     }
 }
 
@@ -1886,6 +2065,90 @@ ovsdb_symbol_table_insert(struct ovsdb_symbol_table *symtab,
     return symbol;
 }
 
+/* APIs for Generating and apply diffs.  */
+
+/* Generate a difference ovsdb_dataum between 'old' and 'new'.
+ * 'new' can be regenerated by applying the difference to the 'old'.
+ *
+ * The diff operation is reversible. Given 'old',
+ * 'new' can be recreated by applying diff to 'old'.
+ *
+ * Thus
+ *     Let  d = 'old' diff 'new'
+ *     then 'new' = 'old' diff d
+ *
+ * The 'diff' datum is always safe; the orders of keys are maintained
+ * since they are added in order.   */
+void
+ovsdb_datum_diff(struct ovsdb_datum *diff,
+                 const struct ovsdb_datum *old,
+                 const struct ovsdb_datum *new,
+                 const struct ovsdb_type *type)
+{
+    size_t oi, ni;
+
+    ovsdb_datum_init_empty(diff);
+    if (!ovsdb_type_is_composite(type)) {
+        ovsdb_datum_clone(diff, new, type);
+        return;
+    }
+
+    /* Generate the diff in O(n) time. */
+    for (oi = ni = 0; oi < old->n && ni < new->n; ) {
+        int c = ovsdb_atom_compare_3way(&old->keys[oi], &new->keys[ni],
+                                        type->key.type);
+        if (c < 0) {
+            ovsdb_datum_add_unsafe(diff, &old->keys[oi], &old->values[oi],
+                                   type, NULL);
+            oi++;
+        } else if (c > 0) {
+            ovsdb_datum_add_unsafe(diff, &new->keys[ni], &new->values[ni],
+                                   type, NULL);
+            ni++;
+        } else {
+            if (type->value.type != OVSDB_TYPE_VOID &&
+                ovsdb_atom_compare_3way(&old->values[oi], &new->values[ni],
+                                        type->value.type)) {
+                ovsdb_datum_add_unsafe(diff, &new->keys[ni], &new->values[ni],
+                                       type, NULL);
+            }
+            oi++; ni++;
+        }
+    }
+
+    for (; oi < old->n; oi++) {
+        ovsdb_datum_add_unsafe(diff, &old->keys[oi], &old->values[oi],
+                               type, NULL);
+    }
+
+    for (; ni < new->n; ni++) {
+        ovsdb_datum_add_unsafe(diff, &new->keys[ni], &new->values[ni],
+                               type, NULL);
+    }
+}
+
+/* Apply 'diff' to 'old' to regenerate 'new'.
+ *
+ * Return NULL if the 'new' is successfully generated, otherwise, return
+ * ovsdb_error and the stat of 'new' is indeterministic. */
+struct ovsdb_error *
+ovsdb_datum_apply_diff(struct ovsdb_datum *new,
+                       const struct ovsdb_datum *old,
+                       const struct ovsdb_datum *diff,
+                       const struct ovsdb_type *type)
+{
+    ovsdb_datum_diff(new, old, diff, type);
+
+    /* Make sure member size of 'new' conforms to type. */
+    if (new->n < type->n_min || new->n > type->n_max) {
+        ovsdb_datum_destroy(new, type);
+        return ovsdb_error(NULL, "Datum crated by diff has size error");
+    }
+
+    return NULL;
+}
+
+
 /* Extracts a token from the beginning of 's' and returns a pointer just after
  * the token.  Stores the token itself into '*outp', which the caller is
  * responsible for freeing (with free()).
@@ -1950,4 +2213,33 @@ bool
 ovsdb_token_is_delim(unsigned char c)
 {
     return strchr(":=, []{}!<>", c) != NULL;
+}
+
+struct ovsdb_error *
+ovsdb_atom_range_check_size(int64_t range_start, int64_t range_end)
+{
+    if ((uint64_t) range_end - (uint64_t) range_start
+        >= MAX_OVSDB_ATOM_RANGE_SIZE) {
+        return ovsdb_error("constraint violation",
+                           "Range \"%"PRId64"-%"PRId64"\" is too big. "
+                           "Maximum allowed size is %d.",
+                           range_start, range_end, MAX_OVSDB_ATOM_RANGE_SIZE);
+    }
+    return NULL;
+}
+
+char *
+ovsdb_data_row_name(const struct uuid *uuid)
+{
+    char *name;
+    char *p;
+
+    name = xasprintf("row"UUID_FMT, UUID_ARGS(uuid));
+    for (p = name; *p != '\0'; p++) {
+        if (*p == '-') {
+            *p = '_';
+        }
+    }
+
+    return name;
 }

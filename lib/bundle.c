@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+/* Copyright (c) 2011, 2012, 2013, 2014, 2015, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,32 +17,36 @@
 
 #include "bundle.h"
 
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <inttypes.h>
 
-#include "dynamic-string.h"
+#include "colors.h"
 #include "multipath.h"
-#include "meta-flow.h"
 #include "nx-match.h"
-#include "ofpbuf.h"
-#include "ofp-actions.h"
-#include "ofp-errors.h"
-#include "ofp-util.h"
 #include "openflow/nicira-ext.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/meta-flow.h"
+#include "openvswitch/ofp-actions.h"
+#include "openvswitch/ofp-errors.h"
+#include "openvswitch/ofp-port.h"
+#include "openvswitch/ofpbuf.h"
 #include "openvswitch/vlog.h"
+#include "util.h"
 
 VLOG_DEFINE_THIS_MODULE(bundle);
 
 static ofp_port_t
 execute_ab(const struct ofpact_bundle *bundle,
-           bool (*slave_enabled)(ofp_port_t ofp_port, void *aux), void *aux)
+           bool (*member_enabled)(ofp_port_t ofp_port, void *aux), void *aux)
 {
     size_t i;
 
-    for (i = 0; i < bundle->n_slaves; i++) {
-        ofp_port_t slave = bundle->slaves[i];
-        if (slave_enabled(slave, aux)) {
-            return slave;
+    for (i = 0; i < bundle->n_members; i++) {
+        ofp_port_t member = bundle->members[i];
+        if (member_enabled(member, aux)) {
+            return member;
         }
     }
 
@@ -52,12 +56,12 @@ execute_ab(const struct ofpact_bundle *bundle,
 static ofp_port_t
 execute_hrw(const struct ofpact_bundle *bundle,
             const struct flow *flow, struct flow_wildcards *wc,
-            bool (*slave_enabled)(ofp_port_t ofp_port, void *aux), void *aux)
+            bool (*member_enabled)(ofp_port_t ofp_port, void *aux), void *aux)
 {
     uint32_t flow_hash, best_hash;
     int best, i;
 
-    if (bundle->n_slaves > 1) {
+    if (bundle->n_members > 1) {
         flow_mask_hash_fields(flow, wc, bundle->fields);
     }
 
@@ -65,8 +69,8 @@ execute_hrw(const struct ofpact_bundle *bundle,
     best = -1;
     best_hash = 0;
 
-    for (i = 0; i < bundle->n_slaves; i++) {
-        if (slave_enabled(bundle->slaves[i], aux)) {
+    for (i = 0; i < bundle->n_members; i++) {
+        if (member_enabled(bundle->members[i], aux)) {
             uint32_t hash = hash_2words(i, flow_hash);
 
             if (best < 0 || hash > best_hash) {
@@ -76,25 +80,25 @@ execute_hrw(const struct ofpact_bundle *bundle,
         }
     }
 
-    return best >= 0 ? bundle->slaves[best] : OFPP_NONE;
+    return best >= 0 ? bundle->members[best] : OFPP_NONE;
 }
 
 /* Executes 'bundle' on 'flow'.  Sets fields in 'wc' that were used to
- * calculate the result.  Uses 'slave_enabled' to determine if the slave
- * designated by 'ofp_port' is up.  Returns the chosen slave, or
- * OFPP_NONE if none of the slaves are acceptable. */
+ * calculate the result.  Uses 'member_enabled' to determine if the member
+ * designated by 'ofp_port' is up.  Returns the chosen member, or
+ * OFPP_NONE if none of the members are acceptable. */
 ofp_port_t
 bundle_execute(const struct ofpact_bundle *bundle,
                const struct flow *flow, struct flow_wildcards *wc,
-               bool (*slave_enabled)(ofp_port_t ofp_port, void *aux),
+               bool (*member_enabled)(ofp_port_t ofp_port, void *aux),
                void *aux)
 {
     switch (bundle->algorithm) {
     case NX_BD_ALG_HRW:
-        return execute_hrw(bundle, flow, wc, slave_enabled, aux);
+        return execute_hrw(bundle, flow, wc, member_enabled, aux);
 
     case NX_BD_ALG_ACTIVE_BACKUP:
-        return execute_ab(bundle, slave_enabled, aux);
+        return execute_ab(bundle, member_enabled, aux);
 
     default:
         OVS_NOT_REACHED();
@@ -103,33 +107,33 @@ bundle_execute(const struct ofpact_bundle *bundle,
 
 enum ofperr
 bundle_check(const struct ofpact_bundle *bundle, ofp_port_t max_ports,
-             const struct flow *flow)
+             const struct match *match)
 {
     static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
     size_t i;
 
     if (bundle->dst.field) {
-        enum ofperr error = mf_check_dst(&bundle->dst, flow);
+        enum ofperr error = mf_check_dst(&bundle->dst, match);
         if (error) {
             return error;
         }
     }
 
-    for (i = 0; i < bundle->n_slaves; i++) {
-        ofp_port_t ofp_port = bundle->slaves[i];
+    for (i = 0; i < bundle->n_members; i++) {
+        ofp_port_t ofp_port = bundle->members[i];
 
         if (ofp_port != OFPP_NONE) {
             enum ofperr error = ofpact_check_output_port(ofp_port, max_ports);
             if (error) {
-                VLOG_WARN_RL(&rl, "invalid slave %"PRIu16, ofp_port);
+                VLOG_WARN_RL(&rl, "invalid member %"PRIu32, ofp_port);
                 return error;
             }
         }
-        /* Controller slaves are unsupported due to the lack of a max_len
+        /* Controller members are unsupported due to the lack of a max_len
          * argument. This may or may not change in the future.  There doesn't
          * seem to be a real-world use-case for supporting it. */
         if (ofp_port == OFPP_CONTROLLER) {
-            VLOG_WARN_RL(&rl, "unsupported controller slave");
+            VLOG_WARN_RL(&rl, "unsupported controller member");
             return OFPERR_OFPBAC_BAD_OUT_PORT;
         }
     }
@@ -143,43 +147,49 @@ bundle_check(const struct ofpact_bundle *bundle, ofp_port_t max_ports,
  * Returns NULL if successful, otherwise a malloc()'d string describing the
  * error.  The caller is responsible for freeing the returned string.*/
 static char * OVS_WARN_UNUSED_RESULT
-bundle_parse__(const char *s, char **save_ptr,
+bundle_parse__(const char *s, const struct ofputil_port_map *port_map,
+               char **save_ptr,
                const char *fields, const char *basis, const char *algorithm,
-               const char *slave_type, const char *dst,
-               const char *slave_delim, struct ofpbuf *ofpacts)
+               const char *member_type, const char *dst,
+               const char *member_delim, struct ofpbuf *ofpacts)
 {
     struct ofpact_bundle *bundle;
 
-    if (!slave_delim) {
+    if (!member_delim) {
         return xasprintf("%s: not enough arguments to bundle action", s);
     }
 
-    if (strcasecmp(slave_delim, "slaves")) {
-        return xasprintf("%s: missing slave delimiter, expected `slaves' "
-                         "got `%s'", s, slave_delim);
+    if (strcasecmp(member_delim, "members")
+        && strcasecmp(member_delim, "slaves")) {
+        return xasprintf("%s: missing member delimiter, expected `members', "
+                         "got `%s'", s, member_delim);
     }
 
     bundle = ofpact_put_BUNDLE(ofpacts);
 
     for (;;) {
-        ofp_port_t slave_port;
-        char *slave;
+        ofp_port_t member_port;
+        char *member;
 
-        slave = strtok_r(NULL, ", []", save_ptr);
-        if (!slave || bundle->n_slaves >= BUNDLE_MAX_SLAVES) {
+        member = strtok_r(NULL, ", []", save_ptr);
+        if (!member || bundle->n_members >= BUNDLE_MAX_MEMBERS) {
             break;
         }
 
-        if (!ofputil_port_from_string(slave, &slave_port)) {
-            return xasprintf("%s: bad port number", slave);
+        if (!ofputil_port_from_string(member, port_map, &member_port)) {
+            return xasprintf("%s: bad port number", member);
         }
-        ofpbuf_put(ofpacts, &slave_port, sizeof slave_port);
+        ofpbuf_put(ofpacts, &member_port, sizeof member_port);
 
         bundle = ofpacts->header;
-        bundle->n_slaves++;
+        bundle->n_members++;
     }
-    ofpact_update_len(ofpacts, &bundle->ofpact);
 
+    if (ofpbuf_oversized(ofpacts)) {
+        return xasprintf("input too big");
+    }
+
+    ofpact_finish_BUNDLE(ofpacts, &bundle);
     bundle->basis = atoi(basis);
 
     if (!strcasecmp(fields, "eth_src")) {
@@ -190,6 +200,12 @@ bundle_parse__(const char *s, char **save_ptr,
         bundle->fields = NX_HASH_FIELDS_SYMMETRIC_L3L4;
     } else if (!strcasecmp(fields, "symmetric_l3l4+udp")) {
         bundle->fields = NX_HASH_FIELDS_SYMMETRIC_L3L4_UDP;
+    } else if (!strcasecmp(fields, "nw_src")) {
+        bundle->fields = NX_HASH_FIELDS_NW_SRC;
+    } else if (!strcasecmp(fields, "nw_dst")) {
+        bundle->fields = NX_HASH_FIELDS_NW_DST;
+    } else if (!strcasecmp(fields, "symmetric_l3")) {
+        bundle->fields = NX_HASH_FIELDS_SYMMETRIC_L3;
     } else {
         return xasprintf("%s: unknown fields `%s'", s, fields);
     }
@@ -202,8 +218,8 @@ bundle_parse__(const char *s, char **save_ptr,
         return xasprintf("%s: unknown algorithm `%s'", s, algorithm);
     }
 
-    if (strcasecmp(slave_type, "ofport")) {
-        return xasprintf("%s: unknown slave_type `%s'", s, slave_type);
+    if (strcasecmp(member_type, "ofport")) {
+        return xasprintf("%s: unknown member_type `%s'", s, member_type);
     }
 
     if (dst) {
@@ -227,9 +243,10 @@ bundle_parse__(const char *s, char **save_ptr,
  * Returns NULL if successful, otherwise a malloc()'d string describing the
  * error.  The caller is responsible for freeing the returned string. */
 char * OVS_WARN_UNUSED_RESULT
-bundle_parse(const char *s, struct ofpbuf *ofpacts)
+bundle_parse(const char *s, const struct ofputil_port_map *port_map,
+             struct ofpbuf *ofpacts)
 {
-    char *fields, *basis, *algorithm, *slave_type, *slave_delim;
+    char *fields, *basis, *algorithm, *member_type, *member_delim;
     char *tokstr, *save_ptr;
     char *error;
 
@@ -238,11 +255,12 @@ bundle_parse(const char *s, struct ofpbuf *ofpacts)
     fields = strtok_r(tokstr, ", ", &save_ptr);
     basis = strtok_r(NULL, ", ", &save_ptr);
     algorithm = strtok_r(NULL, ", ", &save_ptr);
-    slave_type = strtok_r(NULL, ", ", &save_ptr);
-    slave_delim = strtok_r(NULL, ": ", &save_ptr);
+    member_type = strtok_r(NULL, ", ", &save_ptr);
+    member_delim = strtok_r(NULL, ": ", &save_ptr);
 
-    error = bundle_parse__(s, &save_ptr, fields, basis, algorithm, slave_type,
-                           NULL, slave_delim, ofpacts);
+    error = bundle_parse__(s, port_map,
+                           &save_ptr, fields, basis, algorithm, member_type,
+                           NULL, member_delim, ofpacts);
     free(tokstr);
 
     return error;
@@ -254,9 +272,10 @@ bundle_parse(const char *s, struct ofpbuf *ofpacts)
  * Returns NULL if successful, otherwise a malloc()'d string describing the
  * error.  The caller is responsible for freeing the returned string.*/
 char * OVS_WARN_UNUSED_RESULT
-bundle_parse_load(const char *s, struct ofpbuf *ofpacts)
+bundle_parse_load(const char *s, const struct ofputil_port_map *port_map,
+                  struct ofpbuf *ofpacts)
 {
-    char *fields, *basis, *algorithm, *slave_type, *dst, *slave_delim;
+    char *fields, *basis, *algorithm, *member_type, *dst, *member_delim;
     char *tokstr, *save_ptr;
     char *error;
 
@@ -265,21 +284,24 @@ bundle_parse_load(const char *s, struct ofpbuf *ofpacts)
     fields = strtok_r(tokstr, ", ", &save_ptr);
     basis = strtok_r(NULL, ", ", &save_ptr);
     algorithm = strtok_r(NULL, ", ", &save_ptr);
-    slave_type = strtok_r(NULL, ", ", &save_ptr);
+    member_type = strtok_r(NULL, ", ", &save_ptr);
     dst = strtok_r(NULL, ", ", &save_ptr);
-    slave_delim = strtok_r(NULL, ": ", &save_ptr);
+    member_delim = strtok_r(NULL, ": ", &save_ptr);
 
-    error = bundle_parse__(s, &save_ptr, fields, basis, algorithm, slave_type,
-                           dst, slave_delim, ofpacts);
+    error = bundle_parse__(s, port_map,
+                           &save_ptr, fields, basis, algorithm, member_type,
+                           dst, member_delim, ofpacts);
 
     free(tokstr);
 
     return error;
 }
 
-/* Appends a human-readable representation of 'nab' to 's'. */
+/* Appends a human-readable representation of 'nab' to 's'.  If 'port_map' is
+ * nonnull, uses it to translate port numbers to names in output. */
 void
-bundle_format(const struct ofpact_bundle *bundle, struct ds *s)
+bundle_format(const struct ofpact_bundle *bundle,
+              const struct ofputil_port_map *port_map, struct ds *s)
 {
     const char *action, *fields, *algorithm;
     size_t i;
@@ -299,22 +321,22 @@ bundle_format(const struct ofpact_bundle *bundle, struct ds *s)
 
     action = bundle->dst.field ? "bundle_load" : "bundle";
 
-    ds_put_format(s, "%s(%s,%"PRIu16",%s,%s,", action, fields,
-                  bundle->basis, algorithm, "ofport");
+    ds_put_format(s, "%s%s(%s%s,%"PRIu16",%s,%s,", colors.paren, action,
+                  colors.end, fields, bundle->basis, algorithm, "ofport");
 
     if (bundle->dst.field) {
         mf_format_subfield(&bundle->dst, s);
-        ds_put_cstr(s, ",");
+        ds_put_char(s, ',');
     }
 
-    ds_put_cstr(s, "slaves:");
-    for (i = 0; i < bundle->n_slaves; i++) {
+    ds_put_format(s, "%smembers:%s", colors.param, colors.end);
+    for (i = 0; i < bundle->n_members; i++) {
         if (i) {
-            ds_put_cstr(s, ",");
+            ds_put_char(s, ',');
         }
 
-        ofputil_format_port(bundle->slaves[i], s);
+        ofputil_format_port(bundle->members[i], port_map, s);
     }
 
-    ds_put_cstr(s, ")");
+    ds_put_format(s, "%s)%s", colors.paren, colors.end);
 }

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import argparse
-import sys
 
 import ovs.daemon
 import ovs.unixctl
@@ -21,6 +20,7 @@ import ovs.unixctl.server
 
 vlog = ovs.vlog.Vlog("test-unixctl")
 exiting = False
+
 
 def unixctl_exit(conn, unused_argv, aux):
     assert aux == "aux_exit"
@@ -36,7 +36,7 @@ def unixctl_echo(conn, argv, aux):
 
 
 def unixctl_echo_error(conn, argv, aux):
-    assert aux ==  "aux_echo_error"
+    assert aux == "aux_echo_error"
     conn.reply_error(str(argv))
 
 
@@ -87,11 +87,4 @@ def main():
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except SystemExit:
-        # Let system.exit() calls complete normally
-        raise
-    except:
-        vlog.exception("traceback")
-        sys.exit(ovs.daemon.RESTART_EXIT_CODE)
+    main()

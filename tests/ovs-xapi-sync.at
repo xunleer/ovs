@@ -1,7 +1,6 @@
 AT_BANNER([ovs-xapi-sync])
 
 AT_SETUP([ovs-xapi-sync])
-AT_SKIP_IF([test $HAVE_PYTHON = no])
 
 # Mock up the XenAPI.
 cp "$top_srcdir/tests/MockXenAPI.py" XenAPI.py
@@ -19,15 +18,15 @@ mkdir var var/run
 touch var/run/xapi_init_complete.cookie
 
 ovs_vsctl () {
-    ovs-vsctl --no-wait -vreconnect:emer --db=unix:socket "$@"
+    ovs-vsctl --no-wait -vreconnect:emer "$@"
 }
 
 # Start ovsdb-server.
 OVS_VSCTL_SETUP
 
 # Start ovs-xapi-sync.
-AT_CHECK([$PYTHON ./ovs-xapi-sync "--pidfile=`pwd`/ovs-xapi-sync.pid" \
-                  "--root-prefix=`pwd`" unix:socket >log 2>&1 &])
+AT_CHECK([$PYTHON3 ./ovs-xapi-sync "--pidfile=ovs-xapi-sync.pid" \
+                  "--root-prefix=`pwd`" unix:db.sock >log 2>&1 &])
 AT_CAPTURE_FILE([log])
 
 # Add bridges and check ovs-xapi-sync's work.

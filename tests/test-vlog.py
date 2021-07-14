@@ -18,7 +18,7 @@ import ovs.vlog
 
 
 def main():
-    modules = [ovs.vlog.Vlog("module_%d" % i) for i in xrange(3)]
+    modules = [ovs.vlog.Vlog("module_%d" % i) for i in range(3)]
 
     parser = argparse.ArgumentParser(description="Vlog Module Tester")
     ovs.vlog.add_args(parser)

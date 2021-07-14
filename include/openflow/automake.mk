@@ -1,5 +1,6 @@
 openflowincludedir = $(includedir)/openflow
 openflowinclude_HEADERS = \
+	include/openflow/intel-ext.h \
 	include/openflow/netronome-ext.h \
 	include/openflow/nicira-ext.h \
 	include/openflow/openflow-1.0.h \
@@ -11,7 +12,6 @@ openflowinclude_HEADERS = \
 	include/openflow/openflow-common.h \
 	include/openflow/openflow.h
 
-if HAVE_PYTHON
 SUFFIXES += .h .hstamp
 
 .h.hstamp:
@@ -22,7 +22,6 @@ HSTAMP_FILES = $(openflowinclude_HEADERS:.h=.hstamp)
 CLEANFILES += $(HSTAMP_FILES)
 ALL_LOCAL += $(HSTAMP_FILES)
 $(HSTAMP_FILES): build-aux/check-structs $(openflowinclude_HEADERS)
-endif
 
 EXTRA_DIST += build-aux/check-structs
 

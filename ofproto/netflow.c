@@ -16,6 +16,8 @@
 
 #include <config.h>
 #include "netflow.h"
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -25,11 +27,11 @@
 #include "dpif.h"
 #include "flow.h"
 #include "lib/netflow.h"
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include "ofproto.h"
 #include "ofproto/netflow.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "socket-util.h"
 #include "timeval.h"
 #include "util.h"
@@ -360,7 +362,7 @@ netflow_set_options(struct netflow *nf,
     nf->add_id_to_iface = nf_options->add_id_to_iface;
 
     collectors_destroy(nf->collectors);
-    collectors_create(&nf_options->collectors, 0, &nf->collectors);
+    collectors_create(&nf_options->collectors, -1, &nf->collectors);
 
     old_timeout = nf->active_timeout;
     if (nf_options->active_timeout >= 0) {
@@ -413,6 +415,14 @@ netflow_unref(struct netflow *nf)
         atomic_count_dec(&netflow_count);
         collectors_destroy(nf->collectors);
         ofpbuf_uninit(&nf->packet);
+
+        struct netflow_flow *nf_flow, *next;
+        HMAP_FOR_EACH_SAFE (nf_flow, next, hmap_node, &nf->flows) {
+            hmap_remove(&nf->flows, &nf_flow->hmap_node);
+            free(nf_flow);
+        }
+        hmap_destroy(&nf->flows);
+
         free(nf);
     }
 }

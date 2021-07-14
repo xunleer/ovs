@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 VMware, Inc.
+ * Copyright (c) 2014, 2016 VMware, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,11 +20,8 @@
 #define MEM_ALIGN                       MEMORY_ALLOCATION_ALIGNMENT
 #define MEM_ALIGN_SIZE(_x)  ((MEM_ALIGN - 1 + (_x))/MEM_ALIGN * MEM_ALIGN)
 #define OVS_CTX_MAGIC                   0xabcd
-
-#define OVS_DEFAULT_NBL_CONTEXT_SIZE    MEM_ALIGN_SIZE(64)
-#define OVS_DEFAULT_NBL_CONTEXT_FILL    \
-      (OVS_DEFAULT_NBL_CONTEXT_SIZE - sizeof (OVS_BUFFER_CONTEXT))
-
+#define OVS_DEFAULT_NBL_CONTEXT_SIZE    sizeof(OVS_BUFFER_CONTEXT)
+#define OVS_DEFAULT_NBL_CONTEXT_FILL    0
 #define OVS_DEFAULT_DATA_SIZE           256
 #define OVS_DEFAULT_HEADROOM_SIZE       128
 #define OVS_FIX_NBL_DATA_SIZE    (OVS_DEFAULT_DATA_SIZE + OVS_DEFAULT_HEADROOM_SIZE)
@@ -49,7 +46,7 @@ enum {
 };
 
 typedef union _OVS_BUFFER_CONTEXT {
-    struct {
+    struct dummy {
         UINT16 magic;
         UINT16 flags;
         UINT32 srcPortNo;
@@ -58,11 +55,13 @@ typedef union _OVS_BUFFER_CONTEXT {
             UINT32 origDataLength;
             UINT32 dataOffsetDelta;
         };
+        ULONG sendFlags;
+        UINT16 mru;
+        UINT16 pendingSend; /* Indicates packet can be sent or not. */
     };
 
-    UINT64 value[MEM_ALIGN_SIZE(16) >> 3];
+    CHAR value[MEM_ALIGN_SIZE(sizeof(struct dummy))];
 } OVS_BUFFER_CONTEXT, *POVS_BUFFER_CONTEXT;
-
 
 typedef struct _OVS_NBL_POOL {
     NDIS_SWITCH_CONTEXT ndisContext;
@@ -83,11 +82,13 @@ typedef struct _OVS_NBL_POOL {
 
 
 NDIS_STATUS OvsInitBufferPool(PVOID context);
+
 VOID OvsCleanupBufferPool(PVOID context);
 
 PNET_BUFFER_LIST OvsAllocateFixSizeNBL(PVOID context,
                                        UINT32 size,
                                        UINT32 headRoom);
+
 PNET_BUFFER_LIST OvsAllocateVariableSizeNBL(PVOID context,
                                             UINT32 size,
                                             UINT32 headRoom);
@@ -106,19 +107,41 @@ PNET_BUFFER_LIST OvsPartialCopyToMultipleNBLs(PVOID context,
                                               UINT32 copySize,
                                               UINT32 headRoom,
                                               BOOLEAN copyNblInfo);
+
 PNET_BUFFER_LIST OvsFullCopyNBL(PVOID context, PNET_BUFFER_LIST nbl,
                                 UINT32 headRoom, BOOLEAN copyNblInfo);
+
 PNET_BUFFER_LIST OvsTcpSegmentNBL(PVOID context,
                                   PNET_BUFFER_LIST nbl,
                                   POVS_PACKET_HDR_INFO hdrInfo,
                                   UINT32 MSS,
-                                  UINT32 headRoom);
-PNET_BUFFER_LIST OvsFullCopyToMultipleNBLs(PVOID context,
-    PNET_BUFFER_LIST nbl, UINT32 headRoom, BOOLEAN copyNblInfo);
+                                  UINT32 headRoom,
+                                  BOOLEAN isIpFragment);
+
+PNET_BUFFER_LIST OvsFragmentNBL(PVOID context,
+                                PNET_BUFFER_LIST nbl,
+                                POVS_PACKET_HDR_INFO hdrInfo,
+                                UINT32 MSS,
+                                UINT32 headRoom,
+                                BOOLEAN isIpFragment);
+
+PNET_BUFFER_LIST OvsAllocateNBLFromBuffer(PVOID context,
+                                          PVOID buffer,
+                                          ULONG length);
+
+PNET_BUFFER_LIST OvsFullCopyToMultipleNBLs(PVOID context, PNET_BUFFER_LIST nbl,
+                                           UINT32 headRoom,
+                                           BOOLEAN copyNblInfo);
+
 PNET_BUFFER_LIST OvsCompleteNBL(PVOID context, PNET_BUFFER_LIST nbl,
                                 BOOLEAN updateRef);
+
 NDIS_STATUS OvsSetCtxSourcePortNo(PNET_BUFFER_LIST nbl, UINT32 portNo);
 
 NDIS_STATUS OvsGetCtxSourcePortNo(PNET_BUFFER_LIST nbl, UINT32 *portNo);
+
+NTSTATUS OvsCreateNewNBLsFromMultipleNBs(PVOID context,
+                                         PNET_BUFFER_LIST *curNbl,
+                                         PNET_BUFFER_LIST *lastNbl);
 
 #endif /* __BUFFER_MGMT_H_ */

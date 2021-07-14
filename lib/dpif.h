@@ -68,9 +68,9 @@
  * datapath implements these (e.g. as the Linux and netdev datapaths do), then
  * Open vSwitch's ovs-vswitchd daemon can directly control what ports are used
  * for switching.  Some datapaths might not implement them, or implement them
- * with restrictions on the types of ports that can be added or removed
- * (e.g. on ESX), on systems where port membership can only be changed by some
- * external entity.
+ * with restrictions on the types of ports that can be added or removed,
+ * on systems where port membership can only be changed by some external
+ * entity.
  *
  * Each datapath must have a port, sometimes called the "local port", whose
  * name is the same as the datapath itself, with port number 0.  The local port
@@ -113,9 +113,8 @@
  *
  *      In Open vSwitch userspace, "struct flow" is the typical way to describe
  *      a flow, but the datapath interface uses a different data format to
- *      allow ABI forward- and backward-compatibility.  datapath/README.md
- *      describes the rationale and design.  Refer to OVS_KEY_ATTR_* and
- *      "struct ovs_key_*" in include/odp-netlink.h for details.
+ *      allow ABI forward- and backward-compatibility.  Refer to OVS_KEY_ATTR_*
+ *      and "struct ovs_key_*" in include/odp-netlink.h for details.
  *      lib/odp-util.h defines several functions for working with these flows.
  *
  *    - A "mask" that, for each bit in the flow, specifies whether the datapath
@@ -275,18 +274,6 @@
  *
  *    - Upcalls that specify the "special" Netlink PID are queued separately.
  *
- * Multiple threads may want to read upcalls simultaneously from a single
- * datapath.  To support multiple threads well, one extends the above preferred
- * behavior:
- *
- *    - Each port has multiple PIDs.  The datapath distributes "miss" upcalls
- *      across the PIDs, ensuring that a given flow is mapped in a stable way
- *      to a single PID.
- *
- *    - For "action" upcalls, the thread can specify its own Netlink PID or
- *      other threads' Netlink PID of the same port for offloading purpose
- *      (e.g. in a "round robin" manner).
- *
  *
  * Packet Format
  * =============
@@ -388,9 +375,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "netdev.h"
+
+#include "dpdk.h"
 #include "dp-packet.h"
+#include "netdev.h"
 #include "openflow/openflow.h"
+#include "openvswitch/ofp-meter.h"
 #include "ovs-numa.h"
 #include "packets.h"
 #include "util.h"
@@ -410,7 +400,7 @@ struct sset;
 
 int dp_register_provider(const struct dpif_class *);
 int dp_unregister_provider(const char *type);
-void dp_blacklist_provider(const char *type);
+void dp_disallow_provider(const char *type);
 void dp_enumerate_types(struct sset *types);
 const char *dpif_normalize_type(const char *);
 
@@ -429,6 +419,8 @@ const char *dpif_name(const struct dpif *);
 const char *dpif_base_name(const struct dpif *);
 const char *dpif_type(const struct dpif *);
 
+bool dpif_cleanup_required(const struct dpif *);
+
 int dpif_delete(struct dpif *);
 
 /* Statistics for a dpif as a whole. */
@@ -443,13 +435,17 @@ struct dpif_dp_stats {
 };
 int dpif_get_dp_stats(const struct dpif *, struct dpif_dp_stats *);
 
+int dpif_set_features(struct dpif *, uint32_t new_features);
+
+int dpif_get_n_offloaded_flows(struct dpif *dpif, uint64_t *n_flows);
+
 
 /* Port operations. */
 
 const char *dpif_port_open_type(const char *datapath_type,
                                 const char *port_type);
 int dpif_port_add(struct dpif *, struct netdev *, odp_port_t *port_nop);
-int dpif_port_del(struct dpif *, odp_port_t port_no);
+int dpif_port_del(struct dpif *, odp_port_t port_no, bool local_delete);
 
 /* A port within a datapath.
  *
@@ -468,8 +464,7 @@ int dpif_port_query_by_name(const struct dpif *, const char *devname,
                             struct dpif_port *);
 int dpif_port_get_name(struct dpif *, odp_port_t port_no,
                        char *name, size_t name_size);
-uint32_t dpif_port_get_pid(const struct dpif *, odp_port_t port_no,
-                           uint32_t hash);
+uint32_t dpif_port_get_pid(const struct dpif *, odp_port_t port_no);
 
 struct dpif_port_dump {
     const struct dpif *dpif;
@@ -505,6 +500,29 @@ struct dpif_flow_stats {
     uint16_t tcp_flags;
 };
 
+/* more statistics info for offloaded packets and bytes */
+struct dpif_flow_detailed_stats {
+    uint64_t n_packets;
+    uint64_t n_bytes;
+    /* n_offload_packets are a subset of n_packets */
+    uint64_t n_offload_packets;
+    /* n_offload_bytes are a subset of n_bytes */
+    uint64_t n_offload_bytes;
+    long long int used;
+    uint16_t tcp_flags;
+};
+
+struct dpif_flow_attrs {
+    bool offloaded;            /* True if flow is offloaded to HW. */
+    const char *dp_layer;      /* DP layer the flow is handled in. */
+    const char *dp_extra_info; /* Extra information provided by DP. */
+};
+
+struct dpif_flow_dump_types {
+    bool ovs_flows;
+    bool netdev_flows;
+};
+
 void dpif_flow_stats_extract(const struct flow *, const struct dp_packet *packet,
                              long long int used, struct dpif_flow_stats *);
 void dpif_flow_stats_format(const struct dpif_flow_stats *, struct ds *);
@@ -517,9 +535,8 @@ enum dpif_flow_put_flags {
 };
 
 bool dpif_probe_feature(struct dpif *, const char *name,
-                        const struct ofpbuf *key, const ovs_u128 *ufid);
-void dpif_flow_hash(const struct dpif *, const void *key, size_t key_len,
-                    ovs_u128 *hash);
+                        const struct ofpbuf *key, const struct ofpbuf *actions,
+                        const ovs_u128 *ufid);
 int dpif_flow_flush(struct dpif *);
 int dpif_flow_put(struct dpif *, enum dpif_flow_put_flags,
                   const struct nlattr *key, size_t key_len,
@@ -564,7 +581,8 @@ int dpif_flow_get(struct dpif *,
  *
  * All error reporting is deferred to the call to dpif_flow_dump_destroy().
  */
-struct dpif_flow_dump *dpif_flow_dump_create(const struct dpif *, bool terse);
+struct dpif_flow_dump *dpif_flow_dump_create(const struct dpif *, bool terse,
+                                             struct dpif_flow_dump_types *);
 int dpif_flow_dump_destroy(struct dpif_flow_dump *);
 
 struct dpif_flow_dump_thread *dpif_flow_dump_thread_create(
@@ -585,6 +603,7 @@ struct dpif_flow {
     bool ufid_present;            /* True if 'ufid' was provided by datapath.*/
     unsigned pmd_id;              /* Datapath poll mode driver id. */
     struct dpif_flow_stats stats; /* Flow statistics. */
+    struct dpif_flow_attrs attrs; /* Flow attributes. */
 };
 int dpif_flow_dump_next(struct dpif_flow_dump_thread *,
                         struct dpif_flow *flows, int max_flows);
@@ -602,6 +621,13 @@ enum dpif_op_type {
     DPIF_OP_FLOW_DEL,
     DPIF_OP_EXECUTE,
     DPIF_OP_FLOW_GET,
+};
+
+/* offload_type argument types to (*operate) interface */
+enum dpif_offload_type {
+    DPIF_OFFLOAD_AUTO,         /* Offload if possible, fallback to software. */
+    DPIF_OFFLOAD_NEVER,        /* Never offload to hardware. */
+    DPIF_OFFLOAD_ALWAYS,       /* Always offload to hardware. */
 };
 
 /* Add or modify a flow.
@@ -628,7 +654,8 @@ enum dpif_op_type {
  *
  *   - If the datapath implements multiple pmd thread with its own flow
  *     table, 'pmd_id' should be used to specify the particular polling
- *     thread for the operation.
+ *     thread for the operation. PMD_ID_NULL means that the flow should
+ *     be put on all the polling threads.
  */
 struct dpif_flow_put {
     /* Input. */
@@ -660,7 +687,8 @@ struct dpif_flow_put {
  *
  * If the datapath implements multiple polling thread with its own flow table,
  * 'pmd_id' should be used to specify the particular polling thread for the
- * operation.
+ * operation. PMD_ID_NULL means that the flow should be deleted from all the
+ * polling threads.
  *
  * If the operation succeeds, then 'stats', if nonnull, will be set to the
  * flow's statistics before its deletion. */
@@ -699,6 +727,8 @@ struct dpif_execute {
     bool probe;                     /* Suppress error messages. */
     unsigned int mtu;               /* Maximum transmission unit to fragment.
                                        0 if not a fragmented packet */
+    uint64_t hash;                  /* Packet flow hash. 0 if not specified. */
+    const struct flow *flow;         /* Flow extracted from 'packet'. */
 
     /* Input, but possibly modified as a side effect of execution. */
     struct dp_packet *packet;          /* Packet to execute. */
@@ -713,8 +743,8 @@ struct dpif_execute {
  * 'buffer' must point to an initialized buffer, with a recommended size of
  * DPIF_FLOW_BUFSIZE bytes.
  *
- * On success, 'flow' will be populated with the mask, actions and stats for
- * the datapath flow corresponding to 'key'. The mask and actions may point
+ * On success, 'flow' will be populated with the mask, actions, stats and attrs
+ * for the datapath flow corresponding to 'key'. The mask and actions may point
  * within '*buffer', or may point at RCU-protected data. Therefore, callers
  * that wish to hold these over quiescent periods must make a copy of these
  * fields before quiescing.
@@ -724,7 +754,8 @@ struct dpif_execute {
  *
  * If the datapath implements multiple polling thread with its own flow table,
  * 'pmd_id' should be used to specify the particular polling thread for the
- * operation.
+ * operation. PMD_ID_NULL means that the datapath will return the first
+ * matching flow from any poll thread.
  *
  * Succeeds with status 0 if the flow is fetched, or fails with ENOENT if no
  * such flow exists. Other failures are indicated with a positive errno value.
@@ -751,10 +782,11 @@ struct dpif_op {
         struct dpif_flow_del flow_del;
         struct dpif_execute execute;
         struct dpif_flow_get flow_get;
-    } u;
+    };
 };
 
-void dpif_operate(struct dpif *, struct dpif_op **ops, size_t n_ops);
+void dpif_operate(struct dpif *, struct dpif_op **ops, size_t n_ops,
+                  enum dpif_offload_type);
 
 /* Upcalls. */
 
@@ -777,12 +809,17 @@ const char *dpif_upcall_type_to_string(enum dpif_upcall_type);
  */
 struct dpif_upcall {
     /* All types. */
+    struct dp_packet packet;    /* Packet data,'dp_packet' should be the first
+                                   member to avoid a hole. This is because
+                                   'rte_mbuf' in dp_packet is aligned atleast
+                                   on a 64-byte boundary */
     enum dpif_upcall_type type;
-    struct dp_packet packet;       /* Packet data. */
     struct nlattr *key;         /* Flow key. */
     size_t key_len;             /* Length of 'key' in bytes. */
     ovs_u128 ufid;              /* Unique flow identifier for 'key'. */
     struct nlattr *mru;         /* Maximum receive unit. */
+    struct nlattr *hash;        /* Packet hash. */
+    struct nlattr *cutlen;      /* Number of bytes shrink from the end. */
 
     /* DPIF_UC_ACTION only. */
     struct nlattr *userdata;    /* Argument to OVS_ACTION_ATTR_USERSPACE. */
@@ -806,7 +843,7 @@ void dpif_register_dp_purge_cb(struct dpif *, dp_purge_callback *, void *aux);
 /* A callback to process an upcall, currently implemented only by dpif-netdev.
  *
  * The caller provides the 'packet' and 'flow' to process, the corresponding
- * 'ufid' as generated by dpif_flow_hash(), the polling thread id 'pmd_id',
+ * 'ufid' as generated by odp_flow_key_hash(), the polling thread id 'pmd_id',
  * the 'type' of the upcall, and if 'type' is DPIF_UC_ACTION then the
  * 'userdata' attached to the action.
  *
@@ -836,8 +873,8 @@ void dpif_register_upcall_cb(struct dpif *, upcall_callback *, void *aux);
 
 int dpif_recv_set(struct dpif *, bool enable);
 int dpif_handlers_set(struct dpif *, uint32_t n_handlers);
-int dpif_poll_threads_set(struct dpif *, unsigned int n_rxqs,
-                          const char *cmask);
+int dpif_set_config(struct dpif *, const struct smap *cfg);
+int dpif_port_set_config(struct dpif *, odp_port_t, const struct smap *cfg);
 int dpif_recv(struct dpif *, uint32_t handler_id, struct dpif_upcall *,
               struct ofpbuf *);
 void dpif_recv_purge(struct dpif *);
@@ -847,6 +884,28 @@ void dpif_disable_upcall(struct dpif *);
 
 void dpif_print_packet(struct dpif *, struct dpif_upcall *);
 
+/* Meters. */
+void dpif_meter_get_features(const struct dpif *,
+                             struct ofputil_meter_features *);
+int dpif_meter_set(struct dpif *, ofproto_meter_id meter_id,
+                   struct ofputil_meter_config *);
+int dpif_meter_get(const struct dpif *, ofproto_meter_id meter_id,
+                   struct ofputil_meter_stats *, uint16_t n_bands);
+int dpif_meter_del(struct dpif *, ofproto_meter_id meter_id,
+                   struct ofputil_meter_stats *, uint16_t n_bands);
+
+/* Bonding. */
+
+/* Bit-mask for hashing a flow down to a bucket. */
+#define BOND_MASK 0xff
+#define BOND_BUCKETS (BOND_MASK + 1)
+
+int dpif_bond_add(struct dpif *, uint32_t bond_id, odp_port_t *member_map);
+int dpif_bond_del(struct dpif *, uint32_t bond_id);
+int dpif_bond_stats_get(struct dpif *, uint32_t bond_id, uint64_t *n_bytes);
+bool dpif_supports_lb_output_action(const struct dpif *);
+
+
 /* Miscellaneous. */
 
 void dpif_get_netflow_ids(const struct dpif *,
@@ -855,8 +914,40 @@ void dpif_get_netflow_ids(const struct dpif *,
 int dpif_queue_to_priority(const struct dpif *, uint32_t queue_id,
                            uint32_t *priority);
 
+int dpif_get_pmds_for_port(const struct dpif * dpif, odp_port_t port_no,
+                           unsigned int **pmds, size_t *n);
+
 char *dpif_get_dp_version(const struct dpif *);
 bool dpif_supports_tnl_push_pop(const struct dpif *);
+bool dpif_supports_explicit_drop_action(const struct dpif *);
+
+/* Log functions. */
+struct vlog_module;
+
+void log_flow_message(const struct dpif *dpif, int error,
+                      const struct vlog_module *module,
+                      const char *operation,
+                      const struct nlattr *key, size_t key_len,
+                      const struct nlattr *mask, size_t mask_len,
+                      const ovs_u128 *ufid,
+                      const struct dpif_flow_stats *stats,
+                      const struct nlattr *actions, size_t actions_len);
+void log_flow_put_message(const struct dpif *,
+                          const struct vlog_module *,
+                          const struct dpif_flow_put *,
+                          int error);
+void log_flow_del_message(const struct dpif *,
+                          const struct vlog_module *,
+                          const struct dpif_flow_del *,
+                          int error);
+void log_execute_message(const struct dpif *,
+                         const struct vlog_module *,
+                         const struct dpif_execute *,
+                         bool subexecute, int error);
+void log_flow_get_message(const struct dpif *,
+                          const struct vlog_module *,
+                          const struct dpif_flow_get *,
+                          int error);
 #ifdef  __cplusplus
 }
 #endif

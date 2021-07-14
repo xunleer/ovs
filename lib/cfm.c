@@ -24,30 +24,29 @@
 #include "byte-order.h"
 #include "connectivity.h"
 #include "dp-packet.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "flow.h"
 #include "hash.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "netdev.h"
 #include "ovs-atomic.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "random.h"
 #include "seq.h"
 #include "timer.h"
 #include "timeval.h"
 #include "unixctl.h"
 #include "openvswitch/vlog.h"
+#include "util.h"
 
 VLOG_DEFINE_THIS_MODULE(cfm);
 
 #define CFM_MAX_RMPS 256
 
 /* Ethernet destination address of CCM packets. */
-static const struct eth_addr eth_addr_ccm = {
-    { { 0x01, 0x80, 0xC2, 0x00, 0x00, 0x30 } } };
-static const struct eth_addr eth_addr_ccm_x = {
-    { { 0x01, 0x23, 0x20, 0x00, 0x00, 0x30 } } };
+static const struct eth_addr eth_addr_ccm = ETH_ADDR_C(01,80,c2,00,00,30);
+static const struct eth_addr eth_addr_ccm_x = ETH_ADDR_C(01,23,20,00,00,30);
 
 #define ETH_TYPE_CFM 0x8902
 
@@ -374,7 +373,7 @@ cfm_create(const struct netdev *netdev) OVS_EXCLUDED(mutex)
 void
 cfm_unref(struct cfm *cfm) OVS_EXCLUDED(mutex)
 {
-    struct remote_mp *rmp, *rmp_next;
+    struct remote_mp *rmp;
 
     if (!cfm) {
         return;
@@ -389,8 +388,7 @@ cfm_unref(struct cfm *cfm) OVS_EXCLUDED(mutex)
     hmap_remove(all_cfms, &cfm->hmap_node);
     ovs_mutex_unlock(&mutex);
 
-    HMAP_FOR_EACH_SAFE (rmp, rmp_next, node, &cfm->remote_mps) {
-        hmap_remove(&cfm->remote_mps, &rmp->node);
+    HMAP_FOR_EACH_POP (rmp, node, &cfm->remote_mps) {
         free(rmp);
     }
 
@@ -760,7 +758,7 @@ cfm_process_heartbeat(struct cfm *cfm, const struct dp_packet *p)
 
     atomic_read_relaxed(&cfm->extended, &extended);
 
-    eth = dp_packet_l2(p);
+    eth = dp_packet_eth(p);
     ccm = dp_packet_at(p, (uint8_t *)dp_packet_l3(p) - (uint8_t *)dp_packet_data(p),
                     CCM_ACCEPT_LEN);
 
@@ -782,8 +780,8 @@ cfm_process_heartbeat(struct cfm *cfm, const struct dp_packet *p)
      *
      * Faults can cause a controller or Open vSwitch to make potentially
      * expensive changes to the network topology.  It seems prudent to trigger
-     * them judiciously, especially when CFM is used to check slave status of
-     * bonds. Furthermore, faults can be maliciously triggered by crafting
+     * them judiciously, especially when CFM is used to check status of bond
+     * members. Furthermore, faults can be maliciously triggered by crafting
      * unexpected CCMs. */
     if (memcmp(ccm->maid, cfm->maid, sizeof ccm->maid)) {
         cfm->recv_fault |= CFM_FAULT_MAID;
@@ -1034,30 +1032,30 @@ cfm_print_details(struct ds *ds, struct cfm *cfm) OVS_REQUIRES(mutex)
 
     fault = cfm_get_fault__(cfm);
     if (fault) {
-        ds_put_cstr(ds, "\tfault: ");
+        ds_put_cstr(ds, "  fault: ");
         ds_put_cfm_fault(ds, fault);
         ds_put_cstr(ds, "\n");
     }
 
     if (cfm->health == -1) {
-        ds_put_format(ds, "\taverage health: undefined\n");
+        ds_put_format(ds, "  average health: undefined\n");
     } else {
-        ds_put_format(ds, "\taverage health: %d\n", cfm->health);
+        ds_put_format(ds, "  average health: %d\n", cfm->health);
     }
-    ds_put_format(ds, "\topstate: %s\n", cfm->opup ? "up" : "down");
-    ds_put_format(ds, "\tremote_opstate: %s\n",
+    ds_put_format(ds, "  opstate: %s\n", cfm->opup ? "up" : "down");
+    ds_put_format(ds, "  remote_opstate: %s\n",
                   cfm->remote_opup ? "up" : "down");
-    ds_put_format(ds, "\tinterval: %dms\n", cfm->ccm_interval_ms);
-    ds_put_format(ds, "\tnext CCM tx: %lldms\n",
+    ds_put_format(ds, "  interval: %dms\n", cfm->ccm_interval_ms);
+    ds_put_format(ds, "  next CCM tx: %lldms\n",
                   timer_msecs_until_expired(&cfm->tx_timer));
-    ds_put_format(ds, "\tnext fault check: %lldms\n",
+    ds_put_format(ds, "  next fault check: %lldms\n",
                   timer_msecs_until_expired(&cfm->fault_timer));
 
     HMAP_FOR_EACH (rmp, node, &cfm->remote_mps) {
         ds_put_format(ds, "Remote MPID %"PRIu64"\n", rmp->mpid);
-        ds_put_format(ds, "\trecv since check: %s\n",
+        ds_put_format(ds, "  recv since check: %s\n",
                       rmp->recv ? "true" : "false");
-        ds_put_format(ds, "\topstate: %s\n", rmp->opup? "up" : "down");
+        ds_put_format(ds, "  opstate: %s\n", rmp->opup? "up" : "down");
     }
 }
 

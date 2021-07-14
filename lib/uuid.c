@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2009, 2010, 2011, 2013 Nicira, Inc.
+/* Copyright (c) 2008, 2009, 2010, 2011, 2013, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,10 +26,15 @@
 
 #include "aes128.h"
 #include "entropy.h"
+#include "fatal-signal.h"
+#include "openvswitch/vlog.h"
+#include "ovs-replay.h"
 #include "ovs-thread.h"
 #include "sha1.h"
 #include "timeval.h"
 #include "util.h"
+
+VLOG_DEFINE_THIS_MODULE(uuid);
 
 static struct aes128 key;
 static uint64_t counter[2];
@@ -52,6 +57,63 @@ uuid_init(void)
 {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, do_init);
+}
+
+/* Record/replay of uuid generation. */
+static replay_file_t uuid_replay_file;
+static int uuid_replay_seqno;
+
+static void
+uuid_replay_file_close(void *aux OVS_UNUSED)
+{
+    ovs_replay_file_close(uuid_replay_file);
+}
+
+static void
+uuid_replay_file_open(void)
+{
+    int error;
+
+    ovs_replay_lock();
+    error = ovs_replay_file_open("__uuid_generate", &uuid_replay_file,
+                                 &uuid_replay_seqno);
+    ovs_replay_unlock();
+    if (error) {
+        VLOG_FATAL("failed to open uuid replay file: %s.",
+                   ovs_strerror(error));
+    }
+    fatal_signal_add_hook(uuid_replay_file_close, NULL, NULL, true);
+}
+
+static void
+uuid_replay_file_read(struct uuid *uuid)
+{
+    int norm_seqno = ovs_replay_normalized_seqno(uuid_replay_seqno);
+    int retval, len;
+
+    ovs_replay_lock();
+    ovs_assert(norm_seqno == ovs_replay_seqno());
+    ovs_assert(ovs_replay_seqno_is_read(uuid_replay_seqno));
+
+    retval = ovs_replay_read(uuid_replay_file, uuid, sizeof *uuid,
+                             &len, &uuid_replay_seqno, true);
+    if (retval || len != sizeof *uuid) {
+        VLOG_FATAL("failed to read from replay file: %s.",
+                   ovs_strerror(retval));
+    }
+    ovs_replay_unlock();
+}
+
+static void
+uuid_replay_file_write(struct uuid *uuid)
+{
+    int retval;
+
+    retval = ovs_replay_write(uuid_replay_file, uuid, sizeof *uuid, true);
+    if (retval) {
+        VLOG_FATAL("failed to write uuid to replay file: %s.",
+                   ovs_strerror(retval));
+    }
 }
 
 /* Generates a new random UUID in 'uuid'.
@@ -82,9 +144,15 @@ void
 uuid_generate(struct uuid *uuid)
 {
     static struct ovs_mutex mutex = OVS_MUTEX_INITIALIZER;
+    enum ovs_replay_state replay_state = ovs_replay_get_state();
     uint64_t copy[2];
 
     uuid_init();
+
+    if (replay_state == OVS_REPLAY_READ) {
+        uuid_replay_file_read(uuid);
+        return;
+    }
 
     /* Copy out the counter's current value, then increment it. */
     ovs_mutex_lock(&mutex);
@@ -99,6 +167,18 @@ uuid_generate(struct uuid *uuid)
     aes128_encrypt(&key, copy, uuid);
 
     uuid_set_bits_v4(uuid);
+
+    if (replay_state == OVS_REPLAY_WRITE) {
+        uuid_replay_file_write(uuid);
+    }
+}
+
+struct uuid
+uuid_random(void)
+{
+    struct uuid uuid;
+    uuid_generate(&uuid);
+    return uuid;
 }
 
 void
@@ -115,7 +195,7 @@ uuid_set_bits_v4(struct uuid *uuid)
 void
 uuid_zero(struct uuid *uuid)
 {
-    uuid->parts[0] = uuid->parts[1] = uuid->parts[2] = uuid->parts[3] = 0;
+    *uuid = UUID_ZERO;
 }
 
 /* Returns true if 'uuid' is all zero, otherwise false. */
@@ -210,6 +290,49 @@ error:
     uuid_zero(uuid);
     return false;
 }
+
+/* If 's' is a string representation of a UUID, or the beginning of one,
+ * returns strlen(s), otherwise 0.
+ *
+ * For example:
+ *
+ *     "123" yields 3
+ *     "xyzzy" yields 0
+ *     "123xyzzy" yields 0
+ *     "e66250bb-9531-491b-b9c3-5385cabb0080" yields 36
+ *     "e66250bb-9531-491b-b9c3-5385cabb0080xyzzy" yields 0
+ */
+int
+uuid_is_partial_string(const char *s)
+{
+    static const char tmpl[UUID_LEN] = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
+    size_t i;
+    for (i = 0; i < UUID_LEN; i++) {
+        if (s[i] == '\0') {
+            return i;
+        } else if (tmpl[i] == 'x'
+                   ? hexit_value(s[i]) < 0
+                   : s[i] != '-') {
+            return 0;
+        }
+    }
+    if (s[i] != '\0') {
+        return 0;
+    }
+    return i;
+}
+
+/* Compares 'match' to the string representation of 'uuid'.  If 'match' equals
+ * or is a prefix of this string representation, returns strlen(match);
+ * otherwise, returns 0. */
+int
+uuid_is_partial_match(const struct uuid *uuid, const char *match)
+{
+    char uuid_s[UUID_LEN + 1];
+    snprintf(uuid_s, sizeof uuid_s, UUID_FMT, UUID_ARGS(uuid));
+    size_t match_len = strlen(match);
+    return !strncmp(uuid_s, match, match_len) ? match_len : 0;
+}
 
 static void
 sha1_update_int(struct sha1_ctx *sha1_ctx, uintmax_t x)
@@ -224,6 +347,10 @@ do_init(void)
     struct sha1_ctx sha1_ctx;
     uint8_t random_seed[16];
     struct timeval now;
+
+    if (ovs_replay_is_active()) {
+        uuid_replay_file_open();
+    }
 
     /* Get seed data. */
     get_entropy_or_die(random_seed, sizeof random_seed);

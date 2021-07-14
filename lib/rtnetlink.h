@@ -45,9 +45,16 @@ struct rtnetlink_change {
     int mtu;                    /* Current MTU. */
     struct eth_addr mac;
     unsigned int ifi_flags;     /* Flags of network device. */
+    bool irrelevant;            /* Some events, notably wireless extensions,
+                                   don't really indicate real netdev change
+                                   that OVS should care about. */
 
     /* Network device address status. */
     /* xxx To be added when needed. */
+
+    /* Link bonding info. */
+    const char *primary;        /* Kind of primary (NULL if not primary). */
+    const char *sub;            /* Kind of subordinate (NULL if not sub). */
 };
 
 /* Function called to report that a netdev has changed.  'change' describes the
@@ -67,4 +74,5 @@ rtnetlink_notifier_create(rtnetlink_notify_func *, void *aux);
 void rtnetlink_notifier_destroy(struct nln_notifier *);
 void rtnetlink_run(void);
 void rtnetlink_wait(void);
+void rtnetlink_report_link(void);
 #endif /* rtnetlink.h */

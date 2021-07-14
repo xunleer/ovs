@@ -18,6 +18,8 @@
 #include <config.h>
 #undef NDEBUG
 #include "netflow.h"
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -27,11 +29,11 @@
 #include <setjmp.h>
 #include "command-line.h"
 #include "daemon.h"
-#include "dynamic-string.h"
-#include "ofpbuf.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/ofpbuf.h"
 #include "ovstest.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "socket-util.h"
 #include "unixctl.h"
 #include "util.h"
@@ -54,6 +56,7 @@ static unixctl_cb_func test_sflow_exit;
 
 /* Structure element tag numbers. */
 #define SFLOW_TAG_CTR_IFCOUNTERS 1
+#define SFLOW_TAG_CTR_ETHCOUNTERS 2
 #define SFLOW_TAG_CTR_LACPCOUNTERS 7
 #define SFLOW_TAG_CTR_OPENFLOWPORT 1004
 #define SFLOW_TAG_CTR_PORTNAME 1005
@@ -110,15 +113,16 @@ struct sflow_xdr {
     struct {
         uint32_t HEADER;
         uint32_t SWITCH;
-	uint32_t TUNNEL4_OUT;
-	uint32_t TUNNEL4_IN;
-	uint32_t TUNNEL_VNI_OUT;
-	uint32_t TUNNEL_VNI_IN;
-	uint32_t MPLS;
+        uint32_t TUNNEL4_OUT;
+        uint32_t TUNNEL4_IN;
+        uint32_t TUNNEL_VNI_OUT;
+        uint32_t TUNNEL_VNI_IN;
+        uint32_t MPLS;
         uint32_t IFCOUNTERS;
-	uint32_t LACPCOUNTERS;
-	uint32_t OPENFLOWPORT;
-	uint32_t PORTNAME;
+        uint32_t ETHCOUNTERS;
+        uint32_t LACPCOUNTERS;
+        uint32_t OPENFLOWPORT;
+        uint32_t PORTNAME;
     } offset;
 
     /* Flow sample fields. */
@@ -241,39 +245,39 @@ process_counter_sample(struct sflow_xdr *x)
         printf("\n");
     }
     if (x->offset.LACPCOUNTERS) {
-	struct eth_addr *mac;
-	union {
-	    ovs_be32 all;
-	    struct {
-		uint8_t actorAdmin;
-		uint8_t actorOper;
-		uint8_t partnerAdmin;
-		uint8_t partnerOper;
-	    } v;
-	} state;
+        struct eth_addr *mac;
+        union {
+            ovs_be32 all;
+            struct {
+                uint8_t actorAdmin;
+                uint8_t actorOper;
+                uint8_t partnerAdmin;
+                uint8_t partnerOper;
+            } v;
+        } state;
 
         sflowxdr_setc(x, x->offset.LACPCOUNTERS);
         printf("LACPCOUNTERS");
-	mac = (void *)sflowxdr_str(x);
-	printf(" sysID="ETH_ADDR_FMT, ETH_ADDR_ARGS(*mac));
-	sflowxdr_skip(x, 2);
-	mac = (void *)sflowxdr_str(x);
-	printf(" partnerID="ETH_ADDR_FMT, ETH_ADDR_ARGS(*mac));
-	sflowxdr_skip(x, 2);
-	printf(" aggID=%"PRIu32, sflowxdr_next(x));
-	state.all = sflowxdr_next_n(x);
-	printf(" actorAdmin=0x%"PRIx32, state.v.actorAdmin);
-	printf(" actorOper=0x%"PRIx32, state.v.actorOper);
-	printf(" partnerAdmin=0x%"PRIx32, state.v.partnerAdmin);
-	printf(" partnerOper=0x%"PRIx32, state.v.partnerOper);
-	printf(" LACPUDsRx=%"PRIu32, sflowxdr_next(x));
-	printf(" markerPDUsRx=%"PRIu32, sflowxdr_next(x));
-	printf(" markerRespPDUsRx=%"PRIu32, sflowxdr_next(x));
-	printf(" unknownRx=%"PRIu32, sflowxdr_next(x));
-	printf(" illegalRx=%"PRIu32, sflowxdr_next(x));
-	printf(" LACPUDsTx=%"PRIu32, sflowxdr_next(x));
-	printf(" markerPDUsTx=%"PRIu32, sflowxdr_next(x));
-	printf(" markerRespPDUsTx=%"PRIu32, sflowxdr_next(x));
+        mac = (void *)sflowxdr_str(x);
+        printf(" sysID="ETH_ADDR_FMT, ETH_ADDR_ARGS(*mac));
+        sflowxdr_skip(x, 2);
+        mac = (void *)sflowxdr_str(x);
+        printf(" partnerID="ETH_ADDR_FMT, ETH_ADDR_ARGS(*mac));
+        sflowxdr_skip(x, 2);
+        printf(" aggID=%"PRIu32, sflowxdr_next(x));
+        state.all = sflowxdr_next_n(x);
+        printf(" actorAdmin=0x%"PRIx32, state.v.actorAdmin);
+        printf(" actorOper=0x%"PRIx32, state.v.actorOper);
+        printf(" partnerAdmin=0x%"PRIx32, state.v.partnerAdmin);
+        printf(" partnerOper=0x%"PRIx32, state.v.partnerOper);
+        printf(" LACPDUsRx=%"PRIu32, sflowxdr_next(x));
+        printf(" markerPDUsRx=%"PRIu32, sflowxdr_next(x));
+        printf(" markerRespPDUsRx=%"PRIu32, sflowxdr_next(x));
+        printf(" unknownRx=%"PRIu32, sflowxdr_next(x));
+        printf(" illegalRx=%"PRIu32, sflowxdr_next(x));
+        printf(" LACPDUsTx=%"PRIu32, sflowxdr_next(x));
+        printf(" markerPDUsTx=%"PRIu32, sflowxdr_next(x));
+        printf(" markerRespPDUsTx=%"PRIu32, sflowxdr_next(x));
         printf("\n");
     }
     if (x->offset.OPENFLOWPORT) {
@@ -281,21 +285,40 @@ process_counter_sample(struct sflow_xdr *x)
         printf("OPENFLOWPORT");
         printf(" datapath_id=%"PRIu64, sflowxdr_next_int64(x));
         printf(" port_no=%"PRIu32, sflowxdr_next(x));
-	printf("\n");
+        printf("\n");
     }
     if (x->offset.PORTNAME) {
-	uint32_t pnLen;
-	const char *pnBytes;
-	char portName[SFL_MAX_PORTNAME_LEN + 1];
+        uint32_t pnLen;
+        const char *pnBytes;
+        char portName[SFL_MAX_PORTNAME_LEN + 1];
         sflowxdr_setc(x, x->offset.PORTNAME);
         printf("PORTNAME");
-	pnLen = sflowxdr_next(x);
-	SFLOWXDR_assert(x, (pnLen <= SFL_MAX_PORTNAME_LEN));
-	pnBytes = sflowxdr_str(x);
-	memcpy(portName, pnBytes, pnLen);
-	portName[pnLen] = '\0';
-	printf(" portName=%s", portName);
-	printf("\n");
+        pnLen = sflowxdr_next(x);
+        SFLOWXDR_assert(x, (pnLen <= SFL_MAX_PORTNAME_LEN));
+        pnBytes = sflowxdr_str(x);
+        memcpy(portName, pnBytes, pnLen);
+        portName[pnLen] = '\0';
+        printf(" portName=%s", portName);
+        printf("\n");
+    }
+    if (x->offset.ETHCOUNTERS) {
+        sflowxdr_setc(x, x->offset.ETHCOUNTERS);
+        printf("ETHCOUNTERS");
+        printf(" dot3StatsAlignmentErrors=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsFCSErrors=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsSingleCollisionFrames=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsMultipleCollisionFrames=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsSQETestErrors=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsDeferredTransmissions=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsLateCollisions=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsExcessiveCollisions=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsInternalMacTransmitErrors=%"PRIu32,
+               sflowxdr_next(x));
+        printf(" dot3StatsCarrierSenseErrors=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsFrameTooLongs=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsInternalMacReceiveErrors=%"PRIu32, sflowxdr_next(x));
+        printf(" dot3StatsSymbolErrors=%"PRIu32, sflowxdr_next(x));
+        printf("\n");
     }
 }
 
@@ -363,22 +386,22 @@ process_flow_sample(struct sflow_xdr *x)
 
         if (x->offset.TUNNEL4_IN) {
             sflowxdr_setc(x, x->offset.TUNNEL4_IN);
-	    print_struct_ipv4(x, "tunnel4_in");
+            print_struct_ipv4(x, "tunnel4_in");
         }
 
         if (x->offset.TUNNEL4_OUT) {
             sflowxdr_setc(x, x->offset.TUNNEL4_OUT);
-	    print_struct_ipv4(x, "tunnel4_out");
+            print_struct_ipv4(x, "tunnel4_out");
         }
 
         if (x->offset.TUNNEL_VNI_IN) {
             sflowxdr_setc(x, x->offset.TUNNEL_VNI_IN);
-	    printf( " tunnel_in_vni=%"PRIu32, sflowxdr_next(x));
+            printf( " tunnel_in_vni=%"PRIu32, sflowxdr_next(x));
         }
 
         if (x->offset.TUNNEL_VNI_OUT) {
             sflowxdr_setc(x, x->offset.TUNNEL_VNI_OUT);
-	    printf( " tunnel_out_vni=%"PRIu32, sflowxdr_next(x));
+            printf( " tunnel_out_vni=%"PRIu32, sflowxdr_next(x));
         }
 
         if (x->offset.MPLS) {
@@ -513,6 +536,9 @@ process_datagram(struct sflow_xdr *x)
                 case SFLOW_TAG_CTR_IFCOUNTERS:
                     sflowxdr_mark_unique(x, &x->offset.IFCOUNTERS);
                     break;
+                case SFLOW_TAG_CTR_ETHCOUNTERS:
+                    sflowxdr_mark_unique(x, &x->offset.ETHCOUNTERS);
+                    break;
                 case SFLOW_TAG_CTR_LACPCOUNTERS:
                     sflowxdr_mark_unique(x, &x->offset.LACPCOUNTERS);
                     break;
@@ -590,23 +616,23 @@ process_datagram(struct sflow_xdr *x)
                     sflowxdr_mark_unique(x, &x->offset.SWITCH);
                     break;
 
-		case SFLOW_TAG_PKT_TUNNEL4_OUT:
+                case SFLOW_TAG_PKT_TUNNEL4_OUT:
                     sflowxdr_mark_unique(x, &x->offset.TUNNEL4_OUT);
                     break;
 
-		case SFLOW_TAG_PKT_TUNNEL4_IN:
+                case SFLOW_TAG_PKT_TUNNEL4_IN:
                     sflowxdr_mark_unique(x, &x->offset.TUNNEL4_IN);
                     break;
 
-		case SFLOW_TAG_PKT_TUNNEL_VNI_OUT:
+                case SFLOW_TAG_PKT_TUNNEL_VNI_OUT:
                     sflowxdr_mark_unique(x, &x->offset.TUNNEL_VNI_OUT);
                     break;
 
-		case SFLOW_TAG_PKT_TUNNEL_VNI_IN:
+                case SFLOW_TAG_PKT_TUNNEL_VNI_IN:
                     sflowxdr_mark_unique(x, &x->offset.TUNNEL_VNI_IN);
                     break;
 
-		case SFLOW_TAG_PKT_MPLS:
+                case SFLOW_TAG_PKT_MPLS:
                     sflowxdr_mark_unique(x, &x->offset.MPLS);
                     break;
 
@@ -651,7 +677,7 @@ print_sflow(struct ofpbuf *buf)
         process_datagram(x);
     } else {
         // CATCH
-        printf("\n>>>>> ERROR in " __FILE__ " at line %u\n", x->errline);
+        printf("\n>>>>> ERROR in " __FILE__ " at line %d\n", x->errline);
     }
 }
 
@@ -717,6 +743,8 @@ test_sflow_main(int argc, char *argv[])
         unixctl_server_wait(server);
         poll_block();
     }
+    ofpbuf_uninit(&buf);
+    unixctl_server_destroy(server);
 }
 
 static void

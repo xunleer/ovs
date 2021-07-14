@@ -24,8 +24,8 @@
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
 # Short-Description: Open vSwitch GRE-over-IPsec daemon
-# Description:       The ovs-monitor-ipsec script provides support for encrypting GRE
-#                    tunnels with IPsec.
+# Description:       The ovs-monitor-ipsec script provides support for
+#                    encrypting GRE tunnels with IPsec.
 ### END INIT INFO
 
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -33,8 +33,9 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 DAEMON=/usr/share/openvswitch/scripts/ovs-monitor-ipsec # Daemon's location
 NAME=ovs-monitor-ipsec          # Introduce the short server's name here
 LOGDIR=/var/log/openvswitch     # Log directory to use
+DATADIR=/usr/share/openvswitch
 
-PIDFILE=/var/run/openvswitch/$NAME.pid 
+PIDFILE=/var/run/openvswitch/$NAME.pid
 
 test -x $DAEMON || exit 0
 
@@ -44,14 +45,14 @@ DODTIME=10              # Time to wait for the server to die, in seconds
                         # If this value is set too low you might not
                         # let some servers to die gracefully and
                         # 'restart' will not work
-                        
+
 set -e
 
 running_pid() {
 # Check if a given process pid's cmdline matches a given name
     pid=$1
     name=$2
-    [ -z "$pid" ] && return 1 
+    [ -z "$pid" ] && return 1
     [ ! -d /proc/$pid ] &&  return 1
     cmd=`cat /proc/$pid/cmdline | tr "\000" " "|cut -d " " -f 2`
     # Is this the expected server
@@ -70,37 +71,13 @@ running() {
     return 0
 }
 
-uninstall_mark_rule() {
-    iptables -D INPUT -t mangle $1 -j MARK --set-mark 1/1 || return 0
-}
-
-install_mark_rule() {
-    if ( ! iptables -C INPUT -t mangle $1 -j MARK --set-mark 1/1 2> /dev/null); then
-        iptables -A INPUT -t mangle $1 -j MARK --set-mark 1/1
-    fi
-}
-
 start_server() {
-    if [ ! -d /var/run/openvswitch ]; then
-        install -d -m 755 -o root -g root /var/run/openvswitch
-    fi
-
-    install_mark_rule "-p esp"
-    install_mark_rule "-p udp --dport 4500"
-    /usr/share/openvswitch/scripts/ovs-monitor-ipsec \
-           --pidfile=$PIDFILE --log-file --detach --monitor \
-           unix:/var/run/openvswitch/db.sock
-
+    ${DATADIR}/scripts/ovs-ctl --ike-daemon=strongswan start-ovs-ipsec
     return 0
 }
 
 stop_server() {
-    if [ -e $PIDFILE ]; then
-        kill `cat $PIDFILE`
-    fi
-    uninstall_mark_rule "-p esp"
-    uninstall_mark_rule "-p udp --dport 4500"
-
+    ${DATADIR}/scripts/ovs-ctl stop-ovs-ipsec
     return 0
 }
 
@@ -190,12 +167,13 @@ case "$1" in
         ;;
   # Use this if the daemon cannot reload
   reload)
-        log_warning_msg "Reloading $NAME daemon: not implemented, as the daemon"
-        log_warning_msg "cannot re-read the config file (use restart)."
+        log_warning_msg "Reloading $NAME daemon: not implemented, as the"
+        log_warning_msg "deamon cannot re-read the config file (use restart)."
         ;;
   *)
         N=/etc/init.d/openvswitch-ipsec
-        echo "Usage: $N {start|stop|force-stop|restart|force-reload|status}" >&2
+        echo "Usage: $N {start|stop|force-stop|restart|force-reload|status}" \
+             >&2
         exit 1
         ;;
 esac

@@ -20,11 +20,9 @@
 #define _LLDPD_STRUCTS_H
 
 #include <net/if.h>
-#ifndef _WIN32
-#include <netinet/in.h>
-#endif
-#include <sys/socket.h>
 #include <sys/types.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include "aa-structs.h"
 #include "lldp-const.h"
 #include "packets.h"
@@ -137,8 +135,8 @@ struct lldpd_config {
     int c_set_ifdescr;      /* Set interface description */
     int c_promisc;          /* Interfaces should be in promiscuous mode */
     int c_tx_hold;          /* Transmit hold */
-    int c_bond_slave_src_mac_type; /* Src mac type in lldp frames over bond
-                                    * slaves */
+    int c_bond_member_src_mac_type; /* Src mac type in lldp frames over bond
+                                     * member interfaces */
     int c_lldp_portid_type; /* The PortID type */
 };
 
@@ -160,9 +158,9 @@ struct lldpd_ops {
 };
 
 /* An interface is uniquely identified by h_ifindex, h_ifname and h_ops. This
- * means if an interface becomes enslaved, it will be considered as a new
- * interface. The same applies for renaming and we include the index in case of
- * renaming to an existing interface.
+ * means if an interface becomes a bond member, it will be considered as a
+ * new interface. The same applies for renaming and we include the index in
+ * case of renaming to an existing interface.
  */
 struct lldpd_hardware {
     struct ovs_list   h_entries;

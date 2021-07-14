@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2011, 2012, 2013, 2014, 2015, 2016, 2019 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@
 #include "command-line.h"
 #include "ovstest.h"
 #include "random.h"
+#include "sat-math.h"
 #include "openvswitch/vlog.h"
 
 static void
@@ -455,6 +456,106 @@ test_bitwise_is_all_zeros(struct ovs_cmdl_context *ctx OVS_UNUSED)
                                 answer ? "true" : "false",
                                 expect ? "true" : "false");
                         abort();
+                    }
+                }
+            }
+        }
+    }
+}
+
+static int
+trivial_bitwise_rscan(const void *p, unsigned int len, bool target,
+                      int start, int end)
+{
+    int ofs;
+
+    for (ofs = start; ofs > end; ofs--) {
+        if (bitwise_get_bit(p, len, ofs) == target) {
+            break;
+        }
+    }
+    return ofs;
+}
+
+static void
+test_bitwise_rscan(struct ovs_cmdl_context *ctx OVS_UNUSED)
+{
+    /* All 1s */
+    uint8_t s1[3] = {0xff, 0xff, 0xff};
+    /* Target is the first bit */
+    ovs_assert(23 == bitwise_rscan(s1, 3, 1, 23, -1));
+    /* Target is not found, return -1 */
+    ovs_assert(-1 == bitwise_rscan(s1, 3, 0, 23, -1));
+    /* Target is not found and end != -1, return end */
+    ovs_assert(20 == bitwise_rscan(s1, 3, 0, 23, 20));
+
+    /* bit 20 - 23 are 0s */
+    uint8_t s2[3] = {0x0f, 0xff, 0xff};
+    /* Target is in the first byte but not the first bit */
+    ovs_assert(19 == bitwise_rscan(s2, 3, 1, 23, -1));
+    /* Target exists before the start postion */
+    ovs_assert(18 == bitwise_rscan(s2, 3, 1, 18, -1));
+    /* Target exists after the end postion, return end */
+    ovs_assert(20 == bitwise_rscan(s2, 3, 1, 23, 20));
+    /* Target is at the end postion, return end */
+    ovs_assert(19 == bitwise_rscan(s2, 3, 1, 23, 19));
+    /* start == end, target at start */
+    ovs_assert(19 == bitwise_rscan(s2, 3, 1, 19, 19));
+    /* start == end, target not at start */
+    ovs_assert(20 == bitwise_rscan(s2, 3, 1, 20, 20));
+    /* Target is 0 ... */
+    ovs_assert(22 == bitwise_rscan(s2, 3, 0, 22, -1));
+
+    /* bit 4 - 23 are 0s */
+    uint8_t s3[3] = {0x00, 0x00, 0x0f};
+    /* Target is in the end byte */
+    ovs_assert(3 == bitwise_rscan(s3, 3, 1, 16, -1));
+    /* Target exists after the end byte, return end */
+    ovs_assert(15 == bitwise_rscan(s3, 3, 1, 23, 15));
+    /* Target exists in end byte but after the end bit, return end */
+    ovs_assert(4 == bitwise_rscan(s3, 3, 1, 23, 4));
+    /* Target is 0 ... */
+    ovs_assert(12 == bitwise_rscan(s3, 3, 0, 12, -1));
+
+    /* All 0s */
+    uint8_t s4[3] = {0x00, 0x00, 0x00};
+    /* Target not found */
+    ovs_assert(-1 == bitwise_rscan(s4, 3, 1, 23, -1));
+    /* Target is 0 ..., start is 0 */
+    ovs_assert(0 == bitwise_rscan(s4, 3, 0, 0, -1));
+
+    int n_loops;
+    for (n_loops = 0; n_loops < 100; n_loops++) {
+        ovs_be64 x = htonll(0);
+        int i;
+
+        for (i = 0; i < 64; i++) {
+            ovs_be64 bit;
+
+            /* Change a random 0-bit into a 1-bit. */
+            do {
+                bit = htonll(UINT64_C(1) << (random_range(64)));
+            } while (x & bit);
+            x |= bit;
+
+            for (int end = -1; end <= 63; end++) {
+                for (int start = end; start <= 63; start++) {
+                    for (int target = 0; target < 2; target++) {
+                        bool expect = trivial_bitwise_rscan(
+                            &x, sizeof x, target, start, end);
+                        bool answer = bitwise_rscan(
+                            &x, sizeof x, target, start, end);
+                        if (expect != answer) {
+                            fprintf(stderr,
+                                    "bitwise_rscan(0x%016"PRIx64",8,%s,%d,%d) "
+                                    "returned %s instead of %s\n",
+                                    ntohll(x),
+                                    target ? "true" : "false",
+                                    start, end,
+                                    answer ? "true" : "false",
+                                    expect ? "true" : "false");
+                            abort();
+                        }
                     }
                 }
             }
@@ -1016,16 +1117,64 @@ test_snprintf(struct ovs_cmdl_context *ctx OVS_UNUSED)
 {
     char s[16];
 
+#if __GNUC__ >= 7
+    /* GCC 7+ warns about the following calls that truncate a string using
+     * snprintf().  We're testing that truncation works properly, so
+     * temporarily disable the warning. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
     ovs_assert(snprintf(s, 4, "abcde") == 5);
     ovs_assert(!strcmp(s, "abc"));
 
     ovs_assert(snprintf(s, 5, "abcde") == 5);
     ovs_assert(!strcmp(s, "abcd"));
+#if __GNUC__ >= 7
+#pragma GCC diagnostic pop
+#endif
 
     ovs_assert(snprintf(s, 6, "abcde") == 5);
     ovs_assert(!strcmp(s, "abcde"));
 
     ovs_assert(snprintf(NULL, 0, "abcde") == 5);
+}
+
+static void
+check_sat(long long int x, long long int y, const char *op,
+          long long int r_a, long long int r_b)
+{
+    if (r_a != r_b) {
+        fprintf(stderr, "%lld %s %lld saturates differently: %lld vs %lld\n",
+                x, op, y, r_a, r_b);
+        abort();
+    }
+}
+
+static void
+test_sat_math(struct ovs_cmdl_context *ctx OVS_UNUSED)
+{
+    long long int values[] = {
+        LLONG_MIN, LLONG_MIN + 1, LLONG_MIN + 2, LLONG_MIN + 3,
+        LLONG_MIN + 4, LLONG_MIN + 5, LLONG_MIN + 6, LLONG_MIN + 7,
+        LLONG_MIN / 2, LLONG_MIN / 3, LLONG_MIN / 4, LLONG_MIN / 5,
+        -1000, -50, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0,
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 50, 1000,
+        LLONG_MAX / 5, LLONG_MAX / 4, LLONG_MAX / 3, LLONG_MAX / 2,
+        LLONG_MAX - 7, LLONG_MAX - 6, LLONG_MAX - 5, LLONG_MAX - 4,
+        LLONG_MAX - 3, LLONG_MAX - 2, LLONG_MAX - 1, LLONG_MAX,
+    };
+
+    /* Compare the behavior of our local implementation of these functions
+     * against the compiler implementation or its fallback.  (If the fallback
+     * is in use then this is comparing the fallback to itself, so this test is
+     * only really useful if the compiler has an implementation.) */
+    for (long long int *x = values; x < values + ARRAY_SIZE(values); x++) {
+        for (long long int *y = values; y < values + ARRAY_SIZE(values); y++) {
+            check_sat(*x, *y, "+", llsat_add(*x, *y), llsat_add__(*x, *y));
+            check_sat(*x, *y, "-", llsat_sub(*x, *y), llsat_sub__(*x, *y));
+            check_sat(*x, *y, "*", llsat_mul(*x, *y), llsat_mul__(*x, *y));
+        }
+    }
 }
 
 #ifndef _WIN32
@@ -1049,24 +1198,26 @@ test_file_name(struct ovs_cmdl_context *ctx)
 #endif /* _WIN32 */
 
 static const struct ovs_cmdl_command commands[] = {
-    {"ctz", NULL, 0, 0, test_ctz},
-    {"clz", NULL, 0, 0, test_clz},
-    {"round_up_pow2", NULL, 0, 0, test_round_up_pow2},
-    {"round_down_pow2", NULL, 0, 0, test_round_down_pow2},
-    {"count_1bits", NULL, 0, 0, test_count_1bits},
-    {"log_2_floor", NULL, 0, 0, test_log_2_floor},
-    {"bitwise_copy", NULL, 0, 0, test_bitwise_copy},
-    {"bitwise_zero", NULL, 0, 0, test_bitwise_zero},
-    {"bitwise_one", NULL, 0, 0, test_bitwise_one},
-    {"bitwise_is_all_zeros", NULL, 0, 0, test_bitwise_is_all_zeros},
-    {"follow-symlinks", NULL, 1, INT_MAX, test_follow_symlinks},
-    {"assert", NULL, 0, 0, test_assert},
-    {"ovs_scan", NULL, 0, 0, test_ovs_scan},
-    {"snprintf", NULL, 0, 0, test_snprintf},
+    {"ctz", NULL, 0, 0, test_ctz, OVS_RO},
+    {"clz", NULL, 0, 0, test_clz, OVS_RO},
+    {"round_up_pow2", NULL, 0, 0, test_round_up_pow2, OVS_RO},
+    {"round_down_pow2", NULL, 0, 0, test_round_down_pow2, OVS_RO},
+    {"count_1bits", NULL, 0, 0, test_count_1bits, OVS_RO},
+    {"log_2_floor", NULL, 0, 0, test_log_2_floor, OVS_RO},
+    {"bitwise_copy", NULL, 0, 0, test_bitwise_copy, OVS_RO},
+    {"bitwise_zero", NULL, 0, 0, test_bitwise_zero, OVS_RO},
+    {"bitwise_one", NULL, 0, 0, test_bitwise_one, OVS_RO},
+    {"bitwise_is_all_zeros", NULL, 0, 0, test_bitwise_is_all_zeros, OVS_RO},
+    {"bitwise_rscan", NULL, 0, 0, test_bitwise_rscan, OVS_RO},
+    {"follow-symlinks", NULL, 1, INT_MAX, test_follow_symlinks, OVS_RO},
+    {"assert", NULL, 0, 0, test_assert, OVS_RO},
+    {"ovs_scan", NULL, 0, 0, test_ovs_scan, OVS_RO},
+    {"snprintf", NULL, 0, 0, test_snprintf, OVS_RO},
+    {"sat_math", NULL, 0, 0, test_sat_math, OVS_RO},
 #ifndef _WIN32
-    {"file_name", NULL, 1, INT_MAX, test_file_name},
+    {"file_name", NULL, 1, INT_MAX, test_file_name, OVS_RO},
 #endif
-    {NULL, NULL, 0, 0, NULL},
+    {NULL, NULL, 0, 0, NULL, OVS_RO},
 };
 
 static void

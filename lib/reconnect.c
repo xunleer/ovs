@@ -19,7 +19,8 @@
 
 #include <stdlib.h>
 
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
+#include "util.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(reconnect);
@@ -60,7 +61,9 @@ struct reconnect {
     long long int last_activity;
     long long int last_connected;
     long long int last_disconnected;
+    long long int last_receive_attempt;
     unsigned int max_tries;
+    unsigned int backoff_free_tries;
 
     /* These values are simply for statistics reporting, not otherwise used
      * directly by anything internal. */
@@ -107,6 +110,7 @@ reconnect_create(long long int now)
     fsm->last_activity = now;
     fsm->last_connected = LLONG_MAX;
     fsm->last_disconnected = LLONG_MAX;
+    fsm->last_receive_attempt = now;
     fsm->max_tries = UINT_MAX;
     fsm->creation_time = now;
 
@@ -203,6 +207,15 @@ unsigned int
 reconnect_get_max_tries(struct reconnect *fsm)
 {
     return fsm->max_tries;
+}
+
+/* Sets the number of connection attempts that will be made without backoff to
+ * 'backoff_free_tries'.  Values 0 and 1 both represent a single attempt. */
+void
+reconnect_set_backoff_free_tries(struct reconnect *fsm,
+                                 unsigned int backoff_free_tries)
+{
+    fsm->backoff_free_tries = backoff_free_tries;
 }
 
 /* Configures the backoff parameters for 'fsm'.  'min_backoff' is the minimum
@@ -345,7 +358,7 @@ reconnect_disconnected(struct reconnect *fsm, long long int now, int error)
                 VLOG(fsm->info, "%s: error listening for connections",
                      fsm->name);
             }
-        } else {
+        } else if (fsm->backoff < fsm->max_backoff) {
             const char *type = fsm->passive ? "listen" : "connection";
             if (error > 0) {
                 VLOG_INFO("%s: %s attempt failed (%s)",
@@ -353,35 +366,47 @@ reconnect_disconnected(struct reconnect *fsm, long long int now, int error)
             } else {
                 VLOG(fsm->info, "%s: %s attempt timed out", fsm->name, type);
             }
+        } else {
+            /* We have reached the maximum backoff, so suppress logging to
+             * avoid wastefully filling the log.  (Previously we logged that we
+             * were suppressing further logging, see below.) */
         }
 
         if (fsm->state & (S_ACTIVE | S_IDLE)) {
             fsm->last_disconnected = now;
         }
+
+        if (!reconnect_may_retry(fsm)) {
+            reconnect_transition__(fsm, now, S_VOID);
+            return;
+        }
+
         /* Back off. */
-        if (fsm->state & (S_ACTIVE | S_IDLE)
-             && (fsm->last_activity - fsm->last_connected >= fsm->backoff
-                 || fsm->passive)) {
+        if (fsm->backoff_free_tries > 1) {
+            fsm->backoff_free_tries--;
+            fsm->backoff = 0;
+        } else if (fsm->state & (S_ACTIVE | S_IDLE)
+                   && (fsm->last_activity - fsm->last_connected >= fsm->backoff
+                       || fsm->passive)) {
             fsm->backoff = fsm->passive ? 0 : fsm->min_backoff;
         } else {
             if (fsm->backoff < fsm->min_backoff) {
                 fsm->backoff = fsm->min_backoff;
-            } else if (fsm->backoff >= fsm->max_backoff / 2) {
-                fsm->backoff = fsm->max_backoff;
-            } else {
+            } else if (fsm->backoff < fsm->max_backoff / 2) {
                 fsm->backoff *= 2;
-            }
-            if (fsm->passive) {
-                VLOG(fsm->info, "%s: waiting %.3g seconds before trying to "
-                          "listen again", fsm->name, fsm->backoff / 1000.0);
+                VLOG(fsm->info, "%s: waiting %.3g seconds before %s",
+                     fsm->name, fsm->backoff / 1000.0,
+                     fsm->passive ? "trying to listen again" : "reconnect");
             } else {
-                VLOG(fsm->info, "%s: waiting %.3g seconds before reconnect",
-                          fsm->name, fsm->backoff / 1000.0);
+                if (fsm->backoff < fsm->max_backoff) {
+                    VLOG_INFO("%s: continuing to %s in the background but "
+                              "suppressing further logging", fsm->name,
+                              fsm->passive ? "try to listen" : "reconnect");
+                }
+                fsm->backoff = fsm->max_backoff;
             }
         }
-
-        reconnect_transition__(fsm, now,
-                               reconnect_may_retry(fsm) ? S_BACKOFF : S_VOID);
+        reconnect_transition__(fsm, now, S_BACKOFF);
     }
 }
 
@@ -396,7 +421,7 @@ reconnect_connecting(struct reconnect *fsm, long long int now)
     if (fsm->state != S_CONNECTING) {
         if (fsm->passive) {
             VLOG(fsm->info, "%s: listening...", fsm->name);
-        } else {
+        } else if (fsm->backoff < fsm->max_backoff) {
             VLOG(fsm->info, "%s: connecting...", fsm->name);
         }
         reconnect_transition__(fsm, now, S_CONNECTING);
@@ -472,10 +497,23 @@ reconnect_connect_failed(struct reconnect *fsm, long long int now, int error)
 void
 reconnect_activity(struct reconnect *fsm, long long int now)
 {
-    if (fsm->state != S_ACTIVE) {
+    if (fsm->state == S_IDLE) {
         reconnect_transition__(fsm, now, S_ACTIVE);
     }
     fsm->last_activity = now;
+}
+
+/* Tell 'fsm' that some attempt to receive data on the connection was made at
+ * 'now'.  The FSM only allows probe interval timer to expire when some attempt
+ * to receive data on the connection was received after the time when it should
+ * have expired.  This helps in the case where there's a long delay in the poll
+ * loop and then reconnect_run() executes before the code to try to receive
+ * anything from the remote runs.  (To disable this feature, just call
+ * reconnect_receive_attempted(fsm, LLONG_MAX).) */
+void
+reconnect_receive_attempted(struct reconnect *fsm, long long int now)
+{
+    fsm->last_receive_attempt = now;
 }
 
 static void
@@ -518,13 +556,19 @@ reconnect_deadline__(const struct reconnect *fsm)
     case S_ACTIVE:
         if (fsm->probe_interval) {
             long long int base = MAX(fsm->last_activity, fsm->state_entered);
-            return base + fsm->probe_interval;
+            long long int expiration = base + fsm->probe_interval;
+            if (fsm->last_receive_attempt >= expiration) {
+                return expiration;
+            }
         }
         return LLONG_MAX;
 
     case S_IDLE:
         if (fsm->probe_interval) {
-            return fsm->state_entered + fsm->probe_interval;
+            long long int expiration = fsm->state_entered + fsm->probe_interval;
+            if (fsm->last_receive_attempt >= expiration) {
+                return expiration;
+            }
         }
         return LLONG_MAX;
 

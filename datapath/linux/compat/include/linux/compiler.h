@@ -11,4 +11,16 @@
 #define __rcu
 #endif
 
+#ifndef READ_ONCE
+#define READ_ONCE(x) (x)
+#endif
+
+#ifndef WRITE_ONCE
+#define WRITE_ONCE(x, val)						\
+do {									\
+	*(volatile typeof(x) *)&(x) = (val);				\
+} while (0)
+#endif
+
+
 #endif

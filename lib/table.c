@@ -18,8 +18,8 @@
 
 #include "table.h"
 
-#include "dynamic-string.h"
-#include "json.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/json.h"
 #include "ovsdb-data.h"
 #include "ovsdb-error.h"
 #include "timeval.h"
@@ -212,10 +212,12 @@ table_add_cell(struct table *table)
 }
 
 static void
-table_print_table_line__(struct ds *line)
+table_finish_line(struct ds *s)
 {
-    puts(ds_cstr(line));
-    ds_clear(line);
+    while (ds_last(s) == ' ') {
+        s->length--;
+    }
+    ds_put_char(s, '\n');
 }
 
 static char *
@@ -225,281 +227,304 @@ table_format_timestamp__(void)
 }
 
 static void
-table_print_timestamp__(const struct table *table)
+table_print_timestamp__(const struct table *table, struct ds *s)
 {
     if (table->timestamp) {
-        char *s = table_format_timestamp__();
-        puts(s);
-        free(s);
+        char *timestamp = table_format_timestamp__();
+        ds_put_format(s, "%s\n", timestamp);
+        free(timestamp);
     }
 }
 
+static bool first_table = true;
+
 static void
-table_print_table__(const struct table *table, const struct table_style *style)
+table_print_table__(const struct table *table, const struct table_style *style,
+                    struct ds *s)
 {
-    static int n = 0;
-    struct ds line = DS_EMPTY_INITIALIZER;
     int *widths;
     size_t x, y;
 
-    if (n++ > 0) {
-        putchar('\n');
+    if (first_table) {
+        first_table = false;
+    } else {
+        ds_put_char(s, '\n');
     }
 
-    table_print_timestamp__(table);
+    table_print_timestamp__(table, s);
 
     if (table->caption) {
-        puts(table->caption);
+        ds_put_format(s, "%s\n", table->caption);
     }
 
-    widths = xmalloc(table->n_columns * sizeof *widths);
+    widths = xzalloc(table->n_columns * sizeof *widths);
     for (x = 0; x < table->n_columns; x++) {
         const struct column *column = &table->columns[x];
 
-        widths[x] = strlen(column->heading);
+        int w = 0;
         for (y = 0; y < table->n_rows; y++) {
             const char *text = cell_to_text(table_cell__(table, y, x), style);
             size_t length = strlen(text);
 
-            if (length > widths[x]) {
-                widths[x] = length;
+            if (length > w) {
+                w = length;
             }
         }
+
+        int max = style->max_column_width;
+        if (max > 0 && w > max) {
+            w = max;
+        }
+        if (style->headings) {
+            int min = strlen(column->heading);
+            if (w < min) {
+                w = min;
+            }
+        }
+        widths[x] = w;
     }
 
     if (style->headings) {
         for (x = 0; x < table->n_columns; x++) {
             const struct column *column = &table->columns[x];
             if (x) {
-                ds_put_char(&line, ' ');
+                ds_put_char(s, ' ');
             }
-            ds_put_format(&line, "%-*s", widths[x], column->heading);
+            ds_put_format(s, "%-*s", widths[x], column->heading);
         }
-        table_print_table_line__(&line);
+        table_finish_line(s);
 
         for (x = 0; x < table->n_columns; x++) {
             if (x) {
-                ds_put_char(&line, ' ');
+                ds_put_char(s, ' ');
             }
-            ds_put_char_multiple(&line, '-', widths[x]);
+            ds_put_char_multiple(s, '-', widths[x]);
         }
-        table_print_table_line__(&line);
+        table_finish_line(s);
     }
 
     for (y = 0; y < table->n_rows; y++) {
         for (x = 0; x < table->n_columns; x++) {
             const char *text = cell_to_text(table_cell__(table, y, x), style);
             if (x) {
-                ds_put_char(&line, ' ');
+                ds_put_char(s, ' ');
             }
-            ds_put_format(&line, "%-*s", widths[x], text);
+            ds_put_format(s, "%-*.*s", widths[x], widths[x], text);
         }
-        table_print_table_line__(&line);
+        table_finish_line(s);
     }
 
-    ds_destroy(&line);
     free(widths);
 }
 
 static void
-table_print_list__(const struct table *table, const struct table_style *style)
+table_print_list__(const struct table *table, const struct table_style *style,
+                   struct ds *s)
 {
-    static int n = 0;
     size_t x, y;
 
-    if (n++ > 0) {
-        putchar('\n');
+    if (first_table) {
+        first_table = false;
+    } else {
+        ds_put_char(s, '\n');
     }
 
-    table_print_timestamp__(table);
+    table_print_timestamp__(table, s);
 
     if (table->caption) {
-        puts(table->caption);
+        ds_put_format(s, "%s\n", table->caption);
     }
 
     for (y = 0; y < table->n_rows; y++) {
         if (y > 0) {
-            putchar('\n');
+            ds_put_char(s, '\n');
         }
         for (x = 0; x < table->n_columns; x++) {
             const char *text = cell_to_text(table_cell__(table, y, x), style);
             if (style->headings) {
-                printf("%-20s: ", table->columns[x].heading);
+                ds_put_format(s, "%-20s: ", table->columns[x].heading);
             }
-            puts(text);
+            ds_put_format(s, "%s\n", text);
         }
     }
 }
 
 static void
-table_escape_html_text__(const char *s, size_t n)
+table_escape_html_text__(const char *content, size_t n, struct ds *s)
 {
-    size_t i;
+    if (!strpbrk(content, "&<>\"")) {
+        ds_put_buffer(s, content, n);
+    } else {
+        size_t i;
 
-    for (i = 0; i < n; i++) {
-        char c = s[i];
+        for (i = 0; i < n; i++) {
+            char c = content[i];
 
-        switch (c) {
-        case '&':
-            fputs("&amp;", stdout);
-            break;
-        case '<':
-            fputs("&lt;", stdout);
-            break;
-        case '>':
-            fputs("&gt;", stdout);
-            break;
-        case '"':
-            fputs("&quot;", stdout);
-            break;
-        default:
-            putchar(c);
-            break;
+            switch (c) {
+            case '&':
+                ds_put_cstr(s, "&amp;");
+                break;
+            case '<':
+                ds_put_cstr(s, "&lt;");
+                break;
+            case '>':
+                ds_put_cstr(s, "&gt;");
+                break;
+            case '"':
+                ds_put_cstr(s, "&quot;");
+                break;
+            default:
+                ds_put_char(s, c);
+                break;
+            }
         }
     }
 }
 
 static void
-table_print_html_cell__(const char *element, const char *content)
+table_print_html_cell__(const char *element, const char *content, struct ds *s)
 {
     const char *p;
 
-    printf("    <%s>", element);
+    ds_put_format(s, "    <%s>", element);
     for (p = content; *p; ) {
         struct uuid uuid;
 
         if (uuid_from_string_prefix(&uuid, p)) {
-            printf("<a href=\"#%.*s\">%.*s</a>", UUID_LEN, p, 8, p);
+            ds_put_format(s, "<a href=\"#%.*s\">%.*s</a>", UUID_LEN, p, 8, p);
             p += UUID_LEN;
         } else {
-            table_escape_html_text__(p, 1);
+            table_escape_html_text__(p, 1, s);
             p++;
         }
     }
-    printf("</%s>\n", element);
+    ds_put_format(s, "</%s>\n", element);
 }
 
 static void
-table_print_html__(const struct table *table, const struct table_style *style)
+table_print_html__(const struct table *table, const struct table_style *style,
+                   struct ds *s)
 {
     size_t x, y;
 
-    table_print_timestamp__(table);
+    table_print_timestamp__(table, s);
 
-    fputs("<table border=1>\n", stdout);
+    ds_put_cstr(s, "<table border=1>\n");
 
     if (table->caption) {
-        table_print_html_cell__("caption", table->caption);
+        table_print_html_cell__("caption", table->caption, s);
     }
 
     if (style->headings) {
-        fputs("  <tr>\n", stdout);
+        ds_put_cstr(s, "  <tr>\n");
         for (x = 0; x < table->n_columns; x++) {
             const struct column *column = &table->columns[x];
-            table_print_html_cell__("th", column->heading);
+            table_print_html_cell__("th", column->heading, s);
         }
-        fputs("  </tr>\n", stdout);
+        ds_put_cstr(s, "  </tr>\n");
     }
 
     for (y = 0; y < table->n_rows; y++) {
-        fputs("  <tr>\n", stdout);
+        ds_put_cstr(s, "  <tr>\n");
         for (x = 0; x < table->n_columns; x++) {
             const char *content;
 
             content = cell_to_text(table_cell__(table, y, x), style);
             if (!strcmp(table->columns[x].heading, "_uuid")) {
-                fputs("    <td><a name=\"", stdout);
-                table_escape_html_text__(content, strlen(content));
-                fputs("\">", stdout);
-                table_escape_html_text__(content, 8);
-                fputs("</a></td>\n", stdout);
+                ds_put_cstr(s, "    <td><a name=\"");
+                table_escape_html_text__(content, strlen(content), s);
+                ds_put_cstr(s, "\">");
+                table_escape_html_text__(content, 8, s);
+                ds_put_cstr(s, "</a></td>\n");
             } else {
-                table_print_html_cell__("td", content);
+                table_print_html_cell__("td", content, s);
             }
         }
-        fputs("  </tr>\n", stdout);
+        ds_put_cstr(s, "  </tr>\n");
     }
 
-    fputs("</table>\n", stdout);
+    ds_put_cstr(s, "</table>\n");
 }
 
 static void
-table_print_csv_cell__(const char *content)
+table_print_csv_cell__(const char *content, struct ds *s)
 {
     const char *p;
 
     if (!strpbrk(content, "\n\",")) {
-        fputs(content, stdout);
+        ds_put_cstr(s, content);
     } else {
-        putchar('"');
+        ds_put_char(s, '"');
         for (p = content; *p != '\0'; p++) {
             switch (*p) {
             case '"':
-                fputs("\"\"", stdout);
+                ds_put_cstr(s, "\"\"");
                 break;
             default:
-                putchar(*p);
+                ds_put_char(s, *p);
                 break;
             }
         }
-        putchar('"');
+        ds_put_char(s, '"');
     }
 }
 
 static void
-table_print_csv__(const struct table *table, const struct table_style *style)
+table_print_csv__(const struct table *table, const struct table_style *style,
+                  struct ds *s)
 {
-    static int n = 0;
     size_t x, y;
 
-    if (n++ > 0) {
-        putchar('\n');
+    if (first_table) {
+        first_table = false;
+    } else {
+        ds_put_char(s, '\n');
     }
 
-    table_print_timestamp__(table);
+    table_print_timestamp__(table, s);
 
     if (table->caption) {
-        puts(table->caption);
+        ds_put_format(s, "%s\n", table->caption);
     }
 
     if (style->headings) {
         for (x = 0; x < table->n_columns; x++) {
             const struct column *column = &table->columns[x];
             if (x) {
-                putchar(',');
+                ds_put_char(s, ',');
             }
-            table_print_csv_cell__(column->heading);
+            table_print_csv_cell__(column->heading, s);
         }
-        putchar('\n');
+        ds_put_char(s, '\n');
     }
 
     for (y = 0; y < table->n_rows; y++) {
         for (x = 0; x < table->n_columns; x++) {
             if (x) {
-                putchar(',');
+                ds_put_char(s, ',');
             }
             table_print_csv_cell__(cell_to_text(table_cell__(table, y, x),
-                                                style));
+                                                style), s);
         }
-        putchar('\n');
+        ds_put_char(s, '\n');
     }
 }
 
 static void
-table_print_json__(const struct table *table, const struct table_style *style)
+table_print_json__(const struct table *table, const struct table_style *style,
+                   struct ds *s)
 {
     struct json *json, *headings, *data;
     size_t x, y;
-    char *s;
 
     json = json_object_create();
     if (table->caption) {
         json_object_put_string(json, "caption", table->caption);
     }
     if (table->timestamp) {
-        char *s = table_format_timestamp__();
-        json_object_put_string(json, "time", s);
-        free(s);
+        json_object_put_nocopy(
+            json, "time",
+            json_string_create_nocopy(table_format_timestamp__()));
     }
 
     headings = json_array_create_empty();
@@ -526,10 +551,9 @@ table_print_json__(const struct table *table, const struct table_style *style)
     }
     json_object_put(json, "data", data);
 
-    s = json_to_string(json, style->json_flags);
+    json_to_ds(json, style->json_flags, s);
+    ds_put_char(s, '\n');
     json_destroy(json);
-    puts(s);
-    free(s);
 }
 
 /* Parses 'format' as the argument to a --format command line option, updating
@@ -568,29 +592,61 @@ table_parse_cell_format(struct table_style *style, const char *format)
     }
 }
 
+void
+table_format(const struct table *table, const struct table_style *style,
+             struct ds *s)
+{
+    switch (style->format) {
+    case TF_TABLE:
+        table_print_table__(table, style, s);
+        break;
+
+    case TF_LIST:
+        table_print_list__(table, style, s);
+        break;
+
+    case TF_HTML:
+        table_print_html__(table, style, s);
+        break;
+
+    case TF_CSV:
+        table_print_csv__(table, style, s);
+        break;
+
+    case TF_JSON:
+        table_print_json__(table, style, s);
+        break;
+    }
+}
+
+void
+table_format_reset(void)
+{
+    first_table = true;
+}
+
 /* Outputs 'table' on stdout in the specified 'style'. */
 void
 table_print(const struct table *table, const struct table_style *style)
 {
-    switch (style->format) {
-    case TF_TABLE:
-        table_print_table__(table, style);
-        break;
+    struct ds s = DS_EMPTY_INITIALIZER;
+    table_format(table, style, &s);
+    fputs(ds_cstr(&s), stdout);
+    ds_destroy(&s);
+}
 
-    case TF_LIST:
-        table_print_list__(table, style);
-        break;
-
-    case TF_HTML:
-        table_print_html__(table, style);
-        break;
-
-    case TF_CSV:
-        table_print_csv__(table, style);
-        break;
-
-    case TF_JSON:
-        table_print_json__(table, style);
-        break;
-    }
+void
+table_usage(void)
+{
+    printf("\nOutput formatting options:\n"
+           "  -f, --format=FORMAT         set output formatting to FORMAT\n"
+           "                              (\"table\", \"html\", \"csv\", "
+           "or \"json\")\n"
+           "  -d, --data=FORMAT           set table cell output formatting to\n"
+           "                              FORMAT (\"string\", \"bare\", "
+           "or \"json\")\n"
+           "  --no-headings               omit table heading row\n"
+           "  --pretty                    pretty-print JSON in output\n"
+           "  --bare                      equivalent to "
+           "\"--format=list --data=bare --no-headings\"\n");
 }

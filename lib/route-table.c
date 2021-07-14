@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2011, 2012, 2013, 2014, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,31 +19,41 @@
 #include "route-table.h"
 
 #include <errno.h>
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 
 #include "hash.h"
+#include "netdev.h"
 #include "netlink.h"
 #include "netlink-notifier.h"
 #include "netlink-socket.h"
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include "ovs-router.h"
 #include "packets.h"
 #include "rtnetlink.h"
+#include "tnl-ports.h"
 #include "openvswitch/vlog.h"
+
+/* Linux 2.6.36 added RTA_MARK, so define it just in case we're building with
+ * old headers.  (We can't test for it with #ifdef because it's an enum.) */
+#define RTA_MARK 16
 
 VLOG_DEFINE_THIS_MODULE(route_table);
 
 struct route_data {
     /* Copied from struct rtmsg. */
     unsigned char rtm_dst_len;
+    bool local;
 
     /* Extracted from Netlink attributes. */
     struct in6_addr rta_dst; /* 0 if missing. */
     struct in6_addr rta_gw;
     char ifname[IFNAMSIZ]; /* Interface name. */
+    uint32_t mark;
 };
 
 /* A digested version of a route message sent down by the kernel to indicate
@@ -62,7 +72,6 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
 static uint64_t rt_change_seq;
 
 static struct nln *nln = NULL;
-static struct nln *nln6 = NULL;
 static struct route_table_msg rtmsg;
 static struct nln_notifier *route_notifier = NULL;
 static struct nln_notifier *route6_notifier = NULL;
@@ -72,7 +81,7 @@ static bool route_table_valid = false;
 
 static int route_table_reset(void);
 static void route_table_handle_msg(const struct route_table_msg *);
-static bool route_table_parse(struct ofpbuf *, struct route_table_msg *);
+static int route_table_parse(struct ofpbuf *, struct route_table_msg *);
 static void route_table_change(const struct route_table_msg *, void *);
 static void route_map_clear(void);
 
@@ -93,22 +102,19 @@ route_table_init(void)
 {
     ovs_mutex_lock(&route_table_mutex);
     ovs_assert(!nln);
-    ovs_assert(!nln6);
     ovs_assert(!route_notifier);
     ovs_assert(!route6_notifier);
 
     ovs_router_init();
-    nln = nln_create(NETLINK_ROUTE, RTNLGRP_IPV4_ROUTE,
-                     (nln_parse_func *) route_table_parse, &rtmsg);
-    nln6 = nln_create(NETLINK_ROUTE, RTNLGRP_IPV6_ROUTE,
-                      (nln_parse_func *) route_table_parse, &rtmsg);
+    nln = nln_create(NETLINK_ROUTE, (nln_parse_func *) route_table_parse,
+                     &rtmsg);
 
     route_notifier =
-        nln_notifier_create(nln, (nln_notify_func *) route_table_change,
-                            NULL);
+        nln_notifier_create(nln, RTNLGRP_IPV4_ROUTE,
+                            (nln_notify_func *) route_table_change, NULL);
     route6_notifier =
-        nln_notifier_create(nln6, (nln_notify_func *) route_table_change,
-                            NULL);
+        nln_notifier_create(nln, RTNLGRP_IPV6_ROUTE,
+                            (nln_notify_func *) route_table_change, NULL);
 
     route_table_reset();
     name_table_init();
@@ -122,14 +128,9 @@ route_table_run(void)
     OVS_EXCLUDED(route_table_mutex)
 {
     ovs_mutex_lock(&route_table_mutex);
-    if (nln || nln6) {
+    if (nln) {
         rtnetlink_run();
-        if (nln) {
-            nln_run(nln);
-        }
-        if (nln6) {
-            nln_run(nln6);
-        }
+        nln_run(nln);
 
         if (!route_table_valid) {
             route_table_reset();
@@ -144,14 +145,9 @@ route_table_wait(void)
     OVS_EXCLUDED(route_table_mutex)
 {
     ovs_mutex_lock(&route_table_mutex);
-    if (nln || nln6) {
+    if (nln) {
         rtnetlink_wait();
-        if (nln) {
-            nln_wait(nln);
-        }
-        if (nln6) {
-            nln_wait(nln6);
-        }
+        nln_wait(nln);
     }
     ovs_mutex_unlock(&route_table_mutex);
 }
@@ -160,20 +156,22 @@ static int
 route_table_reset(void)
 {
     struct nl_dump dump;
-    struct rtgenmsg *rtmsg;
+    struct rtgenmsg *rtgenmsg;
     uint64_t reply_stub[NL_DUMP_BUFSIZE / 8];
     struct ofpbuf request, reply, buf;
 
     route_map_clear();
+    netdev_get_addrs_list_flush();
     route_table_valid = true;
     rt_change_seq++;
 
     ofpbuf_init(&request, 0);
 
-    nl_msg_put_nlmsghdr(&request, sizeof *rtmsg, RTM_GETROUTE, NLM_F_REQUEST);
+    nl_msg_put_nlmsghdr(&request, sizeof *rtgenmsg, RTM_GETROUTE,
+                        NLM_F_REQUEST);
 
-    rtmsg = ofpbuf_put_zeros(&request, sizeof *rtmsg);
-    rtmsg->rtgen_family = AF_UNSPEC;
+    rtgenmsg = ofpbuf_put_zeros(&request, sizeof *rtgenmsg);
+    rtgenmsg->rtgen_family = AF_UNSPEC;
 
     nl_dump_start(&dump, NETLINK_ROUTE, &request);
     ofpbuf_uninit(&request);
@@ -191,20 +189,24 @@ route_table_reset(void)
     return nl_dump_done(&dump);
 }
 
-static bool
+/* Return RTNLGRP_IPV4_ROUTE or RTNLGRP_IPV6_ROUTE on success, 0 on parse
+ * error. */
+static int
 route_table_parse(struct ofpbuf *buf, struct route_table_msg *change)
 {
     bool parsed, ipv4 = false;
 
     static const struct nl_policy policy[] = {
         [RTA_DST] = { .type = NL_A_U32, .optional = true  },
-        [RTA_OIF] = { .type = NL_A_U32, .optional = false },
+        [RTA_OIF] = { .type = NL_A_U32, .optional = true },
         [RTA_GATEWAY] = { .type = NL_A_U32, .optional = true },
+        [RTA_MARK] = { .type = NL_A_U32, .optional = true },
     };
 
     static const struct nl_policy policy6[] = {
         [RTA_DST] = { .type = NL_A_IPV6, .optional = true },
         [RTA_OIF] = { .type = NL_A_U32, .optional = true },
+        [RTA_MARK] = { .type = NL_A_U32, .optional = true },
         [RTA_GATEWAY] = { .type = NL_A_IPV6, .optional = true },
     };
 
@@ -222,7 +224,7 @@ route_table_parse(struct ofpbuf *buf, struct route_table_msg *change)
                                  policy6, attrs, ARRAY_SIZE(policy6));
     } else {
         VLOG_DBG_RL(&rl, "received non AF_INET rtnetlink route message");
-        return false;
+        return 0;
     }
 
     if (parsed) {
@@ -244,6 +246,7 @@ route_table_parse(struct ofpbuf *buf, struct route_table_msg *change)
         }
         change->nlmsg_type     = nlmsg->nlmsg_type;
         change->rd.rtm_dst_len = rtm->rtm_dst_len + (ipv4 ? 96 : 0);
+        change->rd.local = rtm->rtm_type == RTN_LOCAL;
         if (attrs[RTA_OIF]) {
             rta_oif = nl_attr_get_u32(attrs[RTA_OIF]);
 
@@ -252,7 +255,11 @@ route_table_parse(struct ofpbuf *buf, struct route_table_msg *change)
 
                 VLOG_DBG_RL(&rl, "Could not find interface name[%u]: %s",
                             rta_oif, ovs_strerror(error));
-                return false;
+                if (error == ENXIO) {
+                    change->relevant = false;
+                } else {
+                    return 0;
+                }
             }
         }
 
@@ -276,13 +283,16 @@ route_table_parse(struct ofpbuf *buf, struct route_table_msg *change)
                 change->rd.rta_gw = nl_attr_get_in6_addr(attrs[RTA_GATEWAY]);
             }
         }
-
-
+        if (attrs[RTA_MARK]) {
+            change->rd.mark = nl_attr_get_u32(attrs[RTA_MARK]);
+        }
     } else {
         VLOG_DBG_RL(&rl, "received unparseable rtnetlink route message");
+        return 0;
     }
 
-    return parsed;
+    /* Success. */
+    return ipv4 ? RTNLGRP_IPV4_ROUTE : RTNLGRP_IPV6_ROUTE;
 }
 
 static void
@@ -298,8 +308,8 @@ route_table_handle_msg(const struct route_table_msg *change)
     if (change->relevant && change->nlmsg_type == RTM_NEWROUTE) {
         const struct route_data *rd = &change->rd;
 
-        ovs_router_insert(&rd->rta_dst, rd->rtm_dst_len,
-                          rd->ifname, &rd->rta_gw);
+        ovs_router_insert(rd->mark, &rd->rta_dst, rd->rtm_dst_len,
+                          rd->local, rd->ifname, &rd->rta_gw);
     }
 }
 
@@ -310,11 +320,11 @@ route_map_clear(void)
 }
 
 bool
-route_table_fallback_lookup(ovs_be32 ip_dst OVS_UNUSED,
-                            char output_bridge[] OVS_UNUSED,
-                            ovs_be32 *gw)
+route_table_fallback_lookup(const struct in6_addr *ip6_dst OVS_UNUSED,
+                            char name[] OVS_UNUSED,
+                            struct in6_addr *gw6)
 {
-    *gw = 0;
+    *gw6 = in6addr_any;
     return false;
 }
 
@@ -329,10 +339,20 @@ name_table_init(void)
 
 
 static void
-name_table_change(const struct rtnetlink_change *change OVS_UNUSED,
+name_table_change(const struct rtnetlink_change *change,
                   void *aux OVS_UNUSED)
 {
+    if (change && change->irrelevant) {
+        return;
+    }
+
     /* Changes to interface status can cause routing table changes that some
      * versions of the linux kernel do not advertise for some reason. */
     route_table_valid = false;
+
+    if (change && change->nlmsg_type == RTM_DELLINK) {
+        if (change->ifname) {
+            tnl_port_map_delete_ipdev(change->ifname);
+        }
+    }
 }

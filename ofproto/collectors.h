@@ -23,11 +23,11 @@
 struct collectors;
 struct sset;
 
-int collectors_create(const struct sset *targets, uint16_t default_port,
+int collectors_create(const struct sset *targets, int default_port,
                       struct collectors **);
 void collectors_destroy(struct collectors *);
 
-void collectors_send(const struct collectors *, const void *, size_t);
+size_t collectors_send(const struct collectors *, const void *, size_t);
 
 int collectors_count(const struct collectors *);
 

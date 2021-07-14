@@ -39,6 +39,7 @@
 #ifndef _WIN32
 #define DAEMON_OPTION_ENUMS                     \
     OPT_DETACH,                                 \
+    OPT_NO_SELF_CONFINEMENT,                    \
     OPT_NO_CHDIR,                               \
     OPT_OVERWRITE_PIDFILE,                      \
     OPT_PIDFILE,                                \
@@ -47,6 +48,7 @@
 
 #define DAEMON_LONG_OPTIONS                                              \
         {"detach",            no_argument, NULL, OPT_DETACH},            \
+        {"no-self-confinement", no_argument, NULL, OPT_NO_SELF_CONFINEMENT}, \
         {"no-chdir",          no_argument, NULL, OPT_NO_CHDIR},          \
         {"pidfile",           optional_argument, NULL, OPT_PIDFILE},     \
         {"overwrite-pidfile", no_argument, NULL, OPT_OVERWRITE_PIDFILE}, \
@@ -56,6 +58,10 @@
 #define DAEMON_OPTION_HANDLERS                  \
         case OPT_DETACH:                        \
             set_detach();                       \
+            break;                              \
+                                                \
+        case OPT_NO_SELF_CONFINEMENT:           \
+            daemon_disable_self_confinement();  \
             break;                              \
                                                 \
         case OPT_NO_CHDIR:                      \
@@ -78,6 +84,15 @@
             daemon_set_new_user(optarg);        \
             break;
 
+#define DAEMON_OPTION_CASES                     \
+        case OPT_DETACH:                        \
+        case OPT_NO_SELF_CONFINEMENT:           \
+        case OPT_NO_CHDIR:                      \
+        case OPT_PIDFILE:                       \
+        case OPT_OVERWRITE_PIDFILE:             \
+        case OPT_MONITOR:                       \
+        case OPT_USER_GROUP:
+
 void set_detach(void);
 void daemon_set_monitor(void);
 void set_no_chdir(void);
@@ -86,6 +101,7 @@ pid_t read_pidfile(const char *name);
 #else
 #define DAEMON_OPTION_ENUMS                    \
     OPT_DETACH,                                \
+    OPT_NO_SELF_CONFINEMENT,                   \
     OPT_NO_CHDIR,                              \
     OPT_PIDFILE,                               \
     OPT_PIPE_HANDLE,                           \
@@ -95,6 +111,7 @@ pid_t read_pidfile(const char *name);
 
 #define DAEMON_LONG_OPTIONS                                               \
         {"detach",             no_argument, NULL, OPT_DETACH},            \
+        {"no-self-confinement", no_argument, NULL, OPT_NO_SELF_CONFINEMENT}, \
         {"no-chdir",           no_argument, NULL, OPT_NO_CHDIR},          \
         {"pidfile",            optional_argument, NULL, OPT_PIDFILE},     \
         {"pipe-handle",        required_argument, NULL, OPT_PIPE_HANDLE}, \
@@ -104,6 +121,11 @@ pid_t read_pidfile(const char *name);
 
 #define DAEMON_OPTION_HANDLERS                  \
         case OPT_DETACH:                        \
+            set_detach();                       \
+            break;                              \
+                                                \
+        case OPT_NO_SELF_CONFINEMENT:           \
+            daemon_disable_self_confinement();  \
             break;                              \
                                                 \
         case OPT_NO_CHDIR:                      \
@@ -118,6 +140,7 @@ pid_t read_pidfile(const char *name);
             break;                              \
                                                 \
         case OPT_SERVICE:                       \
+            set_detach();                       \
             break;                              \
                                                 \
         case OPT_SERVICE_MONITOR:               \
@@ -126,8 +149,19 @@ pid_t read_pidfile(const char *name);
         case OPT_USER_GROUP:                    \
             daemon_set_new_user(optarg);
 
+#define DAEMON_OPTION_CASES                     \
+        case OPT_DETACH:                        \
+        case OPT_NO_SELF_CONFINEMENT:           \
+        case OPT_NO_CHDIR:                      \
+        case OPT_PIDFILE:                       \
+        case OPT_PIPE_HANDLE:                   \
+        case OPT_SERVICE:                       \
+        case OPT_SERVICE_MONITOR:               \
+        case OPT_USER_GROUP:
+
 void control_handler(DWORD request);
 void set_pipe_handle(const char *pipe_handle);
+void set_detach(void);
 #endif /* _WIN32 */
 
 bool get_detach(void);
@@ -138,6 +172,8 @@ void daemonize_complete(void);
 void daemon_set_new_user(const char * user_spec);
 void daemon_become_new_user(bool access_datapath);
 void daemon_usage(void);
+void daemon_disable_self_confinement(void);
+bool daemon_should_self_confine(void);
 void service_start(int *argcp, char **argvp[]);
 void service_stop(void);
 bool should_service_stop(void);

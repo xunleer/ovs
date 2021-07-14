@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2013, 2015 Nicira, Inc.
+ * Copyright (c) 2009, 2010, 2013, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,12 @@
 
 #include "netlink.h"
 #include "netlink-notifier.h"
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
+#include "packets.h"
+
+#if IFLA_INFO_MAX < 5
+#define IFLA_INFO_SLAVE_KIND 4
+#endif
 
 static struct nln *nln = NULL;
 static struct rtnetlink_change rtn_change;
@@ -44,6 +49,36 @@ rtnetlink_type_is_rtnlgrp_addr(uint16_t type)
     return type == RTM_NEWADDR || type == RTM_DELADDR;
 }
 
+/* Parses nested nlattr for link info. Returns false if unparseable, else
+ * populates 'change' and returns true. */
+static bool
+rtnetlink_parse_link_info(const struct nlattr *nla,
+                          struct rtnetlink_change *change)
+{
+    bool parsed = false;
+
+    static const struct nl_policy linkinfo_policy[] = {
+        [IFLA_INFO_KIND] = { .type = NL_A_STRING, .optional = true  },
+        [IFLA_INFO_SLAVE_KIND] = { .type = NL_A_STRING, .optional = true  },
+    };
+
+    struct nlattr *linkinfo[ARRAY_SIZE(linkinfo_policy)];
+
+    parsed = nl_parse_nested(nla, linkinfo_policy, linkinfo,
+                             ARRAY_SIZE(linkinfo_policy));
+
+    if (parsed) {
+        change->primary = (linkinfo[IFLA_INFO_KIND]
+                           ? nl_attr_get_string(linkinfo[IFLA_INFO_KIND])
+                           : NULL);
+        change->sub = (linkinfo[IFLA_INFO_SLAVE_KIND]
+                       ? nl_attr_get_string(linkinfo[IFLA_INFO_SLAVE_KIND])
+                       : NULL);
+    }
+
+    return parsed;
+}
+
 /* Parses a rtnetlink message 'buf' into 'change'.  If 'buf' is unparseable,
  * leaves 'change' untouched and returns false.  Otherwise, populates 'change'
  * and returns true. */
@@ -52,6 +87,8 @@ rtnetlink_parse(struct ofpbuf *buf, struct rtnetlink_change *change)
 {
     const struct nlmsghdr *nlmsg = buf->data;
     bool parsed = false;
+
+    change->irrelevant = false;
 
     if (rtnetlink_type_is_rtnlgrp_link(nlmsg->nlmsg_type)) {
         /* Policy for RTNLGRP_LINK messages.
@@ -63,6 +100,8 @@ rtnetlink_parse(struct ofpbuf *buf, struct rtnetlink_change *change)
             [IFLA_MASTER] = { .type = NL_A_U32,    .optional = true },
             [IFLA_MTU]    = { .type = NL_A_U32,    .optional = true },
             [IFLA_ADDRESS] = { .type = NL_A_UNSPEC, .optional = true },
+            [IFLA_LINKINFO] = { .type = NL_A_NESTED, .optional = true },
+            [IFLA_WIRELESS] = { .type = NL_A_UNSPEC, .optional = true },
         };
 
         struct nlattr *attrs[ARRAY_SIZE(policy)];
@@ -74,6 +113,23 @@ rtnetlink_parse(struct ofpbuf *buf, struct rtnetlink_change *change)
             const struct ifinfomsg *ifinfo;
 
             ifinfo = ofpbuf_at(buf, NLMSG_HDRLEN, sizeof *ifinfo);
+
+            /* Wireless events can be spammy and cause a
+             * lot of unnecessary churn and CPU load in
+             * ovs-vswitchd. The best way to filter them out
+             * is to rely on the IFLA_WIRELESS and
+             * ifi_change. As per rtnetlink_ifinfo_prep() in
+             * the kernel, the ifi_change = 0. That combined
+             * with the fact wireless events never really
+             * change interface state (as far as core
+             * networking is concerned) they can be ignored
+             * by ovs-vswitchd. It doesn't understand
+             * wireless extensions anyway and has no way of
+             * presenting these bits into ovsdb.
+             */
+            if (attrs[IFLA_WIRELESS] && ifinfo->ifi_change == 0) {
+                change->irrelevant = true;
+            }
 
             change->nlmsg_type     = nlmsg->nlmsg_type;
             change->if_index       = ifinfo->ifi_index;
@@ -93,6 +149,14 @@ rtnetlink_parse(struct ofpbuf *buf, struct rtnetlink_change *change)
             } else {
                 memset(&change->mac, 0, ETH_ADDR_LEN);
             }
+
+            if (attrs[IFLA_LINKINFO]) {
+                parsed = rtnetlink_parse_link_info(attrs[IFLA_LINKINFO],
+                                                   change);
+            } else {
+                change->primary = NULL;
+                change->sub = NULL;
+            }
         }
     } else if (rtnetlink_type_is_rtnlgrp_addr(nlmsg->nlmsg_type)) {
         /* Policy for RTNLGRP_IPV4_IFADDR/RTNLGRP_IPV6_IFADDR messages.
@@ -100,7 +164,7 @@ rtnetlink_parse(struct ofpbuf *buf, struct rtnetlink_change *change)
          * There are *many* more fields in these messages, but currently we
          * only care about these fields. */
         static const struct nl_policy policy[] = {
-            [IFA_LABEL] = { .type = NL_A_STRING, .optional = false },
+            [IFA_LABEL] = { .type = NL_A_STRING, .optional = true },
         };
 
         struct nlattr *attrs[ARRAY_SIZE(policy)];
@@ -115,17 +179,20 @@ rtnetlink_parse(struct ofpbuf *buf, struct rtnetlink_change *change)
 
             change->nlmsg_type     = nlmsg->nlmsg_type;
             change->if_index       = ifaddr->ifa_index;
-            change->ifname         = nl_attr_get_string(attrs[IFA_LABEL]);
+            change->ifname         = (attrs[IFA_LABEL]
+                                      ? nl_attr_get_string(attrs[IFA_LABEL])
+                                      : NULL);
         }
     }
 
     return parsed;
 }
 
-static bool
+/* Return RTNLGRP_LINK on success, 0 on parse error. */
+static int
 rtnetlink_parse_cb(struct ofpbuf *buf, void *change)
 {
-    return rtnetlink_parse(buf, change);
+    return rtnetlink_parse(buf, change) ? RTNLGRP_LINK : 0;
 }
 
 /* Registers 'cb' to be called with auxiliary data 'aux' with network device
@@ -143,11 +210,10 @@ struct nln_notifier *
 rtnetlink_notifier_create(rtnetlink_notify_func *cb, void *aux)
 {
     if (!nln) {
-        nln = nln_create(NETLINK_ROUTE, RTNLGRP_LINK, rtnetlink_parse_cb,
-                         &rtn_change);
+        nln = nln_create(NETLINK_ROUTE, rtnetlink_parse_cb, &rtn_change);
     }
 
-    return nln_notifier_create(nln, (nln_notify_func *) cb, aux);
+    return nln_notifier_create(nln, RTNLGRP_LINK, (nln_notify_func *) cb, aux);
 }
 
 /* Destroys 'notifier', which must have previously been created with
@@ -175,5 +241,14 @@ rtnetlink_wait(void)
 {
     if (nln) {
         nln_wait(nln);
+    }
+}
+
+/* Report RTNLGRP_LINK netdev change events. */
+void
+rtnetlink_report_link(void)
+{
+    if (nln) {
+        nln_report(nln, NULL, RTNLGRP_LINK);
     }
 }

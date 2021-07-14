@@ -16,6 +16,7 @@
 *.lib
 *.pdb
 *.pyc
+*.retry
 *.so
 *.suo
 **/*.sym
@@ -29,7 +30,7 @@
 .dirstamp
 .libs
 .tmp_versions
-.gitattributes
+.vagrant
 /Makefile
 /Makefile.in
 /aclocal.m4
@@ -50,8 +51,11 @@
 /depcomp
 /distfiles
 /dist-docs
+/flake8-check
+/docs-check
 /install-sh
 /libtool
+/manpages.mk
 /manpage-check
 /missing
 /missing-distfiles
@@ -65,6 +69,13 @@ cscope.*
 tags
 _debian
 odp-netlink.h
+odp-netlink-macros.h
 OvsDpInterface.h
 /.vagrant/
 testsuite.tmp.orig
+/rpm/
+/openvswitch*.tar.gz
+/tests/lcov/
+/Documentation/_build
+/.venv
+/cxx-check

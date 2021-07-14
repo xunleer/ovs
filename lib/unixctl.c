@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,12 +20,12 @@
 #include <unistd.h>
 #include "coverage.h"
 #include "dirs.h"
-#include "dynamic-string.h"
-#include "json.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/json.h"
 #include "jsonrpc.h"
-#include "list.h"
-#include "poll-loop.h"
-#include "shash.h"
+#include "openvswitch/list.h"
+#include "openvswitch/poll-loop.h"
+#include "openvswitch/shash.h"
 #include "stream.h"
 #include "stream-provider.h"
 #include "svec.h"
@@ -56,6 +56,7 @@ struct unixctl_conn {
 struct unixctl_server {
     struct pstream *listener;
     struct ovs_list conns;
+    char *path;
 };
 
 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 5);
@@ -76,7 +77,9 @@ unixctl_list_commands(struct unixctl_conn *conn, int argc OVS_UNUSED,
         const struct shash_node *node = nodes[i];
         const struct unixctl_command *command = node->data;
 
-        ds_put_format(&ds, "  %-23s %s\n", node->name, command->usage);
+        if (command->usage) {
+            ds_put_format(&ds, "  %-23s %s\n", node->name, command->usage);
+        }
     }
     free(nodes);
 
@@ -93,7 +96,7 @@ unixctl_version(struct unixctl_conn *conn, int argc OVS_UNUSED,
 
 /* Registers a unixctl command with the given 'name'.  'usage' describes the
  * arguments to the command; it is used only for presentation to the user in
- * "list-commands" output.
+ * "list-commands" output.  (If 'usage' is NULL, then the command is hidden.)
  *
  * 'cb' is called when the command is received.  It is passed an array
  * containing the command name and arguments, plus a copy of 'aux'.  Normally
@@ -151,6 +154,13 @@ unixctl_command_reply__(struct unixctl_conn *conn,
         reply = jsonrpc_create_error(body_json, conn->request_id);
     }
 
+    if (VLOG_IS_DBG_ENABLED()) {
+        char *id = json_to_string(conn->request_id, 0);
+        VLOG_DBG("replying with %s, id=%s: \"%s\"",
+                 success ? "success" : "error", id, body);
+        free(id);
+    }
+
     /* If jsonrpc_send() returns an error, the run loop will take care of the
      * problem eventually. */
     jsonrpc_send(conn->rpc, reply);
@@ -188,7 +198,7 @@ unixctl_command_reply_error(struct unixctl_conn *conn, const char *error)
  *      - An absolute path (starting with '/') that gives the exact name of
  *        the Unix domain socket to listen on.
  *
- * For Windows, a kernel assigned TCP port is used and written in 'path'
+ * For Windows, a local named pipe is used. A file is created in 'path'
  * which may be:
  *
  *      - NULL, in which case <rundir>/<program>.ctl is used.
@@ -209,52 +219,44 @@ unixctl_command_reply_error(struct unixctl_conn *conn, const char *error)
 int
 unixctl_server_create(const char *path, struct unixctl_server **serverp)
 {
-    struct unixctl_server *server;
-    struct pstream *listener;
-    char *punix_path;
-    int error;
-
     *serverp = NULL;
     if (path && !strcmp(path, "none")) {
         return 0;
     }
 
-    if (path) {
-        char *abs_path;
-#ifndef _WIN32
-        abs_path = abs_file_name(ovs_rundir(), path);
+#ifdef _WIN32
+    enum { WINDOWS = 1 };
 #else
-        abs_path = xstrdup(path);
+    enum { WINDOWS = 0 };
 #endif
-        punix_path = xasprintf("punix:%s", abs_path);
-        free(abs_path);
-    } else {
-#ifndef _WIN32
-        punix_path = xasprintf("punix:%s/%s.%ld.ctl", ovs_rundir(),
-                               program_name, (long int) getpid());
-#else
-        punix_path = xasprintf("punix:%s/%s.ctl", ovs_rundir(), program_name);
-#endif
-    }
 
-    error = pstream_open(punix_path, &listener, 0);
+    long int pid = getpid();
+    char *abs_path
+        = (path ? abs_file_name(ovs_rundir(), path)
+           : WINDOWS ? xasprintf("%s/%s.ctl", ovs_rundir(), program_name)
+           : xasprintf("%s/%s.%ld.ctl", ovs_rundir(), program_name, pid));
+
+    struct pstream *listener;
+    char *punix_path = xasprintf("punix:%s", abs_path);
+    int error = pstream_open(punix_path, &listener, 0);
+    free(punix_path);
+
     if (error) {
-        ovs_error(error, "could not initialize control socket %s", punix_path);
-        goto exit;
+        ovs_error(error, "%s: could not initialize control socket", abs_path);
+        free(abs_path);
+        return error;
     }
 
     unixctl_command_register("list-commands", "", 0, 0, unixctl_list_commands,
                              NULL);
     unixctl_command_register("version", "", 0, 0, unixctl_version, NULL);
 
-    server = xmalloc(sizeof *server);
+    struct unixctl_server *server = xmalloc(sizeof *server);
     server->listener = listener;
-    list_init(&server->conns);
+    server->path = abs_path;
+    ovs_list_init(&server->conns);
     *serverp = server;
-
-exit:
-    free(punix_path);
-    return error;
+    return 0;
 }
 
 static void
@@ -268,10 +270,21 @@ process_command(struct unixctl_conn *conn, struct jsonrpc_msg *request)
     COVERAGE_INC(unixctl_received);
     conn->request_id = json_clone(request->id);
 
+    if (VLOG_IS_DBG_ENABLED()) {
+        char *params_s = json_to_string(request->params, 0);
+        char *id_s = json_to_string(request->id, 0);
+        VLOG_DBG("received request %s%s, id=%s",
+                 request->method, params_s, id_s);
+        free(params_s);
+        free(id_s);
+    }
+
     params = json_array(request->params);
     command = shash_find_data(&commands, request->method);
     if (!command) {
-        error = xasprintf("\"%s\" is not a valid command", request->method);
+        error = xasprintf("\"%s\" is not a valid command (use "
+                          "\"list-commands\" to see a list of valid commands)",
+                          request->method);
     } else if (params->n < command->min_args) {
         error = xasprintf("\"%s\" command requires at least %d arguments",
                           request->method, command->min_args);
@@ -346,7 +359,7 @@ run_connection(struct unixctl_conn *conn)
 static void
 kill_connection(struct unixctl_conn *conn)
 {
-    list_remove(&conn->node);
+    ovs_list_remove(&conn->node);
     jsonrpc_close(conn->rpc);
     json_destroy(conn->request_id);
     free(conn);
@@ -355,21 +368,18 @@ kill_connection(struct unixctl_conn *conn)
 void
 unixctl_server_run(struct unixctl_server *server)
 {
-    struct unixctl_conn *conn, *next;
-    int i;
-
     if (!server) {
         return;
     }
 
-    for (i = 0; i < 10; i++) {
+    for (int i = 0; i < 10; i++) {
         struct stream *stream;
         int error;
 
         error = pstream_accept(server->listener, &stream);
         if (!error) {
             struct unixctl_conn *conn = xzalloc(sizeof *conn);
-            list_push_back(&server->conns, &conn->node);
+            ovs_list_push_back(&server->conns, &conn->node);
             conn->rpc = jsonrpc_open(stream);
         } else if (error == EAGAIN) {
             break;
@@ -380,6 +390,7 @@ unixctl_server_run(struct unixctl_server *server)
         }
     }
 
+    struct unixctl_conn *conn, *next;
     LIST_FOR_EACH_SAFE (conn, next, node, &server->conns) {
         int error = run_connection(conn);
         if (error && error != EAGAIN) {
@@ -400,7 +411,7 @@ unixctl_server_wait(struct unixctl_server *server)
     pstream_wait(server->listener);
     LIST_FOR_EACH (conn, node, &server->conns) {
         jsonrpc_wait(conn->rpc);
-        if (!jsonrpc_get_backlog(conn->rpc)) {
+        if (!jsonrpc_get_backlog(conn->rpc) && !conn->request_id) {
             jsonrpc_recv_wait(conn->rpc);
         }
     }
@@ -417,16 +428,24 @@ unixctl_server_destroy(struct unixctl_server *server)
             kill_connection(conn);
         }
 
+        free(server->path);
         pstream_close(server->listener);
         free(server);
     }
+}
+
+const char *
+unixctl_server_get_path(const struct unixctl_server *server)
+{
+    return server ? server->path : NULL;
 }
 
 /* On POSIX based systems, connects to a unixctl server socket.  'path' should
  * be the name of a unixctl server socket.  If it does not start with '/', it
  * will be prefixed with the rundir (e.g. /usr/local/var/run/openvswitch).
  *
- * On Windows, connects to a localhost TCP port as written inside 'path'.
+ * On Windows, connects to a local named pipe. A file which resides in
+ * 'path' is used to mimic the behavior of a Unix domain socket.
  * 'path' should be an absolute path of the file.
  *
  * Returns 0 if successful, otherwise a positive errno value.  If successful,
@@ -434,21 +453,16 @@ unixctl_server_destroy(struct unixctl_server *server)
 int
 unixctl_client_create(const char *path, struct jsonrpc **client)
 {
-    char *abs_path, *unix_path;
     struct stream *stream;
     int error;
 
-#ifdef _WIN32
-    abs_path = xstrdup(path);
-#else
-    abs_path = abs_file_name(ovs_rundir(), path);
-#endif
-    unix_path = xasprintf("unix:%s", abs_path);
+    char *abs_path = abs_file_name(ovs_rundir(), path);
+    char *unix_path = xasprintf("unix:%s", abs_path);
 
     *client = NULL;
 
     error = stream_open_block(stream_open(unix_path, &stream, DSCP_DEFAULT),
-                              &stream);
+                              -1, &stream);
     free(unix_path);
     free(abs_path);
 

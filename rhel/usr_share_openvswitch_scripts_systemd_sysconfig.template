@@ -1,6 +1,7 @@
 ### Configuration options for openvswitch
 #
-# Enable core files:
+# Enable core files.
+# This option should be set to "yes" or "no".  The default is "yes".
 # --force-corefiles=yes
 #
 # Set "nice" priority at which to run ovsdb-server:
@@ -20,4 +21,11 @@
 #   --ovs-vswitchd-wrapper=valgrind
 #   --ovsdb-server-wrapper=valgrind
 #
+# Specify additional options, for example to start with debug logs:
+#   --ovs-vswitchd-options='-vconsole:dbg -vfile:dbg'
+#   --ovsdb-server-options='-vconsole:dbg -vfile:dbg'
+#
 OPTIONS=""
+
+# Uncomment and set the OVS User/Group value
+#OVS_USER_ID="openvswitch:openvswitch"

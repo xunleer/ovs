@@ -15,7 +15,7 @@
 import copy
 import errno
 import os
-import types
+import sys
 
 import ovs.dirs
 import ovs.jsonrpc
@@ -25,9 +25,9 @@ import ovs.util
 import ovs.version
 import ovs.vlog
 
+
 Message = ovs.jsonrpc.Message
 vlog = ovs.vlog.Vlog("unixctl_server")
-strtypes = types.StringTypes
 
 
 class UnixctlConnection(object):
@@ -80,7 +80,7 @@ class UnixctlConnection(object):
 
     def _reply_impl(self, success, body):
         assert isinstance(success, bool)
-        assert body is None or isinstance(body, strtypes)
+        assert body is None or isinstance(body, str)
 
         assert self._request_id is not None
 
@@ -118,12 +118,12 @@ class UnixctlConnection(object):
                     % (method, command.max_args)
         else:
             for param in params:
-                if not isinstance(param, strtypes):
+                if not isinstance(param, str):
                     error = '"%s" command has non-string argument' % method
                     break
 
             if error is None:
-                unicode_params = [unicode(p) for p in params]
+                unicode_params = [str(p) for p in params]
                 command.callback(self, unicode_params, command.aux)
 
         if error:
@@ -135,6 +135,7 @@ def _unixctl_version(conn, unused_argv, version):
     version = "%s (Open vSwitch) %s" % (ovs.util.PROGRAM_NAME, version)
     conn.reply(version)
 
+
 class UnixctlServer(object):
     def __init__(self, listener):
         assert isinstance(listener, ovs.stream.PassiveStream)
@@ -144,6 +145,10 @@ class UnixctlServer(object):
     def run(self):
         for _ in range(10):
             error, stream = self._listener.accept()
+            if sys.platform == "win32" and error == errno.WSAEWOULDBLOCK:
+                # WSAEWOULDBLOCK would be the equivalent on Windows
+                # for EAGAIN on Unix.
+                error = errno.EAGAIN
             if not error:
                 rpc = ovs.jsonrpc.Connection(stream)
                 self._conns.append(UnixctlConnection(rpc))
@@ -180,13 +185,18 @@ class UnixctlServer(object):
         'version' contains the version of the server as reported by the unixctl
         version command.  If None, ovs.version.VERSION is used."""
 
-        assert path is None or isinstance(path, strtypes)
+        assert path is None or isinstance(path, str)
 
         if path is not None:
             path = "punix:%s" % ovs.util.abs_file_name(ovs.dirs.RUNDIR, path)
         else:
-            path = "punix:%s/%s.%d.ctl" % (ovs.dirs.RUNDIR,
-                                           ovs.util.PROGRAM_NAME, os.getpid())
+            if sys.platform == "win32":
+                path = "punix:%s/%s.ctl" % (ovs.dirs.RUNDIR,
+                                            ovs.util.PROGRAM_NAME)
+            else:
+                path = "punix:%s/%s.%d.ctl" % (ovs.dirs.RUNDIR,
+                                               ovs.util.PROGRAM_NAME,
+                                               os.getpid())
 
         if version is None:
             version = ovs.version.VERSION
@@ -209,10 +219,10 @@ class UnixctlClient(object):
         self._conn = conn
 
     def transact(self, command, argv):
-        assert isinstance(command, strtypes)
+        assert isinstance(command, str)
         assert isinstance(argv, list)
         for arg in argv:
-            assert isinstance(arg, strtypes)
+            assert isinstance(arg, str)
 
         request = Message.create_request(command, argv)
         error, reply = self._conn.transact_block(request)

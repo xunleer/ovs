@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2009-2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,15 +21,17 @@
 #include <errno.h>
 
 #include "byteq.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
-#include "json.h"
-#include "list.h"
-#include "ofpbuf.h"
+#include "openvswitch/json.h"
+#include "openvswitch/list.h"
+#include "openvswitch/ofpbuf.h"
+#include "ovs-replay.h"
 #include "ovs-thread.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "reconnect.h"
 #include "stream.h"
+#include "svec.h"
 #include "timeval.h"
 #include "openvswitch/vlog.h"
 
@@ -42,13 +44,17 @@ struct jsonrpc {
 
     /* Input. */
     struct byteq input;
-    uint8_t input_buffer[512];
+    uint8_t input_buffer[4096];
     struct json_parser *parser;
 
     /* Output. */
     struct ovs_list output;     /* Contains "struct ofpbuf"s. */
     size_t output_count;        /* Number of elements in "output". */
     size_t backlog;
+
+    /* Limits. */
+    size_t max_output;          /* 'output_count' disconnection threshold. */
+    size_t max_backlog;         /* 'backlog' disconnection threshold. */
 };
 
 /* Rate limit for error messages. */
@@ -87,7 +93,7 @@ jsonrpc_open(struct stream *stream)
     rpc->name = xstrdup(stream_get_name(stream));
     rpc->stream = stream;
     byteq_init(&rpc->input, rpc->input_buffer, sizeof rpc->input_buffer);
-    list_init(&rpc->output);
+    ovs_list_init(&rpc->output);
 
     return rpc;
 }
@@ -113,7 +119,7 @@ jsonrpc_run(struct jsonrpc *rpc)
     }
 
     stream_run(rpc->stream);
-    while (!list_is_empty(&rpc->output)) {
+    while (!ovs_list_is_empty(&rpc->output)) {
         struct ofpbuf *buf = ofpbuf_from_list(rpc->output.next);
         int retval;
 
@@ -122,7 +128,7 @@ jsonrpc_run(struct jsonrpc *rpc)
             rpc->backlog -= retval;
             ofpbuf_pull(buf, retval);
             if (!buf->size) {
-                list_remove(&buf->list_node);
+                ovs_list_remove(&buf->list_node);
                 rpc->output_count--;
                 ofpbuf_delete(buf);
             }
@@ -144,7 +150,7 @@ jsonrpc_wait(struct jsonrpc *rpc)
 {
     if (!rpc->status) {
         stream_run_wait(rpc->stream);
-        if (!list_is_empty(&rpc->output)) {
+        if (!ovs_list_is_empty(&rpc->output)) {
             stream_send_wait(rpc->stream);
         }
     }
@@ -156,11 +162,11 @@ jsonrpc_wait(struct jsonrpc *rpc)
  * - >0: errno value
  * - EOF: end of file (remote end closed connection; not necessarily an error).
  *
- * When this functions nonzero, 'rpc' is effectively out of commission.  'rpc'
- * will not receive any more messages and any further messages that one
- * attempts to send with 'rpc' will be discarded.  The caller can keep 'rpc'
- * around as long as it wants, but it's not going to provide any more useful
- * services.
+ * When this function returns nonzero, 'rpc' is effectively out of
+ * commission.  'rpc' will not receive any more messages and any further
+ * messages that one attempts to send with 'rpc' will be discarded.  The
+ * caller can keep 'rpc' around as long as it wants, but it's not going
+ * to provide any more useful services.
  */
 int
 jsonrpc_get_status(const struct jsonrpc *rpc)
@@ -175,6 +181,17 @@ size_t
 jsonrpc_get_backlog(const struct jsonrpc *rpc)
 {
     return rpc->status ? 0 : rpc->backlog;
+}
+
+/* Sets thresholds for send backlog.  If send backlog contains more than
+ * 'max_n_msgs' messages or is larger than 'max_backlog_bytes' bytes,
+ * connection will be dropped. */
+void
+jsonrpc_set_backlog_threshold(struct jsonrpc *rpc,
+                              size_t max_n_msgs, size_t max_backlog_bytes)
+{
+    rpc->max_output = max_n_msgs;
+    rpc->max_backlog = max_backlog_bytes;
 }
 
 /* Returns the number of bytes that have been received on 'rpc''s underlying
@@ -255,14 +272,31 @@ jsonrpc_send(struct jsonrpc *rpc, struct jsonrpc_msg *msg)
 
     buf = xmalloc(sizeof *buf);
     ofpbuf_use_ds(buf, &ds);
-    list_push_back(&rpc->output, &buf->list_node);
+    ovs_list_push_back(&rpc->output, &buf->list_node);
     rpc->output_count++;
     rpc->backlog += length;
 
     if (rpc->output_count >= 50) {
-        VLOG_INFO_RL(&rl, "excessive sending backlog, jsonrpc: %s, num of"
+        static struct vlog_rate_limit bl_rl = VLOG_RATE_LIMIT_INIT(5, 5);
+        bool disconnect = false;
+
+        VLOG_INFO_RL(&bl_rl, "excessive sending backlog, jsonrpc: %s, num of"
                      " msgs: %"PRIuSIZE", backlog: %"PRIuSIZE".", rpc->name,
                      rpc->output_count, rpc->backlog);
+        if (rpc->max_output && rpc->output_count > rpc->max_output) {
+            disconnect = true;
+            VLOG_WARN("sending backlog exceeded maximum number of messages (%"
+                      PRIuSIZE" > %"PRIuSIZE"), disconnecting, jsonrpc: %s.",
+                      rpc->output_count, rpc->max_output, rpc->name);
+        } else if (rpc->max_backlog && rpc->backlog > rpc->max_backlog) {
+            disconnect = true;
+            VLOG_WARN("sending backlog exceeded maximum size (%"PRIuSIZE" > %"
+                      PRIuSIZE" bytes), disconnecting, jsonrpc: %s.",
+                      rpc->backlog, rpc->max_backlog, rpc->name);
+        }
+        if (disconnect) {
+            jsonrpc_error(rpc, E2BIG);
+        }
     }
 
     if (rpc->backlog == length) {
@@ -343,7 +377,7 @@ jsonrpc_recv(struct jsonrpc *rpc, struct jsonrpc_msg **msgp)
                 const struct byteq *q = &rpc->input;
                 if (q->head <= q->size) {
                     stream_report_content(q->buffer, q->head, STREAM_JSONRPC,
-                                          THIS_MODULE, rpc->name);
+                                          &this_module, rpc->name);
                 }
                 return rpc->status;
             }
@@ -384,7 +418,7 @@ jsonrpc_send_block(struct jsonrpc *rpc, struct jsonrpc_msg *msg)
 
     for (;;) {
         jsonrpc_run(rpc);
-        if (list_is_empty(&rpc->output) || rpc->status) {
+        if (ovs_list_is_empty(&rpc->output) || rpc->status) {
             return rpc->status;
         }
         jsonrpc_wait(rpc);
@@ -512,7 +546,7 @@ jsonrpc_create(enum jsonrpc_msg_type type, const char *method,
 {
     struct jsonrpc_msg *msg = xmalloc(sizeof *msg);
     msg->type = type;
-    msg->method = method ? xstrdup(method) : NULL;
+    msg->method = nullable_xstrdup(method);
     msg->params = params;
     msg->result = result;
     msg->error = error;
@@ -559,6 +593,16 @@ jsonrpc_create_error(struct json *error, const struct json *id)
 {
     return jsonrpc_create(JSONRPC_REPLY, NULL, NULL, NULL, error,
                            json_clone(id));
+}
+
+struct jsonrpc_msg *
+jsonrpc_msg_clone(const struct jsonrpc_msg *old)
+{
+    return jsonrpc_create(old->type, old->method,
+                          json_nullable_clone(old->params),
+                          json_nullable_clone(old->result),
+                          json_nullable_clone(old->error),
+                          json_nullable_clone(old->id));
 }
 
 const char *
@@ -684,7 +728,7 @@ jsonrpc_msg_from_json(struct json *json, struct jsonrpc_msg **msgp)
     }
 
     msg = xzalloc(sizeof *msg);
-    msg->method = method ? xstrdup(method->u.string) : NULL;
+    msg->method = method ? xstrdup(method->string) : NULL;
     msg->params = null_from_json_null(shash_find_and_delete(object, "params"));
     msg->result = null_from_json_null(shash_find_and_delete(object, "result"));
     msg->error = null_from_json_null(shash_find_and_delete(object, "error"));
@@ -714,6 +758,9 @@ exit:
     return error;
 }
 
+/* Returns 'm' converted to JSON suitable for sending as a JSON-RPC message.
+ *
+ * Consumes and destroys 'm'. */
 struct json *
 jsonrpc_msg_to_json(struct jsonrpc_msg *m)
 {
@@ -749,10 +796,23 @@ jsonrpc_msg_to_json(struct jsonrpc_msg *m)
 
     return json;
 }
+
+char *
+jsonrpc_msg_to_string(const struct jsonrpc_msg *m)
+{
+    struct jsonrpc_msg *copy = jsonrpc_msg_clone(m);
+    struct json *json = jsonrpc_msg_to_json(copy);
+    char *s = json_to_string(json, JSSF_SORT);
+    json_destroy(json);
+    return s;
+}
 
 /* A JSON-RPC session with reconnection. */
 
 struct jsonrpc_session {
+    struct svec remotes;
+    size_t next_remote;
+
     struct reconnect *reconnect;
     struct jsonrpc *rpc;
     struct stream *stream;
@@ -760,7 +820,18 @@ struct jsonrpc_session {
     int last_error;
     unsigned int seqno;
     uint8_t dscp;
+
+    /* Limits for jsonrpc. */
+    size_t max_n_msgs;
+    size_t max_backlog_bytes;
 };
+
+static void
+jsonrpc_session_pick_remote(struct jsonrpc_session *s)
+{
+    reconnect_set_name(s->reconnect,
+                       s->remotes.names[s->next_remote++ % s->remotes.n]);
+}
 
 /* Creates and returns a jsonrpc_session to 'name', which should be a string
  * acceptable to stream_open() or pstream_open().
@@ -779,12 +850,28 @@ struct jsonrpc_session {
 struct jsonrpc_session *
 jsonrpc_session_open(const char *name, bool retry)
 {
+    const struct svec remotes = { .names = (char **) &name, .n = 1 };
+    return jsonrpc_session_open_multiple(&remotes, retry);
+}
+
+struct jsonrpc_session *
+jsonrpc_session_open_multiple(const struct svec *remotes, bool retry)
+{
     struct jsonrpc_session *s;
 
     s = xmalloc(sizeof *s);
+
+    /* Set 'n' remotes from 'names'. */
+    svec_clone(&s->remotes, remotes);
+    if (!s->remotes.n) {
+        svec_add(&s->remotes, "invalid:");
+    }
+    s->next_remote = 0;
+
     s->reconnect = reconnect_create(time_msec());
-    reconnect_set_name(s->reconnect, name);
+    jsonrpc_session_pick_remote(s);
     reconnect_enable(s->reconnect, time_msec());
+    reconnect_set_backoff_free_tries(s->reconnect, remotes->n);
     s->rpc = NULL;
     s->stream = NULL;
     s->pstream = NULL;
@@ -792,14 +879,17 @@ jsonrpc_session_open(const char *name, bool retry)
     s->dscp = 0;
     s->last_error = 0;
 
+    jsonrpc_session_set_backlog_threshold(s, 0, 0);
+
+    const char *name = reconnect_get_name(s->reconnect);
     if (!pstream_verify_name(name)) {
         reconnect_set_passive(s->reconnect, true, time_msec());
     } else if (!retry) {
-        reconnect_set_max_tries(s->reconnect, 1);
+        reconnect_set_max_tries(s->reconnect, remotes->n);
         reconnect_set_backoff(s->reconnect, INT_MAX, INT_MAX);
     }
 
-    if (!stream_or_pstream_needs_probes(name)) {
+    if (!stream_or_pstream_needs_probes(name) || ovs_replay_is_active()) {
         reconnect_set_probe_interval(s->reconnect, 0);
     }
 
@@ -817,17 +907,26 @@ jsonrpc_session_open_unreliably(struct jsonrpc *jsonrpc, uint8_t dscp)
     struct jsonrpc_session *s;
 
     s = xmalloc(sizeof *s);
+    svec_init(&s->remotes);
+    svec_add(&s->remotes, jsonrpc_get_name(jsonrpc));
+    s->next_remote = 0;
     s->reconnect = reconnect_create(time_msec());
     reconnect_set_quiet(s->reconnect, true);
     reconnect_set_name(s->reconnect, jsonrpc_get_name(jsonrpc));
     reconnect_set_max_tries(s->reconnect, 0);
     reconnect_connected(s->reconnect, time_msec());
+
+    if (ovs_replay_is_active()) {
+        reconnect_set_probe_interval(s->reconnect, 0);
+    }
+
     s->dscp = dscp;
     s->rpc = jsonrpc;
     s->stream = NULL;
     s->pstream = NULL;
-    s->seqno = 0;
+    s->seqno = 1;
 
+    jsonrpc_session_set_backlog_threshold(s, 0, 0);
     return s;
 }
 
@@ -839,8 +938,18 @@ jsonrpc_session_close(struct jsonrpc_session *s)
         reconnect_destroy(s->reconnect);
         stream_close(s->stream);
         pstream_close(s->pstream);
+        svec_destroy(&s->remotes);
         free(s);
     }
+}
+
+struct jsonrpc *
+jsonrpc_session_steal(struct jsonrpc_session *s)
+{
+    struct jsonrpc *rpc = s->rpc;
+    s->rpc = NULL;
+    jsonrpc_session_close(s);
+    return rpc;
 }
 
 static void
@@ -850,12 +959,15 @@ jsonrpc_session_disconnect(struct jsonrpc_session *s)
         jsonrpc_error(s->rpc, EOF);
         jsonrpc_close(s->rpc);
         s->rpc = NULL;
-        s->seqno++;
     } else if (s->stream) {
         stream_close(s->stream);
         s->stream = NULL;
-        s->seqno++;
+    } else {
+        return;
     }
+
+    s->seqno++;
+    jsonrpc_session_pick_remote(s);
 }
 
 static void
@@ -882,8 +994,8 @@ jsonrpc_session_connect(struct jsonrpc_session *s)
 
     if (error) {
         reconnect_connect_failed(s->reconnect, time_msec(), error);
+        jsonrpc_session_pick_remote(s);
     }
-    s->seqno++;
 }
 
 void
@@ -903,6 +1015,9 @@ jsonrpc_session_run(struct jsonrpc_session *s)
             }
             reconnect_connected(s->reconnect, time_msec());
             s->rpc = jsonrpc_open(stream);
+            jsonrpc_set_backlog_threshold(s->rpc, s->max_n_msgs,
+                                                  s->max_backlog_bytes);
+            s->seqno++;
         } else if (error != EAGAIN) {
             reconnect_listen_error(s->reconnect, time_msec(), error);
             pstream_close(s->pstream);
@@ -942,9 +1057,13 @@ jsonrpc_session_run(struct jsonrpc_session *s)
         if (!error) {
             reconnect_connected(s->reconnect, time_msec());
             s->rpc = jsonrpc_open(s->stream);
+            jsonrpc_set_backlog_threshold(s->rpc, s->max_n_msgs,
+                                                  s->max_backlog_bytes);
             s->stream = NULL;
+            s->seqno++;
         } else if (error != EAGAIN) {
             reconnect_connect_failed(s->reconnect, time_msec(), error);
+            jsonrpc_session_pick_remote(s);
             stream_close(s->stream);
             s->stream = NULL;
             s->last_error = error;
@@ -1005,6 +1124,22 @@ jsonrpc_session_get_name(const struct jsonrpc_session *s)
     return reconnect_get_name(s->reconnect);
 }
 
+const char *
+jsonrpc_session_get_id(const struct jsonrpc_session *s)
+{
+    if (s->rpc && s->rpc->stream) {
+        return stream_get_peer_id(s->rpc->stream);
+    } else {
+        return NULL;
+    }
+}
+
+size_t
+jsonrpc_session_get_n_remotes(const struct jsonrpc_session *s)
+{
+    return s->remotes.n;
+}
+
 /* Always takes ownership of 'msg', regardless of success. */
 int
 jsonrpc_session_send(struct jsonrpc_session *s, struct jsonrpc_msg *msg)
@@ -1026,13 +1161,16 @@ jsonrpc_session_recv(struct jsonrpc_session *s)
 
         received_bytes = jsonrpc_get_received_bytes(s->rpc);
         jsonrpc_recv(s->rpc, &msg);
+
+        long long int now = time_msec();
+        reconnect_receive_attempted(s->reconnect, now);
         if (received_bytes != jsonrpc_get_received_bytes(s->rpc)) {
             /* Data was successfully received.
              *
              * Previously we only counted receiving a full message as activity,
              * but with large messages or a slow connection that policy could
              * time out the session mid-message. */
-            reconnect_activity(s->reconnect, time_msec());
+            reconnect_activity(s->reconnect, now);
         }
 
         if (msg) {
@@ -1044,7 +1182,7 @@ jsonrpc_session_recv(struct jsonrpc_session *s)
                 jsonrpc_session_send(s, reply);
             } else if (msg->type == JSONRPC_REPLY
                        && msg->id && msg->id->type == JSON_STRING
-                       && !strcmp(msg->id->u.string, "echo")) {
+                       && !strcmp(msg->id->string, "echo")) {
                 /* It's a reply to our echo request.  Suppress it. */
             } else {
                 return msg;
@@ -1147,6 +1285,9 @@ void
 jsonrpc_session_set_probe_interval(struct jsonrpc_session *s,
                                    int probe_interval)
 {
+    if (ovs_replay_is_active()) {
+        return;
+    }
     reconnect_set_probe_interval(s->reconnect, probe_interval);
 }
 
@@ -1162,5 +1303,20 @@ jsonrpc_session_set_dscp(struct jsonrpc_session *s, uint8_t dscp)
 
         s->dscp = dscp;
         jsonrpc_session_force_reconnect(s);
+    }
+}
+
+/* Sets thresholds for send backlog.  If send backlog contains more than
+ * 'max_n_msgs' messages or is larger than 'max_backlog_bytes' bytes,
+ * connection will be closed (then reconnected, if that feature is enabled). */
+void
+jsonrpc_session_set_backlog_threshold(struct jsonrpc_session *s,
+                                      size_t max_n_msgs,
+                                      size_t max_backlog_bytes)
+{
+    s->max_n_msgs = max_n_msgs;
+    s->max_backlog_bytes = max_backlog_bytes;
+    if (s->rpc) {
+        jsonrpc_set_backlog_threshold(s->rpc, max_n_msgs, max_backlog_bytes);
     }
 }

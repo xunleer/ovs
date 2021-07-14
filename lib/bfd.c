@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, 2014 Nicira, Inc.
+/* Copyright (c) 2013, 2014, 2015, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 #include "bfd.h"
 
 #include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netinet/in_systm.h>
 #include <netinet/ip.h>
@@ -26,18 +27,18 @@
 #include "csum.h"
 #include "dp-packet.h"
 #include "dpif.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "flow.h"
 #include "hash.h"
-#include "hmap.h"
-#include "list.h"
+#include "openvswitch/hmap.h"
+#include "openvswitch/list.h"
 #include "netdev.h"
 #include "odp-util.h"
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include "ovs-thread.h"
 #include "openvswitch/types.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "random.h"
 #include "seq.h"
 #include "smap.h"
@@ -146,6 +147,10 @@ BUILD_ASSERT_DECL(BFD_PACKET_LEN == sizeof(struct msg));
 #define VERS_SHIFT 5
 #define STATE_MASK 0xC0
 #define FLAGS_MASK 0x3f
+#define DEFAULT_MULT 3
+
+#define BFD_DEFAULT_SRC_IP 0xA9FE0101 /* 169.254.1.1 */
+#define BFD_DEFAULT_DST_IP 0xA9FE0100 /* 169.254.1.0 */
 
 struct bfd {
     struct hmap_node node;        /* In 'all_bfds'. */
@@ -155,6 +160,7 @@ struct bfd {
 
     bool cpath_down;              /* Concatenated Path Down. */
     uint8_t mult;                 /* bfd.DetectMult. */
+    uint8_t rmt_mult;             /* Remote bfd.DetectMult. */
 
     struct netdev *netdev;
     uint64_t rx_packets;          /* Packets received by 'netdev'. */
@@ -167,6 +173,8 @@ struct bfd {
 
     enum flags flags;             /* Flags sent on messages. */
     enum flags rmt_flags;         /* Flags last received. */
+
+    bool oam;                     /* Set tunnel OAM flag if applicable. */
 
     uint32_t rmt_disc;            /* bfd.RemoteDiscr. */
 
@@ -233,7 +241,7 @@ static struct ovs_mutex mutex = OVS_MUTEX_INITIALIZER;
 static struct hmap all_bfds__ = HMAP_INITIALIZER(&all_bfds__);
 static struct hmap *const all_bfds OVS_GUARDED_BY(mutex) = &all_bfds__;
 
-static bool bfd_lookup_ip(const char *host_name, struct in_addr *)
+static void bfd_lookup_ip(const char *host_name, ovs_be32 def, ovs_be32 *ip)
     OVS_REQUIRES(mutex);
 static bool bfd_forwarding__(struct bfd *) OVS_REQUIRES(mutex);
 static bool bfd_in_poll(const struct bfd *) OVS_REQUIRES(mutex);
@@ -321,11 +329,8 @@ bfd_get_status(const struct bfd *bfd, struct smap *smap)
     smap_add(smap, "state", bfd_state_str(bfd->state));
     smap_add(smap, "diagnostic", bfd_diag_str(bfd->diag));
     smap_add_format(smap, "flap_count", "%"PRIu64, bfd->flap_count);
-
-    if (bfd->state != STATE_DOWN) {
-        smap_add(smap, "remote_state", bfd_state_str(bfd->rmt_state));
-        smap_add(smap, "remote_diagnostic", bfd_diag_str(bfd->rmt_diag));
-    }
+    smap_add(smap, "remote_state", bfd_state_str(bfd->rmt_state));
+    smap_add(smap, "remote_diagnostic", bfd_diag_str(bfd->rmt_diag));
     ovs_mutex_unlock(&mutex);
 }
 
@@ -355,9 +360,6 @@ bfd_configure(struct bfd *bfd, const char *name, const struct smap *cfg,
     bool need_poll = false;
     bool cfg_min_rx_changed = false;
     bool cpath_down, forwarding_if_rx;
-    const char *hwaddr, *ip_src, *ip_dst;
-    struct in_addr in_addr;
-    struct eth_addr ea;
 
     if (!cfg || !smap_get_bool(cfg, "enable", false)) {
         bfd_unref(bfd);
@@ -374,7 +376,8 @@ bfd_configure(struct bfd *bfd, const char *name, const struct smap *cfg,
 
         bfd->diag = DIAG_NONE;
         bfd->min_tx = 1000;
-        bfd->mult = 3;
+        bfd->rmt_mult = 0;
+        bfd->mult = DEFAULT_MULT;
         ovs_refcount_init(&bfd->ref_cnt);
         bfd->netdev = netdev_ref(netdev);
         bfd->rx_packets = bfd_rx_packets(bfd);
@@ -392,6 +395,15 @@ bfd_configure(struct bfd *bfd, const char *name, const struct smap *cfg,
 
         bfd_status_changed(bfd);
     }
+
+    int old_mult = bfd->mult;
+    int new_mult = smap_get_int(cfg, "mult", DEFAULT_MULT);
+    if (new_mult < 1 || new_mult > 255) {
+        new_mult = DEFAULT_MULT;
+    }
+    bfd->mult = new_mult;
+
+    bfd->oam = smap_get_bool(cfg, "oam", false);
 
     atomic_store_relaxed(&bfd->check_tnl_key,
                          smap_get_bool(cfg, "check_tnl_key", false));
@@ -440,40 +452,17 @@ bfd_configure(struct bfd *bfd, const char *name, const struct smap *cfg,
         need_poll = true;
     }
 
-    hwaddr = smap_get(cfg, "bfd_local_src_mac");
-    if (hwaddr && eth_addr_from_string(hwaddr, &ea)) {
-        bfd->local_eth_src = ea;
-    } else {
-        bfd->local_eth_src = eth_addr_zero;
-    }
+    eth_addr_from_string(smap_get_def(cfg, "bfd_local_src_mac", ""),
+                         &bfd->local_eth_src);
+    eth_addr_from_string(smap_get_def(cfg, "bfd_local_dst_mac", ""),
+                         &bfd->local_eth_dst);
+    eth_addr_from_string(smap_get_def(cfg, "bfd_remote_dst_mac", ""),
+                         &bfd->rmt_eth_dst);
 
-    hwaddr = smap_get(cfg, "bfd_local_dst_mac");
-    if (hwaddr && eth_addr_from_string(hwaddr, &ea)) {
-        bfd->local_eth_dst = ea;
-    } else {
-        bfd->local_eth_dst = eth_addr_zero;
-    }
-
-    hwaddr = smap_get(cfg, "bfd_remote_dst_mac");
-    if (hwaddr && eth_addr_from_string(hwaddr, &ea)) {
-        bfd->rmt_eth_dst = ea;
-    } else {
-        bfd->rmt_eth_dst = eth_addr_zero;
-    }
-
-    ip_src = smap_get(cfg, "bfd_src_ip");
-    if (ip_src && bfd_lookup_ip(ip_src, &in_addr)) {
-        memcpy(&bfd->ip_src, &in_addr, sizeof in_addr);
-    } else {
-        bfd->ip_src = htonl(0xA9FE0101); /* 169.254.1.1. */
-    }
-
-    ip_dst = smap_get(cfg, "bfd_dst_ip");
-    if (ip_dst && bfd_lookup_ip(ip_dst, &in_addr)) {
-        memcpy(&bfd->ip_dst, &in_addr, sizeof in_addr);
-    } else {
-        bfd->ip_dst = htonl(0xA9FE0100); /* 169.254.1.0. */
-    }
+    bfd_lookup_ip(smap_get_def(cfg, "bfd_src_ip", ""),
+                  htonl(BFD_DEFAULT_SRC_IP), &bfd->ip_src);
+    bfd_lookup_ip(smap_get_def(cfg, "bfd_dst_ip", ""),
+                  htonl(BFD_DEFAULT_DST_IP), &bfd->ip_dst);
 
     forwarding_if_rx = smap_get_bool(cfg, "forwarding_if_rx", false);
     if (bfd->forwarding_if_rx != forwarding_if_rx) {
@@ -483,6 +472,9 @@ bfd_configure(struct bfd *bfd, const char *name, const struct smap *cfg,
         } else {
             bfd->forwarding_if_rx_detect_time = 0;
         }
+    } else if (bfd->state == STATE_UP && bfd->forwarding_if_rx
+               && old_mult != new_mult) {
+        bfd_forwarding_if_rx_update(bfd);
     }
 
     if (need_poll) {
@@ -589,7 +581,7 @@ bfd_should_send_packet(const struct bfd *bfd) OVS_EXCLUDED(mutex)
 
 void
 bfd_put_packet(struct bfd *bfd, struct dp_packet *p,
-               const struct eth_addr eth_src) OVS_EXCLUDED(mutex)
+               const struct eth_addr eth_src, bool *oam) OVS_EXCLUDED(mutex)
 {
     long long int min_tx, min_rx;
     struct udp_header *udp;
@@ -624,10 +616,11 @@ bfd_put_packet(struct bfd *bfd, struct dp_packet *p,
     ip->ip_ihl_ver = IP_IHL_VER(5, 4);
     ip->ip_tot_len = htons(sizeof *ip + sizeof *udp + sizeof *msg);
     ip->ip_ttl = MAXTTL;
-    ip->ip_tos = IPTOS_LOWDELAY | IPTOS_THROUGHPUT;
+    ip->ip_tos = IPTOS_PREC_INTERNETCONTROL;
     ip->ip_proto = IPPROTO_UDP;
     put_16aligned_be32(&ip->ip_src, bfd->ip_src);
     put_16aligned_be32(&ip->ip_dst, bfd->ip_dst);
+    /* Checksum has already been zeroed by put_zeros call. */
     ip->ip_csum = csum(ip, sizeof *ip);
 
     udp = dp_packet_put_zeros(p, sizeof *udp);
@@ -657,6 +650,7 @@ bfd_put_packet(struct bfd *bfd, struct dp_packet *p,
     msg->min_rx = htonl(min_rx * 1000);
 
     bfd->flags &= ~FLAG_FINAL;
+    *oam = bfd->oam;
 
     log_msg(VLL_DBG, msg, "Sending BFD Message", bfd);
 
@@ -681,19 +675,25 @@ bfd_should_process_flow(const struct bfd *bfd_, const struct flow *flow,
 
     if (flow->dl_type == htons(ETH_TYPE_IP)) {
         memset(&wc->masks.nw_proto, 0xff, sizeof wc->masks.nw_proto);
-        if (flow->nw_proto == IPPROTO_UDP) {
-            memset(&wc->masks.tp_dst, 0xff, sizeof wc->masks.tp_dst);
-            if (flow->tp_dst == htons(BFD_DEST_PORT)) {
-                bool check_tnl_key;
+        if (flow->nw_proto == IPPROTO_UDP
+            && !(flow->nw_frag & FLOW_NW_FRAG_LATER)
+            && tp_dst_equals(flow, BFD_DEST_PORT, wc)
+            && (bfd->ip_src == htonl(BFD_DEFAULT_SRC_IP)
+                || bfd->ip_src == flow->nw_dst)) {
 
-                atomic_read_relaxed(&bfd->check_tnl_key, &check_tnl_key);
-                if (check_tnl_key) {
-                    memset(&wc->masks.tunnel.tun_id, 0xff,
-                           sizeof wc->masks.tunnel.tun_id);
-                    return flow->tunnel.tun_id == htonll(0);
-                }
-                return true;
+            if (bfd->ip_src == flow->nw_dst) {
+                memset(&wc->masks.nw_dst, 0xffffffff, sizeof wc->masks.nw_dst);
             }
+
+            bool check_tnl_key;
+
+            atomic_read_relaxed(&bfd->check_tnl_key, &check_tnl_key);
+            if (check_tnl_key) {
+                memset(&wc->masks.tunnel.tun_id, 0xff,
+                       sizeof wc->masks.tunnel.tun_id);
+                return flow->tunnel.tun_id == htonll(0);
+            }
+            return true;
         }
     }
     return false;
@@ -828,6 +828,12 @@ bfd_process_packet(struct bfd *bfd, const struct flow *flow,
         bfd->flags |= FLAG_FINAL;
     }
 
+    if (bfd->rmt_mult != msg->mult) {
+        VLOG_INFO("Interface %s remote mult value %d changed to %d",
+                   bfd->name, bfd->rmt_mult, msg->mult);
+        bfd->rmt_mult = msg->mult;
+    }
+
     rmt_min_rx = MAX(ntohl(msg->min_rx) / 1000, 1);
     if (bfd->rmt_min_rx != rmt_min_rx) {
         bfd->rmt_min_rx = rmt_min_rx;
@@ -838,7 +844,7 @@ bfd_process_packet(struct bfd *bfd, const struct flow *flow,
     }
 
     bfd->rmt_min_tx = MAX(ntohl(msg->min_tx) / 1000, 1);
-    bfd->detect_time = bfd_rx_interval(bfd) * bfd->mult + time_msec();
+    bfd->detect_time = bfd_rx_interval(bfd) * bfd->rmt_mult + time_msec();
 
     if (bfd->state == STATE_ADMIN_DOWN) {
         VLOG_DBG_RL(&rl, "Administratively down, dropping control message.");
@@ -939,14 +945,16 @@ bfd_forwarding__(struct bfd *bfd) OVS_REQUIRES(mutex)
 }
 
 /* Helpers. */
-static bool
-bfd_lookup_ip(const char *host_name, struct in_addr *addr)
+static void
+bfd_lookup_ip(const char *host_name, ovs_be32 def, ovs_be32 *addr)
 {
-    if (!inet_pton(AF_INET, host_name, addr)) {
+    if (host_name[0]) {
+        if (ip_parse(host_name, addr)) {
+            return;
+        }
         VLOG_ERR_RL(&rl, "\"%s\" is not a valid IP address", host_name);
-        return false;
     }
-    return true;
+    *addr = def;
 }
 
 static bool
@@ -997,7 +1005,11 @@ static void
 bfd_set_next_tx(struct bfd *bfd) OVS_REQUIRES(mutex)
 {
     long long int interval = bfd_tx_interval(bfd);
-    interval -= interval * random_range(26) / 100;
+    if (bfd->mult == 1) {
+        interval -= interval * (10 + random_range(16)) / 100;
+    } else {
+        interval -= interval * random_range(26) / 100;
+    }
     bfd->next_tx = bfd->last_tx + interval;
 }
 
@@ -1076,19 +1088,19 @@ log_msg(enum vlog_level level, const struct msg *p, const char *message,
 {
     struct ds ds = DS_EMPTY_INITIALIZER;
 
-    if (vlog_should_drop(THIS_MODULE, level, &rl)) {
+    if (vlog_should_drop(&this_module, level, &rl)) {
         return;
     }
 
     ds_put_format(&ds,
                   "%s: %s."
-                  "\n\tvers:%"PRIu8" diag:\"%s\" state:%s mult:%"PRIu8
+                  "\n  vers:%d diag:\"%s\" state:%s mult:%"PRIu8
                   " length:%"PRIu8
-                  "\n\tflags: %s"
-                  "\n\tmy_disc:0x%"PRIx32" your_disc:0x%"PRIx32
-                  "\n\tmin_tx:%"PRIu32"us (%"PRIu32"ms)"
-                  "\n\tmin_rx:%"PRIu32"us (%"PRIu32"ms)"
-                  "\n\tmin_rx_echo:%"PRIu32"us (%"PRIu32"ms)",
+                  "\n  flags: %s"
+                  "\n  my_disc:0x%"PRIx32" your_disc:0x%"PRIx32
+                  "\n  min_tx:%"PRIu32"us (%"PRIu32"ms)"
+                  "\n  min_rx:%"PRIu32"us (%"PRIu32"ms)"
+                  "\n  min_rx_echo:%"PRIu32"us (%"PRIu32"ms)",
                   bfd->name, message, p->vers_diag >> VERS_SHIFT,
                   bfd_diag_str(p->vers_diag & DIAG_MASK),
                   bfd_state_str(p->flags & STATE_MASK),
@@ -1251,44 +1263,45 @@ bfd_find_by_name(const char *name) OVS_REQUIRES(mutex)
 static void
 bfd_put_details(struct ds *ds, const struct bfd *bfd) OVS_REQUIRES(mutex)
 {
-    ds_put_format(ds, "\tForwarding: %s\n",
+    ds_put_format(ds, "  Forwarding: %s\n",
                   bfd_forwarding__(CONST_CAST(struct bfd *, bfd))
                   ? "true" : "false");
-    ds_put_format(ds, "\tDetect Multiplier: %d\n", bfd->mult);
-    ds_put_format(ds, "\tConcatenated Path Down: %s\n",
+    ds_put_format(ds, "  Detect Multiplier: %d\n", bfd->mult);
+    ds_put_format(ds, "  Concatenated Path Down: %s\n",
                   bfd->cpath_down ? "true" : "false");
-    ds_put_format(ds, "\tTX Interval: Approx %lldms\n", bfd_tx_interval(bfd));
-    ds_put_format(ds, "\tRX Interval: Approx %lldms\n", bfd_rx_interval(bfd));
-    ds_put_format(ds, "\tDetect Time: now %+lldms\n",
-                  time_msec() - bfd->detect_time);
-    ds_put_format(ds, "\tNext TX Time: now %+lldms\n",
-                  time_msec() - bfd->next_tx);
-    ds_put_format(ds, "\tLast TX Time: now %+lldms\n",
-                  time_msec() - bfd->last_tx);
+    ds_put_format(ds, "  TX Interval: Approx %lldms\n", bfd_tx_interval(bfd));
+    ds_put_format(ds, "  RX Interval: Approx %lldms\n", bfd_rx_interval(bfd));
+    ds_put_format(ds, "  Detect Time: now %+lldms\n",
+                  bfd->detect_time - time_msec());
+    ds_put_format(ds, "  Next TX Time: now %+lldms\n",
+                  bfd->next_tx -time_msec());
+    ds_put_format(ds, "  Last TX Time: now %+lldms\n",
+                  bfd->last_tx - time_msec());
 
     ds_put_cstr(ds, "\n");
 
-    ds_put_format(ds, "\tLocal Flags: %s\n", bfd_flag_str(bfd->flags));
-    ds_put_format(ds, "\tLocal Session State: %s\n",
+    ds_put_format(ds, "  Local Flags: %s\n", bfd_flag_str(bfd->flags));
+    ds_put_format(ds, "  Local Session State: %s\n",
                   bfd_state_str(bfd->state));
-    ds_put_format(ds, "\tLocal Diagnostic: %s\n", bfd_diag_str(bfd->diag));
-    ds_put_format(ds, "\tLocal Discriminator: 0x%"PRIx32"\n", bfd->disc);
-    ds_put_format(ds, "\tLocal Minimum TX Interval: %lldms\n",
+    ds_put_format(ds, "  Local Diagnostic: %s\n", bfd_diag_str(bfd->diag));
+    ds_put_format(ds, "  Local Discriminator: 0x%"PRIx32"\n", bfd->disc);
+    ds_put_format(ds, "  Local Minimum TX Interval: %lldms\n",
                   bfd_min_tx(bfd));
-    ds_put_format(ds, "\tLocal Minimum RX Interval: %lldms\n", bfd->min_rx);
+    ds_put_format(ds, "  Local Minimum RX Interval: %lldms\n", bfd->min_rx);
 
     ds_put_cstr(ds, "\n");
 
-    ds_put_format(ds, "\tRemote Flags: %s\n", bfd_flag_str(bfd->rmt_flags));
-    ds_put_format(ds, "\tRemote Session State: %s\n",
+    ds_put_format(ds, "  Remote Flags: %s\n", bfd_flag_str(bfd->rmt_flags));
+    ds_put_format(ds, "  Remote Session State: %s\n",
                   bfd_state_str(bfd->rmt_state));
-    ds_put_format(ds, "\tRemote Diagnostic: %s\n",
+    ds_put_format(ds, "  Remote Diagnostic: %s\n",
                   bfd_diag_str(bfd->rmt_diag));
-    ds_put_format(ds, "\tRemote Discriminator: 0x%"PRIx32"\n", bfd->rmt_disc);
-    ds_put_format(ds, "\tRemote Minimum TX Interval: %lldms\n",
+    ds_put_format(ds, "  Remote Discriminator: 0x%"PRIx32"\n", bfd->rmt_disc);
+    ds_put_format(ds, "  Remote Minimum TX Interval: %lldms\n",
                   bfd->rmt_min_tx);
-    ds_put_format(ds, "\tRemote Minimum RX Interval: %lldms\n",
+    ds_put_format(ds, "  Remote Minimum RX Interval: %lldms\n",
                   bfd->rmt_min_rx);
+    ds_put_format(ds, "  Remote Detect Multiplier: %d\n", bfd->rmt_mult);
 }
 
 static void

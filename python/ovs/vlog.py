@@ -1,5 +1,5 @@
 
-# Copyright (c) 2011, 2012, 2013 Nicira, Inc.
+# Copyright (c) 2011, 2012, 2013, 2015, 2016 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,7 +51,7 @@ def get_level(level_str):
     return LEVELS.get(level_str.lower())
 
 
-class Vlog:
+class Vlog(object):
     __inited = False
     __msg_num = 0
     __start_time = 0
@@ -78,7 +78,7 @@ class Vlog:
         msg_num = Vlog.__msg_num
         Vlog.__msg_num += 1
 
-        for f, f_level in Vlog.__mfl[self.name].iteritems():
+        for f, f_level in Vlog.__mfl[self.name].items():
             f_level = LEVELS.get(f_level, logging.CRITICAL)
             if level_num >= f_level:
                 msg = self._build_message(message, f, level, msg_num)
@@ -130,16 +130,16 @@ class Vlog:
         matches = formatting.match(match)
         # Do we need to apply padding?
         if not matches.group(1) and replace != "":
-            replace = replace.center(len(replace)+2)
+            replace = replace.center(len(replace) + 2)
         # Does the field have a minimum width
         if matches.group(2):
             min_width = int(matches.group(2))
             if len(replace) < min_width:
                 replace = replace.center(min_width)
-        return re.sub(match, replace, tmp)
+        return re.sub(match, replace.replace('\\', r'\\'), tmp)
 
     def _format_time(self, tmp):
-        date_regex = re.compile('(%(0?[1-9]?[dD])(\{(.*)\})?)')
+        date_regex = re.compile(r'(%(0?[1-9]?[dD])(\{(.*)\})?)')
         match = date_regex.search(tmp)
 
         if match is None:
@@ -182,7 +182,7 @@ class Vlog:
 
     def __is_enabled(self, level):
         level = LEVELS.get(level.lower(), logging.DEBUG)
-        for f, f_level in Vlog.__mfl[self.name].iteritems():
+        for f, f_level in Vlog.__mfl[self.name].items():
             f_level = LEVELS.get(f_level, logging.CRITICAL)
             if level >= f_level:
                 return True
@@ -234,11 +234,20 @@ class Vlog:
                     Vlog.__file_handler = logging.FileHandler(Vlog.__log_file)
                     logger.addHandler(Vlog.__file_handler)
             except (IOError, socket.error):
-                logger.setLevel(logging.CRITICAL)
+                logger.disabled = True
 
         ovs.unixctl.command_register("vlog/reopen", "", 0, 0,
                                      Vlog._unixctl_vlog_reopen, None)
-        ovs.unixctl.command_register("vlog/set", "spec", 1, sys.maxint,
+        ovs.unixctl.command_register("vlog/close", "", 0, 0,
+                                     Vlog._unixctl_vlog_close, None)
+        try:
+            # Windows limitation on Python 2, sys.maxsize is a long number
+            # on 64 bits environments, while sys.maxint is the maximum int
+            # number. Python 3 works as expected.
+            maxsize_int = sys.maxint
+        except AttributeError:
+            maxsize_int = sys.maxsize
+        ovs.unixctl.command_register("vlog/set", "spec", 1, maxsize_int,
                                      Vlog._unixctl_vlog_set, None)
         ovs.unixctl.command_register("vlog/list", "", 0, 0,
                                      Vlog._unixctl_vlog_list, None)
@@ -264,12 +273,12 @@ class Vlog:
             return
 
         if module == "any":
-            modules = Vlog.__mfl.keys()
+            modules = list(Vlog.__mfl.keys())
         else:
             modules = [module]
 
         if destination == "any":
-            destinations = DESTINATIONS.keys()
+            destinations = list(DESTINATIONS.keys())
         else:
             destinations = [destination]
 
@@ -293,20 +302,24 @@ class Vlog:
             return
 
         logger = logging.getLogger('syslog')
-        # If there is no infrastructure to support python syslog, increase
-        # the logging severity level to avoid repeated errors.
-        if not os.path.exists("/dev/log"):
-            logger.setLevel(logging.CRITICAL)
+        # Disable the logger if the "null" syslog method requested
+        # by environment.
+        if os.environ.get('OVS_SYSLOG_METHOD') == "null":
+            logger.disabled = True
             return
+
+        if facility is None:
+            facility = syslog_facility
+
+        new_handler = logging.handlers.SysLogHandler(address="/dev/log",
+                                                     facility=facility)
 
         if syslog_handler:
             logger.removeHandler(syslog_handler)
 
-        if facility:
-            syslog_facility = facility
+        syslog_handler = new_handler
+        syslog_facility = facility
 
-        syslog_handler = logging.handlers.SysLogHandler(address="/dev/log",
-                                                    facility=syslog_facility)
         logger.addHandler(syslog_handler)
         return
 
@@ -330,7 +343,11 @@ class Vlog:
                 return "Please supply a valid pattern and destination"
         elif words[0] == "FACILITY":
             if words[1] in FACILITIES:
-                Vlog.add_syslog_handler(words[1])
+                try:
+                    Vlog.add_syslog_handler(words[1])
+                except (IOError, socket.error):
+                    logger = logging.getLogger('syslog')
+                    logger.disabled = True
                 return
             else:
                 return "Facility %s is invalid" % words[1]
@@ -379,12 +396,32 @@ class Vlog:
             logger.addHandler(Vlog.__file_handler)
 
     @staticmethod
+    def close_log_file():
+        """Closes the current log file. (This is useful on Windows, to ensure
+        that a reference to the file is not kept by the daemon in case of
+        detach.)"""
+        if Vlog.__log_file:
+            logger = logging.getLogger("file")
+            logger.removeHandler(Vlog.__file_handler)
+            Vlog.__file_handler.close()
+
+    @staticmethod
     def _unixctl_vlog_reopen(conn, unused_argv, unused_aux):
         if Vlog.__log_file:
             Vlog.reopen_log_file()
             conn.reply(None)
         else:
             conn.reply("Logging to file not configured")
+
+    @staticmethod
+    def _unixctl_vlog_close(conn, unused_argv, unused_aux):
+        if Vlog.__log_file:
+            if sys.platform != 'win32':
+                logger = logging.getLogger("file")
+                logger.removeHandler(Vlog.__file_handler)
+            else:
+                Vlog.close_log_file()
+        conn.reply(None)
 
     @staticmethod
     def _unixctl_vlog_set(conn, argv, unused_aux):

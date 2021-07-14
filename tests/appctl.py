@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import argparse
-import signal
 import sys
 
 import ovs.daemon
@@ -21,6 +20,7 @@ import ovs.unixctl
 import ovs.unixctl.client
 import ovs.util
 import ovs.vlog
+from ovs.fatal_signal import signal_alarm
 
 
 def connect_to_target(target):
@@ -51,8 +51,7 @@ def main():
                         help="wait at most SECS seconds for a response")
     args = parser.parse_args()
 
-    if args.timeout:
-        signal.alarm(int(args.timeout))
+    signal_alarm(int(args.timeout) if args.timeout else None)
 
     ovs.vlog.Vlog.init()
     target = args.target

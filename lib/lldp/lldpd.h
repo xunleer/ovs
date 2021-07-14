@@ -19,15 +19,13 @@
 #ifndef _LLDPD_H
 #define _LLDPD_H
 
-#ifndef _WIN32
+#include <sys/types.h>
 #include <netinet/in.h>
-#endif
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
-#include <sys/types.h>
 #include "dp-packet.h"
-#include "list.h"
+#include "openvswitch/list.h"
 #include "lldpd-structs.h"
 #include "lldp-tlv.h"
 #include "packets.h"
@@ -71,14 +69,14 @@ struct lldpd {
 static inline struct lldpd_hardware *
 lldpd_first_hardware(struct lldpd *lldpd)
 {
-    return CONTAINER_OF(list_front(&lldpd->g_hardware),
+    return CONTAINER_OF(ovs_list_front(&lldpd->g_hardware),
                         struct lldpd_hardware, h_entries);
 }
 
 /* lldpd.c */
 struct lldpd_hardware *lldpd_get_hardware(struct lldpd *,
     char *, int, struct lldpd_ops *);
-struct lldpd_hardware *lldpd_alloc_hardware(struct lldpd *, char *, int);
+struct lldpd_hardware *lldpd_alloc_hardware(struct lldpd *, const char *, int);
 void lldpd_hardware_cleanup(struct lldpd*, struct lldpd_hardware *);
 struct lldpd_mgmt *lldpd_alloc_mgmt(int family, void *addr, size_t addrsize,
     u_int32_t iface);

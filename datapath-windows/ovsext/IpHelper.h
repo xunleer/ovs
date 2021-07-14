@@ -19,6 +19,7 @@
 
 #include <ntddk.h>
 #include <netioapi.h>
+#include "Vport.h"
 
 #define OVS_FWD_HASH_TABLE_SIZE ((UINT32)1 << 10)
 #define OVS_FWD_HASH_TABLE_MASK (OVS_FWD_HASH_TABLE_SIZE - 1)
@@ -31,16 +32,44 @@
 
 #define OVS_IPNEIGH_TIMEOUT 100000000   // 10 s
 
+ /*
+ * This structure is used to define each adapter instance.
+ *
+ * Note:
+ * Only when the internal IP is configured and virtual
+ * internal port is connected, the IP helper request can be
+ * queued.
+ *
+ * We only keep internal IP for reference, it will not be used for determining
+ * SRC IP of the Tunnel.
+ *
+ * The lock must not raise the IRQL higher than PASSIVE_LEVEL in order for the
+ * route manipulation functions, i.e. GetBestRoute, to work.
+ */
+typedef struct _OVS_IPHELPER_INSTANCE
+{
+    LIST_ENTRY          link;
+
+    BOOLEAN             isIpConfigured;
+    UINT32              portNo;
+    GUID                netCfgId;
+    MIB_IF_ROW2         internalRow;
+    MIB_IPINTERFACE_ROW internalIPRow;
+    UINT32              ipAddress;
+
+    ERESOURCE           lock;
+} OVS_IPHELPER_INSTANCE, *POVS_IPHELPER_INSTANCE;
 
 typedef struct _OVS_IPNEIGH_ENTRY {
-    UINT8             macAddr[ETH_ADDR_LEN];
-    UINT16            refCount;
-    UINT32            ipAddr;
-    UINT32            pad;
-    UINT64            timeout;
-    LIST_ENTRY        link;
-    LIST_ENTRY        slink;
-    LIST_ENTRY        fwdList;
+    UINT8                       macAddr[ETH_ADDR_LEN];
+    UINT16                      refCount;
+    UINT32                      ipAddr;
+    UINT32                      pad;
+    UINT64                      timeout;
+    LIST_ENTRY                  link;
+    LIST_ENTRY                  slink;
+    LIST_ENTRY                  fwdList;
+    POVS_IPHELPER_INSTANCE      instance;
 } OVS_IPNEIGH_ENTRY, *POVS_IPNEIGH_ENTRY;
 
 typedef struct _OVS_IPFORWARD_ENTRY {
@@ -51,15 +80,16 @@ typedef struct _OVS_IPFORWARD_ENTRY {
     LIST_ENTRY        fwdList;
 } OVS_IPFORWARD_ENTRY, *POVS_IPFORWARD_ENTRY;
 
-typedef union  _OVS_FWD_INFO {
+typedef union _OVS_FWD_INFO {
     struct {
         UINT32        dstIpAddr;
         UINT32        srcIpAddr;
         UINT8         dstMacAddr[ETH_ADDR_LEN];
         UINT8         srcMacAddr[ETH_ADDR_LEN];
         UINT32        srcPortNo;
+        POVS_VPORT_ENTRY   vport;
     };
-    UINT64            value[3];
+    UINT64            value[4];
 } OVS_FWD_INFO, *POVS_FWD_INFO;
 
 typedef struct _OVS_FWD_ENTRY {
@@ -74,6 +104,7 @@ typedef struct _OVS_FWD_ENTRY {
 
 enum {
     OVS_IP_HELPER_INTERNAL_ADAPTER_UP,
+    OVS_IP_HELPER_INTERNAL_ADAPTER_DOWN,
     OVS_IP_HELPER_FWD_REQUEST,
 };
 
@@ -94,13 +125,17 @@ typedef struct _OVS_FWD_REQUEST_INFO {
     PVOID             cbData2;
 } OVS_FWD_REQUEST_INFO, *POVS_FWD_REQUEST_INFO;
 
+typedef struct _OVS_INSTANCE_REQUEST_INFO {
+    GUID              netCfgInstanceId;
+    UINT32            portNo;
+} OVS_INSTANCE_REQUEST_INFO, *POVS_INSTANCE_REQUEST_INFO;
 
 typedef struct _OVS_IP_HELPER_REQUEST {
     LIST_ENTRY        link;
     UINT32            command;
     union {
-        OVS_FWD_REQUEST_INFO    fwdReq;
-        UINT32                  dummy;
+        OVS_FWD_REQUEST_INFO        fwdReq;
+        OVS_INSTANCE_REQUEST_INFO   instanceReq;
     };
 } OVS_IP_HELPER_REQUEST, *POVS_IP_HELPER_REQUEST;
 
@@ -115,14 +150,14 @@ NTSTATUS OvsInitIpHelper(NDIS_HANDLE ndisFilterHandle);
 VOID OvsCleanupIpHelper(VOID);
 
 VOID OvsInternalAdapterUp(UINT32 portNo, GUID *netCfgInstanceId);
-VOID OvsInternalAdapterDown(VOID);
+VOID OvsInternalAdapterDown(UINT32 portNo, GUID netCfgInstanceId);
 
 NTSTATUS OvsFwdIPHelperRequest(PNET_BUFFER_LIST nbl, UINT32 inPort,
                                const PVOID tunnelKey,
                                OvsIPHelperCallback cb,
                                PVOID cbData1,
                                PVOID cbData2);
-NTSTATUS OvsLookupIPFwdInfo(UINT32 dstIp, POVS_FWD_INFO info);
+NTSTATUS OvsLookupIPFwdInfo(UINT32 srcIp, UINT32 dstIp, POVS_FWD_INFO info);
 VOID OvsCancelFwdIpHelperRequest(PNET_BUFFER_LIST nbl);
 
 #endif /* __IP_HELPER_H_ */

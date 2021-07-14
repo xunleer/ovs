@@ -27,6 +27,7 @@
 
 typedef unsigned short int sa_family_t;
 typedef __socklen_t socklen_t;
+struct timespec;
 
 struct sockaddr {
     sa_family_t sa_family;
@@ -75,6 +76,11 @@ __cmsg_nxthdr(struct msghdr *msg, struct cmsghdr *cmsg)
             : NULL);
 }
 
+struct mmsghdr {
+    struct msghdr msg_hdr;
+    unsigned int msg_len;
+};
+
 enum {
     SCM_RIGHTS = 1
 };
@@ -121,7 +127,8 @@ enum {
     MSG_PEEK,
     MSG_TRUNC,
     MSG_WAITALL,
-    MSG_DONTWAIT
+    MSG_DONTWAIT,
+    MSG_WAITFORONE
 };
 
 enum {
@@ -157,6 +164,8 @@ ssize_t recvfrom(int, void *, size_t, int, struct sockaddr *, socklen_t *);
 ssize_t recvmsg(int, struct msghdr *, int);
 ssize_t send(int, const void *, size_t, int);
 ssize_t sendmsg(int, const struct msghdr *, int);
+int sendmmsg(int, struct mmsghdr *, unsigned int, unsigned int);
+int recvmmsg(int, struct mmsghdr *, unsigned int, int, struct timespec *);
 ssize_t sendto(int, const void *, size_t, int, const struct sockaddr *,
                socklen_t);
 int setsockopt(int, int, int, const void *, socklen_t);

@@ -18,6 +18,7 @@
 #define STREAM_PROVIDER_H 1
 
 #include <sys/types.h>
+#include "ovs-replay.h"
 #include "stream.h"
 
 /* Active stream connection. */
@@ -29,11 +30,13 @@ struct stream {
     const struct stream_class *class;
     int state;
     int error;
+    replay_file_t replay_wfd;
     char *name;
+    char *peer_id;
 };
 
 void stream_init(struct stream *, const struct stream_class *,
-                 int connect_status, const char *name);
+                 int connect_status, char *name);
 static inline void stream_assert_class(const struct stream *stream,
                                        const struct stream_class *class)
 {
@@ -132,9 +135,10 @@ struct pstream {
     const struct pstream_class *class;
     char *name;
     ovs_be16 bound_port;
+    replay_file_t replay_wfd;
 };
 
-void pstream_init(struct pstream *, const struct pstream_class *, const char *name);
+void pstream_init(struct pstream *, const struct pstream_class *, char *name);
 void pstream_set_bound_port(struct pstream *, ovs_be16 bound_port);
 static inline void pstream_assert_class(const struct pstream *pstream,
                                         const struct pstream_class *class)
@@ -199,5 +203,7 @@ extern const struct pstream_class pwindows_pstream_class;
 extern const struct stream_class ssl_stream_class;
 extern const struct pstream_class pssl_pstream_class;
 #endif
+extern const struct stream_class replay_stream_class;
+extern const struct pstream_class preplay_pstream_class;
 
 #endif /* stream-provider.h */

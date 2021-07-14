@@ -14,8 +14,8 @@
 
 import os
 
-import ovs.vlog
 import ovs.util
+import ovs.vlog
 
 # Values returned by Reconnect.run()
 CONNECT = 'connect'
@@ -95,7 +95,10 @@ class Reconnect(object):
         def deadline(fsm):
             if fsm.probe_interval:
                 base = max(fsm.last_activity, fsm.state_entered)
-                return base + fsm.probe_interval
+                expiration = base + fsm.probe_interval
+                if (fsm.last_receive_attempt is None or
+                    fsm.last_receive_attempt >= expiration):
+                    return expiration
             return None
 
         @staticmethod
@@ -113,7 +116,10 @@ class Reconnect(object):
         @staticmethod
         def deadline(fsm):
             if fsm.probe_interval:
-                return fsm.state_entered + fsm.probe_interval
+                expiration = fsm.state_entered + fsm.probe_interval
+                if (fsm.last_receive_attempt is None or
+                    fsm.last_receive_attempt >= expiration):
+                    return expiration
             return None
 
         @staticmethod
@@ -153,7 +159,9 @@ class Reconnect(object):
         self.last_activity = now
         self.last_connected = None
         self.last_disconnected = None
+        self.last_receive_attempt = now
         self.max_tries = None
+        self.backoff_free_tries = 0
 
         self.creation_time = now
         self.n_attempted_connections = 0
@@ -240,7 +248,13 @@ class Reconnect(object):
 
         if (self.state == Reconnect.Backoff and
             self.backoff > self.max_backoff):
-                self.backoff = self.max_backoff
+            self.backoff = self.max_backoff
+
+    def set_backoff_free_tries(self, backoff_free_tries):
+        """Sets the number of connection attempts that will be made without
+        backoff to 'backoff_free_tries'.  Values 0 and 1 both
+        represent a single attempt."""
+        self.backoff_free_tries = backoff_free_tries
 
     def set_probe_interval(self, probe_interval):
         """Sets the "probe interval" to 'probe_interval', in milliseconds.  If
@@ -337,7 +351,10 @@ class Reconnect(object):
                 else:
                     self.info_level("%s: error listening for connections"
                                     % self.name)
-            else:
+            elif self.state == Reconnect.Reconnect:
+                self.info_level("%s: connection closed by client"
+                                % self.name)
+            elif self.backoff < self.max_backoff:
                 if self.passive:
                     type_ = "listen"
                 else:
@@ -352,8 +369,15 @@ class Reconnect(object):
             if (self.state in (Reconnect.Active, Reconnect.Idle)):
                 self.last_disconnected = now
 
+            if not self.__may_retry():
+                self._transition(now, Reconnect.Void)
+                return
+
             # Back off
-            if (self.state in (Reconnect.Active, Reconnect.Idle) and
+            if self.backoff_free_tries > 1:
+                self.backoff_free_tries -= 1
+                self.backoff = 0
+            elif (self.state in (Reconnect.Active, Reconnect.Idle) and
                 (self.last_activity - self.last_connected >= self.backoff or
                  self.passive)):
                 if self.passive:
@@ -363,23 +387,26 @@ class Reconnect(object):
             else:
                 if self.backoff < self.min_backoff:
                     self.backoff = self.min_backoff
-                elif self.backoff >= self.max_backoff / 2:
-                    self.backoff = self.max_backoff
-                else:
+                elif self.backoff < self.max_backoff / 2:
                     self.backoff *= 2
-
-                if self.passive:
-                    self.info_level("%s: waiting %.3g seconds before trying "
-                                    "to listen again"
-                                    % (self.name, self.backoff / 1000.0))
+                    if self.passive:
+                        action = "trying to listen again"
+                    else:
+                        action = "reconnect"
+                    self.info_level("%s: waiting %.3g seconds before %s"
+                                    % (self.name, self.backoff / 1000.0,
+                                       action))
                 else:
-                    self.info_level("%s: waiting %.3g seconds before reconnect"
-                                    % (self.name, self.backoff / 1000.0))
-
-            if self.__may_retry():
-                self._transition(now, Reconnect.Backoff)
-            else:
-                self._transition(now, Reconnect.Void)
+                    if self.backoff < self.max_backoff:
+                        if self.passive:
+                            action = "try to listen"
+                        else:
+                            action = "reconnect"
+                        self.info_level("%s: continuing to %s in the "
+                                        "background but suppressing further "
+                                        "logging" % (self.name, action))
+                    self.backoff = self.max_backoff
+            self._transition(now, Reconnect.Backoff)
 
     def connecting(self, now):
         """Tell this FSM that a connection or listening attempt is in progress.
@@ -390,7 +417,7 @@ class Reconnect(object):
         if self.state != Reconnect.ConnectInProgress:
             if self.passive:
                 self.info_level("%s: listening..." % self.name)
-            else:
+            elif self.backoff < self.max_backoff:
                 self.info_level("%s: connecting..." % self.name)
             self._transition(now, Reconnect.ConnectInProgress)
 
@@ -451,6 +478,16 @@ class Reconnect(object):
         if self.state != Reconnect.Active:
             self._transition(now, Reconnect.Active)
         self.last_activity = now
+
+    def receive_attempted(self, now):
+        """Tell 'fsm' that some attempt to receive data on the connection was
+        made at 'now'.  The FSM only allows probe interval timer to expire when
+        some attempt to receive data on the connection was received after the
+        time when it should have expired.  This helps in the case where there's
+        a long delay in the poll loop and then reconnect_run() executes before
+        the code to try to receive anything from the remote runs.  (To disable
+        this feature, pass None for 'now'.)"""
+        self.last_receive_attempt = now
 
     def _transition(self, now, state):
         if self.state == Reconnect.ConnectInProgress:
@@ -518,7 +555,7 @@ class Reconnect(object):
         """Causes the next call to poller.block() to wake up when self.run()
         should be called."""
         timeout = self.timeout(now)
-        if timeout >= 0:
+        if timeout is not None and timeout >= 0:
             poller.timer_wait(timeout)
 
     def timeout(self, now):

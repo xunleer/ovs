@@ -1,4 +1,4 @@
-#! @PYTHON@
+#! @PYTHON3@
 #
 # Copyright (c) 2010 Nicira, Inc.
 #
@@ -19,8 +19,10 @@ import getopt
 import struct
 import sys
 
+
 class PcapException(Exception):
     pass
+
 
 class PcapReader(object):
     def __init__(self, file_name):
@@ -30,13 +32,14 @@ class PcapReader(object):
             raise PcapException("end of file reading pcap header")
         magic, version, thiszone, sigfigs, snaplen, network = \
             struct.unpack(">6I", header)
-        if magic == 0xa1b2c3d4:
+        if magic == 0xa1b2c3d4 or magic == 0xa1b23c4d:
             self.header_format = ">4I"
-        elif magic == 0xd4c3b2a1:
+        elif magic == 0xd4c3b2a1 or magic == 0x4d3cb2a1:
             self.header_format = "<4I"
         else:
             raise PcapException("bad magic %u reading pcap file "
-                        "(expected 0xa1b2c3d4 or 0xd4c3b2a1)" % magic)
+                        "(expected 0xa1b2c3d4, 0xa1b23c4d, 0x4d3cb2a1 or "
+                        "0xd4c3b2a1)" % magic)
 
     def read(self):
         header = self.file.read(16)
@@ -51,10 +54,13 @@ class PcapReader(object):
         if len(packet) != incl_len:
             raise PcapException("end of file reading pcap packet data")
         return packet
+
+
 argv0 = sys.argv[0]
 
+
 def usage():
-    print """\
+    print("""\
 %(argv0)s: print pcap file packet data as hex
 usage: %(argv0)s FILE
 where FILE is a PCAP file.
@@ -62,15 +68,16 @@ where FILE is a PCAP file.
 The following options are also available:
   -h, --help                  display this help message
   -V, --version               display version information\
-""" % {'argv0': argv0}
+""" % {'argv0': argv0})
     sys.exit(0)
+
 
 if __name__ == "__main__":
     try:
         try:
             options, args = getopt.gnu_getopt(sys.argv[1:], 'hV',
                                               ['help', 'version'])
-        except getopt.GetoptException, geo:
+        except getopt.GetoptError as geo:
             sys.stderr.write("%s: %s\n" % (argv0, geo.msg))
             sys.exit(1)
 
@@ -78,7 +85,7 @@ if __name__ == "__main__":
             if key in ['-h', '--help']:
                 usage()
             elif key in ['-V', '--version']:
-                print "ovs-pcap (Open vSwitch) @VERSION@"
+                print("ovs-pcap (Open vSwitch) @VERSION@")
             else:
                 sys.exit(0)
 
@@ -93,9 +100,9 @@ if __name__ == "__main__":
             if packet is None:
                 break
 
-            print binascii.hexlify(packet)
+            print(binascii.hexlify(packet).decode().strip())
 
-    except PcapException, e:
+    except PcapException as e:
         sys.stderr.write("%s: %s\n" % (argv0, e))
         sys.exit(1)
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2008-2019 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,13 @@
  */
 
 #include <config.h>
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <sys/socket.h>
 #include <net/if.h>
-#include <netinet/in.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,27 +29,34 @@
 
 #include "command-line.h"
 #include "compiler.h"
+#include "ct-dpif.h"
 #include "dirs.h"
 #include "dpctl.h"
 #include "dpif.h"
-#include "dynamic-string.h"
+#include "dpif-provider.h"
+#include "openvswitch/dynamic-string.h"
 #include "flow.h"
-#include "match.h"
+#include "openvswitch/match.h"
 #include "netdev.h"
-#include "netdev-dpdk.h"
 #include "netlink.h"
 #include "odp-util.h"
-#include "ofp-parse.h"
-#include "ofpbuf.h"
-#include "ovs-numa.h"
+#include "openvswitch/ofpbuf.h"
 #include "packets.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "simap.h"
 #include "smap.h"
 #include "sset.h"
 #include "timeval.h"
 #include "unixctl.h"
 #include "util.h"
+#include "openvswitch/ofp-flow.h"
+#include "openvswitch/ofp-port.h"
+
+enum {
+    DPCTL_FLOWS_ADD = 0,
+    DPCTL_FLOWS_DEL,
+    DPCTL_FLOWS_MOD
+};
 
 typedef int dpctl_command_handler(int argc, const char *argv[],
                                   struct dpctl_params *);
@@ -58,6 +66,7 @@ struct dpctl_command {
     int min_args;
     int max_args;
     dpctl_command_handler *handler;
+    enum { DP_RO, DP_RW} mode;
 };
 static const struct dpctl_command *get_all_dpctl_commands(void);
 static void dpctl_print(struct dpctl_params *dpctl_p, const char *fmt, ...)
@@ -126,8 +135,8 @@ if_up(struct netdev *netdev)
 }
 
 /* Retrieve the name of the datapath if exactly one exists.  The caller
- * is responsible for freeing the returned string.  If there is not one
- * datapath, aborts with an error message. */
+ * is responsible for freeing the returned string.  If a single datapath
+ * name cannot be determined, returns NULL. */
 static char *
 get_one_dp(struct dpctl_params *dpctl_p)
 {
@@ -180,6 +189,68 @@ parsed_dpif_open(const char *arg_, bool create, struct dpif **dpifp)
     free(name);
     free(type);
     return result;
+}
+
+static bool
+dp_exists(const char *queried_dp)
+{
+    char *queried_name, *queried_type;
+    dp_parse_name(queried_dp, &queried_name, &queried_type);
+    struct sset dpif_names = SSET_INITIALIZER(&dpif_names),
+                dpif_types = SSET_INITIALIZER(&dpif_types);
+    dp_enumerate_types(&dpif_types);
+
+    bool found = (sset_contains(&dpif_types, queried_type) &&
+                  !dp_enumerate_names(queried_type, &dpif_names) &&
+                  sset_contains(&dpif_names, queried_name));
+
+    sset_destroy(&dpif_names);
+    sset_destroy(&dpif_types);
+    free(queried_name);
+    free(queried_type);
+    return found;
+}
+
+static bool
+dp_arg_exists(int argc, const char *argv[])
+{
+    return argc > 1 && dp_exists(argv[1]);
+}
+
+/* Open a dpif with an optional name argument.
+ *
+ * The datapath name is not a mandatory parameter for this command.  If it is
+ * not specified, we retrieve it from the current setup, assuming only one
+ * exists.  On success stores the opened dpif in '*dpifp'.  */
+static int
+opt_dpif_open(int argc, const char *argv[], struct dpctl_params *dpctl_p,
+              int max_args, struct dpif **dpifp)
+{
+    char *dpname;
+
+    if (dp_arg_exists(argc, argv)) {
+        dpname = xstrdup(argv[1]);
+    } else if (argc != max_args) {
+        dpname = get_one_dp(dpctl_p);
+    } else {
+        /* If the arguments are the maximum possible number and there is no
+         * valid datapath argument, then we fall into the case of dpname is
+         * NULL, since this is an error. */
+        dpname = NULL;
+    }
+
+    int error = 0;
+    if (!dpname) {
+        error = EINVAL;
+        dpctl_error(dpctl_p, error, "datapath not found");
+    } else {
+        error = parsed_dpif_open(dpname, false, dpifp);
+        free(dpname);
+        if (error) {
+            dpctl_error(dpctl_p, error, "opening datapath");
+        }
+    }
+    return error;
 }
 
 static int
@@ -333,7 +404,8 @@ dpctl_set_if(int argc, const char *argv[], struct dpctl_params *dpctl_p)
         struct smap args;
         odp_port_t port_no;
         char *option;
-        int error = 0;
+
+        error = 0;
 
         argcopy = xstrdup(argv[i]);
         name = strtok_r(argcopy, ",", &save_ptr);
@@ -468,7 +540,7 @@ dpctl_del_if(int argc, const char *argv[], struct dpctl_params *dpctl_p)
             continue;
         }
 
-        error = dpif_port_del(dpif, port);
+        error = dpif_port_del(dpif, port, false);
         if (error) {
             dpctl_error(dpctl_p, error, "deleting port %s from %s failed",
                         name, argv[1]);
@@ -507,6 +579,18 @@ print_human_size(struct dpctl_params *dpctl_p, uint64_t value)
     }
 }
 
+/* qsort comparison function. */
+static int
+compare_port_nos(const void *a_, const void *b_)
+{
+    const odp_port_t *ap = a_;
+    const odp_port_t *bp = b_;
+    uint32_t a = odp_to_u32(*ap);
+    uint32_t b = odp_to_u32(*bp);
+
+    return a < b ? -1 : a > b;
+}
+
 static void
 show_dpif(struct dpif *dpif, struct dpctl_params *dpctl_p)
 {
@@ -517,21 +601,41 @@ show_dpif(struct dpif *dpif, struct dpctl_params *dpctl_p)
 
     dpctl_print(dpctl_p, "%s:\n", dpif_name(dpif));
     if (!dpif_get_dp_stats(dpif, &stats)) {
-        dpctl_print(dpctl_p, "\tlookups: hit:%"PRIu64" missed:%"PRIu64
-                             " lost:%"PRIu64"\n\tflows: %"PRIu64"\n",
+        dpctl_print(dpctl_p, "  lookups: hit:%"PRIu64" missed:%"PRIu64
+                             " lost:%"PRIu64"\n  flows: %"PRIu64"\n",
                     stats.n_hit, stats.n_missed, stats.n_lost, stats.n_flows);
         if (stats.n_masks != UINT32_MAX) {
             uint64_t n_pkts = stats.n_hit + stats.n_missed;
             double avg = n_pkts ? (double) stats.n_mask_hit / n_pkts : 0.0;
 
-            dpctl_print(dpctl_p, "\tmasks: hit:%"PRIu64" total:%"PRIu32
+            dpctl_print(dpctl_p, "  masks: hit:%"PRIu64" total:%"PRIu32
                                  " hit/pkt:%.2f\n",
                         stats.n_mask_hit, stats.n_masks, avg);
         }
     }
 
+    odp_port_t *port_nos = NULL;
+    size_t allocated_port_nos = 0, n_port_nos = 0;
     DPIF_PORT_FOR_EACH (&dpif_port, &dump, dpif) {
-        dpctl_print(dpctl_p, "\tport %u: %s",
+        if (n_port_nos >= allocated_port_nos) {
+            port_nos = x2nrealloc(port_nos, &allocated_port_nos,
+                                  sizeof *port_nos);
+        }
+
+        port_nos[n_port_nos] = dpif_port.port_no;
+        n_port_nos++;
+    }
+
+    if (port_nos) {
+        qsort(port_nos, n_port_nos, sizeof *port_nos, compare_port_nos);
+    }
+
+    for (int i = 0; i < n_port_nos; i++) {
+        if (dpif_port_query_by_number(dpif, port_nos[i], &dpif_port)) {
+            continue;
+        }
+
+        dpctl_print(dpctl_p, "  port %u: %s",
                     dpif_port.port_no, dpif_port.name);
 
         if (strcmp(dpif_port.type, "system")) {
@@ -546,13 +650,10 @@ show_dpif(struct dpif *dpif, struct dpctl_params *dpctl_p)
                 smap_init(&config);
                 error = netdev_get_config(netdev, &config);
                 if (!error) {
-                    const struct smap_node **nodes;
-                    size_t i;
-
-                    nodes = smap_sort(&config);
-                    for (i = 0; i < smap_count(&config); i++) {
-                        const struct smap_node *node = nodes[i];
-                        dpctl_print(dpctl_p, "%c %s=%s", i ? ',' : ':',
+                    const struct smap_node **nodes = smap_sort(&config);
+                    for (size_t j = 0; j < smap_count(&config); j++) {
+                        const struct smap_node *node = nodes[j];
+                        dpctl_print(dpctl_p, "%c %s=%s", j ? ',' : ':',
                                     node->key, node->value);
                     }
                     free(nodes);
@@ -579,29 +680,30 @@ show_dpif(struct dpif *dpif, struct dpctl_params *dpctl_p)
             if (error) {
                 dpctl_print(dpctl_p, ", open failed (%s)",
                             ovs_strerror(error));
+                dpif_port_destroy(&dpif_port);
                 continue;
             }
             error = netdev_get_stats(netdev, &s);
             if (!error) {
                 netdev_close(netdev);
-                print_stat(dpctl_p, "\t\tRX packets:", s.rx_packets);
+                print_stat(dpctl_p, "    RX packets:", s.rx_packets);
                 print_stat(dpctl_p, " errors:", s.rx_errors);
                 print_stat(dpctl_p, " dropped:", s.rx_dropped);
                 print_stat(dpctl_p, " overruns:", s.rx_over_errors);
                 print_stat(dpctl_p, " frame:", s.rx_frame_errors);
                 dpctl_print(dpctl_p, "\n");
 
-                print_stat(dpctl_p, "\t\tTX packets:", s.tx_packets);
+                print_stat(dpctl_p, "    TX packets:", s.tx_packets);
                 print_stat(dpctl_p, " errors:", s.tx_errors);
                 print_stat(dpctl_p, " dropped:", s.tx_dropped);
                 print_stat(dpctl_p, " aborted:", s.tx_aborted_errors);
                 print_stat(dpctl_p, " carrier:", s.tx_carrier_errors);
                 dpctl_print(dpctl_p, "\n");
 
-                print_stat(dpctl_p, "\t\tcollisions:", s.collisions);
+                print_stat(dpctl_p, "    collisions:", s.collisions);
                 dpctl_print(dpctl_p, "\n");
 
-                print_stat(dpctl_p, "\t\tRX bytes:", s.rx_bytes);
+                print_stat(dpctl_p, "    RX bytes:", s.rx_bytes);
                 print_human_size(dpctl_p, s.rx_bytes);
                 print_stat(dpctl_p, "  TX bytes:", s.tx_bytes);
                 print_human_size(dpctl_p, s.tx_bytes);
@@ -611,7 +713,10 @@ show_dpif(struct dpif *dpif, struct dpctl_params *dpctl_p)
                             ovs_strerror(error));
             }
         }
+        dpif_port_destroy(&dpif_port);
     }
+
+    free(port_nos);
 }
 
 typedef void (*dps_for_each_cb)(struct dpif *, struct dpctl_params *);
@@ -718,8 +823,150 @@ format_dpif_flow(struct ds *ds, const struct dpif_flow *f, struct hmap *ports,
     ds_put_cstr(ds, ", ");
 
     dpif_flow_stats_format(&f->stats, ds);
+    if (dpctl_p->verbosity && f->attrs.offloaded) {
+        if (f->attrs.dp_layer && !strcmp(f->attrs.dp_layer, "ovs")) {
+            ds_put_cstr(ds, ", offloaded:partial");
+        } else {
+            ds_put_cstr(ds, ", offloaded:yes");
+        }
+    }
+    if (dpctl_p->verbosity && f->attrs.dp_layer) {
+        ds_put_format(ds, ", dp:%s", f->attrs.dp_layer);
+    }
     ds_put_cstr(ds, ", actions:");
-    format_odp_actions(ds, f->actions, f->actions_len);
+    format_odp_actions(ds, f->actions, f->actions_len, ports);
+    if (dpctl_p->verbosity && f->attrs.dp_extra_info) {
+        ds_put_format(ds, ", dp-extra-info:%s", f->attrs.dp_extra_info);
+    }
+}
+
+struct dump_types {
+    bool ovs;
+    bool tc;
+    bool dpdk;
+    bool offloaded;
+    bool non_offloaded;
+    bool partially_offloaded;
+};
+
+static void
+enable_all_dump_types(struct dump_types *dump_types)
+{
+    dump_types->ovs = true;
+    dump_types->tc = true;
+    dump_types->dpdk = true;
+    dump_types->offloaded = true;
+    dump_types->non_offloaded = true;
+    dump_types->partially_offloaded = true;
+}
+
+static int
+populate_dump_types(char *types_list, struct dump_types *dump_types,
+                    struct dpctl_params *dpctl_p)
+{
+    if (!types_list) {
+        enable_all_dump_types(dump_types);
+        return 0;
+    }
+
+    char *current_type;
+
+    while (types_list && types_list[0] != '\0') {
+        current_type = types_list;
+        size_t type_len = strcspn(current_type, ",");
+
+        types_list += type_len + (types_list[type_len] != '\0');
+        current_type[type_len] = '\0';
+
+        if (!strcmp(current_type, "ovs")) {
+            dump_types->ovs = true;
+        } else if (!strcmp(current_type, "tc")) {
+            dump_types->tc = true;
+        } else if (!strcmp(current_type, "dpdk")) {
+            dump_types->dpdk = true;
+        } else if (!strcmp(current_type, "offloaded")) {
+            dump_types->offloaded = true;
+        } else if (!strcmp(current_type, "non-offloaded")) {
+            dump_types->non_offloaded = true;
+        } else if (!strcmp(current_type, "partially-offloaded")) {
+            dump_types->partially_offloaded = true;
+        } else if (!strcmp(current_type, "all")) {
+            enable_all_dump_types(dump_types);
+        } else {
+            dpctl_error(dpctl_p, EINVAL, "Failed to parse type (%s)",
+                        current_type);
+            return EINVAL;
+        }
+    }
+    return 0;
+}
+
+static void
+determine_dpif_flow_dump_types(struct dump_types *dump_types,
+                               struct dpif_flow_dump_types *dpif_dump_types)
+{
+    dpif_dump_types->ovs_flows = dump_types->ovs || dump_types->non_offloaded;
+    dpif_dump_types->netdev_flows = dump_types->tc || dump_types->offloaded
+                                    || dump_types->non_offloaded
+                                    || dump_types->dpdk
+                                    || dump_types->partially_offloaded;
+}
+
+static bool
+flow_passes_type_filter(const struct dpif_flow *f,
+                        struct dump_types *dump_types)
+{
+    if (dump_types->ovs && !strcmp(f->attrs.dp_layer, "ovs")) {
+        return true;
+    }
+    if (dump_types->tc && !strcmp(f->attrs.dp_layer, "tc")) {
+        return true;
+    }
+    if (dump_types->dpdk && !strcmp(f->attrs.dp_layer, "dpdk")) {
+        return true;
+    }
+    if (dump_types->offloaded && f->attrs.offloaded &&
+        strcmp(f->attrs.dp_layer, "ovs")) {
+        return true;
+    }
+    if (dump_types->partially_offloaded && f->attrs.offloaded &&
+        !strcmp(f->attrs.dp_layer, "ovs")) {
+        return true;
+    }
+    if (dump_types->non_offloaded && !(f->attrs.offloaded)) {
+        return true;
+    }
+    return false;
+}
+
+static struct hmap *
+dpctl_get_portno_names(struct dpif *dpif, const struct dpctl_params *dpctl_p)
+{
+    if (dpctl_p->names) {
+        struct hmap *portno_names = xmalloc(sizeof *portno_names);
+        hmap_init(portno_names);
+
+        struct dpif_port_dump port_dump;
+        struct dpif_port dpif_port;
+        DPIF_PORT_FOR_EACH (&dpif_port, &port_dump, dpif) {
+            odp_portno_names_set(portno_names, dpif_port.port_no,
+                                 dpif_port.name);
+        }
+
+        return portno_names;
+    } else {
+        return NULL;
+    }
+}
+
+static void
+dpctl_free_portno_names(struct hmap *portno_names)
+{
+    if (portno_names) {
+        odp_portno_names_destroy(portno_names);
+        hmap_destroy(portno_names);
+        free(portno_names);
+    }
 }
 
 static int
@@ -727,57 +974,83 @@ dpctl_dump_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
 {
     struct dpif *dpif;
     struct ds ds;
-    char *name;
 
     char *filter = NULL;
     struct flow flow_filter;
     struct flow_wildcards wc_filter;
-
-    struct dpif_port_dump port_dump;
-    struct dpif_port dpif_port;
-    struct hmap portno_names;
-    struct simap names_portno;
+    char *types_list = NULL;
+    struct dump_types dump_types;
+    struct dpif_flow_dump_types dpif_dump_types;
 
     struct dpif_flow_dump_thread *flow_dump_thread;
     struct dpif_flow_dump *flow_dump;
     struct dpif_flow f;
     int pmd_id = PMD_ID_NULL;
+    bool pmd_id_filter = false;
+    int lastargc = 0;
     int error;
 
-    if (argc > 1 && !strncmp(argv[argc - 1], "filter=", 7)) {
-        filter = xstrdup(argv[--argc] + 7);
-    }
-    name = (argc == 2) ? xstrdup(argv[1]) : get_one_dp(dpctl_p);
-    if (!name) {
-        error = EINVAL;
-        goto out_freefilter;
+    while (argc > 1 && lastargc != argc) {
+        lastargc = argc;
+        if (!strncmp(argv[argc - 1], "filter=", 7) && !filter) {
+            filter = xstrdup(argv[--argc] + 7);
+        } else if (!strncmp(argv[argc - 1], "type=", 5) && !types_list) {
+            if (!dpctl_p->is_appctl) {
+                dpctl_error(dpctl_p, 0,
+                            "Invalid argument 'type'. "
+                            "Use 'ovs-appctl dpctl/dump-flows' instead.");
+                error = EINVAL;
+                goto out_free;
+            }
+            types_list = xstrdup(argv[--argc] + 5);
+        } else if (!strncmp(argv[argc - 1], "pmd=", 4)) {
+            if (!ovs_scan(argv[--argc], "pmd=%d", &pmd_id)) {
+                error = EINVAL;
+                goto out_free;
+            }
+
+            if (pmd_id == -1) {
+                pmd_id = NON_PMD_CORE_ID;
+            }
+            pmd_id_filter = true;
+        }
     }
 
-    error = parsed_dpif_open(name, false, &dpif);
-    free(name);
+    error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
     if (error) {
-        dpctl_error(dpctl_p, error, "opening datapath");
-        goto out_freefilter;
+        goto out_free;
     }
 
-
-    hmap_init(&portno_names);
-    simap_init(&names_portno);
-    DPIF_PORT_FOR_EACH (&dpif_port, &port_dump, dpif) {
-        odp_portno_names_set(&portno_names, dpif_port.port_no, dpif_port.name);
-        simap_put(&names_portno, dpif_port.name,
-                  odp_to_u32(dpif_port.port_no));
-    }
+    struct hmap *portno_names = dpctl_get_portno_names(dpif, dpctl_p);
 
     if (filter) {
-        char *err = parse_ofp_exact_flow(&flow_filter, &wc_filter.masks,
-                                         filter, &names_portno);
+        struct ofputil_port_map port_map;
+        ofputil_port_map_init(&port_map);
+
+        struct dpif_port_dump port_dump;
+        struct dpif_port dpif_port;
+        DPIF_PORT_FOR_EACH (&dpif_port, &port_dump, dpif) {
+            ofputil_port_map_put(&port_map,
+                                 u16_to_ofp(odp_to_u32(dpif_port.port_no)),
+                                 dpif_port.name);
+        }
+        char *err = parse_ofp_exact_flow(&flow_filter, &wc_filter, NULL,
+                                         filter, &port_map);
+        ofputil_port_map_destroy(&port_map);
         if (err) {
             dpctl_error(dpctl_p, 0, "Failed to parse filter (%s)", err);
+            free(err);
             error = EINVAL;
             goto out_dpifclose;
         }
     }
+
+    memset(&dump_types, 0, sizeof dump_types);
+    error = populate_dump_types(types_list, &dump_types, dpctl_p);
+    if (error) {
+        goto out_dpifclose;
+    }
+    determine_dpif_flow_dump_types(&dump_types, &dpif_dump_types);
 
     /* Make sure that these values are different. PMD_ID_NULL means that the
      * pmd is unspecified (e.g. because the datapath doesn't have different
@@ -786,7 +1059,8 @@ dpctl_dump_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
     BUILD_ASSERT(PMD_ID_NULL != NON_PMD_CORE_ID);
 
     ds_init(&ds);
-    flow_dump = dpif_flow_dump_create(dpif, false);
+    memset(&f, 0, sizeof f);
+    flow_dump = dpif_flow_dump_create(dpif, false, &dpif_dump_types);
     flow_dump_thread = dpif_flow_dump_thread_create(flow_dump);
     while (dpif_flow_dump_next(flow_dump_thread, &f, 1)) {
         if (filter) {
@@ -795,9 +1069,8 @@ dpctl_dump_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
             struct match match, match_filter;
             struct minimatch minimatch;
 
-            odp_flow_key_to_flow(f.key, f.key_len, &flow);
-            odp_flow_key_to_mask(f.mask, f.mask_len, f.key, f.key_len,
-                                 &wc.masks, &flow);
+            odp_flow_key_to_flow(f.key, f.key_len, &flow, NULL);
+            odp_flow_key_to_mask(f.mask, f.mask_len, &wc, &flow, NULL);
             match_init(&match, &flow, &wc);
 
             match_init(&match_filter, &flow_filter, &wc);
@@ -814,17 +1087,20 @@ dpctl_dump_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
         /* If 'pmd_id' is specified, overlapping flows could be dumped from
          * different pmd threads.  So, separates dumps from different pmds
          * by printing a title line. */
-        if (pmd_id != f.pmd_id) {
+        if (!pmd_id_filter && pmd_id != f.pmd_id) {
             if (f.pmd_id == NON_PMD_CORE_ID) {
-                ds_put_format(&ds, "flow-dump from non-dpdk interfaces:\n");
+                ds_put_format(&ds, "flow-dump from the main thread:\n");
             } else {
                 ds_put_format(&ds, "flow-dump from pmd on cpu core: %d\n",
                               f.pmd_id);
             }
             pmd_id = f.pmd_id;
         }
-        format_dpif_flow(&ds, &f, &portno_names, dpctl_p);
-        dpctl_print(dpctl_p, "%s\n", ds_cstr(&ds));
+        if (pmd_id == f.pmd_id &&
+            flow_passes_type_filter(&f, &dump_types)) {
+            format_dpif_flow(&ds, &f, portno_names, dpctl_p);
+            dpctl_print(dpctl_p, "%s\n", ds_cstr(&ds));
+        }
     }
     dpif_flow_dump_thread_destroy(flow_dump_thread);
     error = dpif_flow_dump_destroy(flow_dump);
@@ -835,75 +1111,30 @@ dpctl_dump_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
     ds_destroy(&ds);
 
 out_dpifclose:
-    odp_portno_names_destroy(&portno_names);
-    simap_destroy(&names_portno);
-    hmap_destroy(&portno_names);
+    dpctl_free_portno_names(portno_names);
     dpif_close(dpif);
-out_freefilter:
+out_free:
     free(filter);
+    free(types_list);
     return error;
 }
 
-/* Extracts the in_port from the parsed keys, and returns the reference
- * to the 'struct netdev *' of the dpif port.  On error, returns NULL.
- * Users must call 'netdev_close()' after finish using the returned
- * reference. */
-static struct netdev *
-get_in_port_netdev_from_key(struct dpif *dpif, const struct ofpbuf *key)
-{
-    const struct nlattr *in_port_nla;
-    struct netdev *dev = NULL;
-
-    in_port_nla = nl_attr_find(key, 0, OVS_KEY_ATTR_IN_PORT);
-    if (in_port_nla) {
-        struct dpif_port dpif_port;
-        odp_port_t port_no;
-        int error;
-
-        port_no = ODP_PORT_C(nl_attr_get_u32(in_port_nla));
-        error = dpif_port_query_by_number(dpif, port_no, &dpif_port);
-        if (error) {
-            goto out;
-        }
-
-        netdev_open(dpif_port.name, dpif_port.type, &dev);
-        dpif_port_destroy(&dpif_port);
-    }
-
-out:
-    return dev;
-}
-
 static int
-dpctl_put_flow(int argc, const char *argv[], enum dpif_flow_put_flags flags,
-               struct dpctl_params *dpctl_p)
+dpctl_put_flow_dpif(struct dpif *dpif, const char *key_s,
+                    const char *actions_s,
+                    enum dpif_flow_put_flags flags,
+                    struct dpctl_params *dpctl_p)
 {
-    const char *key_s = argv[argc - 2];
-    const char *actions_s = argv[argc - 1];
-    struct netdev *in_port_netdev = NULL;
     struct dpif_flow_stats stats;
     struct dpif_port dpif_port;
     struct dpif_port_dump port_dump;
     struct ofpbuf actions;
     struct ofpbuf key;
     struct ofpbuf mask;
-    struct dpif *dpif;
     ovs_u128 ufid;
     bool ufid_present;
-    char *dp_name;
     struct simap port_names;
     int n, error;
-
-    dp_name = argc == 4 ? xstrdup(argv[1]) : get_one_dp(dpctl_p);
-    if (!dp_name) {
-        return EINVAL;
-    }
-    error = parsed_dpif_open(dp_name, false, &dpif);
-    free(dp_name);
-    if (error) {
-        dpctl_error(dpctl_p, error, "opening datapath");
-        return error;
-    }
 
     ufid_present = false;
     n = odp_ufid_from_string(key_s, &ufid);
@@ -922,10 +1153,12 @@ dpctl_put_flow(int argc, const char *argv[], enum dpif_flow_put_flags flags,
 
     ofpbuf_init(&key, 0);
     ofpbuf_init(&mask, 0);
-    error = odp_flow_from_string(key_s, &port_names, &key, &mask);
+    char *error_s;
+    error = odp_flow_from_string(key_s, &port_names, &key, &mask, &error_s);
     simap_destroy(&port_names);
     if (error) {
-        dpctl_error(dpctl_p, error, "parsing flow key");
+        dpctl_error(dpctl_p, error, "parsing flow key (%s)", error_s);
+        free(error_s);
         goto out_freekeymask;
     }
 
@@ -936,39 +1169,25 @@ dpctl_put_flow(int argc, const char *argv[], enum dpif_flow_put_flags flags,
         goto out_freeactions;
     }
 
-    /* For DPDK interface, applies the operation to all pmd threads
-     * on the same numa node. */
-    in_port_netdev = get_in_port_netdev_from_key(dpif, &key);
-    if (in_port_netdev && netdev_is_pmd(in_port_netdev)) {
-        int numa_id;
-
-        numa_id = netdev_get_numa_id(in_port_netdev);
-        if (ovs_numa_numa_id_is_valid(numa_id)) {
-            struct ovs_numa_dump *dump = ovs_numa_dump_cores_on_numa(numa_id);
-            struct ovs_numa_info *iter;
-
-            FOR_EACH_CORE_ON_NUMA (iter, dump) {
-                if (ovs_numa_core_is_pinned(iter->core_id)) {
-                    error = dpif_flow_put(dpif, flags,
-                                          key.data, key.size,
-                                          mask.size == 0 ? NULL : mask.data,
-                                          mask.size, actions.data,
-                                          actions.size, ufid_present ? &ufid : NULL,
-                                          iter->core_id, dpctl_p->print_statistics ? &stats : NULL);
-                }
-            }
-            ovs_numa_dump_destroy(dump);
-        } else {
-            error = EINVAL;
-        }
-    } else {
-        error = dpif_flow_put(dpif, flags,
-                              key.data, key.size,
-                              mask.size == 0 ? NULL : mask.data,
-                              mask.size, actions.data,
-                              actions.size, ufid_present ? &ufid : NULL,
-                              PMD_ID_NULL, dpctl_p->print_statistics ? &stats : NULL);
+    if (!ufid_present && dpctl_p->is_appctl) {
+        /* Generating UFID for this flow so it could be offloaded to HW.  We're
+         * not doing that if invoked from ovs-dpctl utility because
+         * odp_flow_key_hash() uses randomly generated base for flow hashes
+         * that will be different for each invocation.  And, anyway, offloading
+         * is only available via appctl. */
+        odp_flow_key_hash(key.data, key.size, &ufid);
+        ufid_present = true;
     }
+
+    /* The flow will be added on all pmds currently in the datapath. */
+    error = dpif_flow_put(dpif, flags,
+                          key.data, key.size,
+                          mask.size == 0 ? NULL : mask.data,
+                          mask.size, actions.data,
+                          actions.size, ufid_present ? &ufid : NULL,
+                          PMD_ID_NULL,
+                          dpctl_p->print_statistics ? &stats : NULL);
+
     if (error) {
         dpctl_error(dpctl_p, error, "updating flow table");
         goto out_freeactions;
@@ -988,8 +1207,25 @@ out_freeactions:
 out_freekeymask:
     ofpbuf_uninit(&mask);
     ofpbuf_uninit(&key);
+    return error;
+}
+
+static int
+dpctl_put_flow(int argc, const char *argv[], enum dpif_flow_put_flags flags,
+               struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    int error;
+
+    error = opt_dpif_open(argc, argv, dpctl_p, 4, &dpif);
+    if (error) {
+        return error;
+    }
+
+    error = dpctl_put_flow_dpif(dpif, argv[argc - 2], argv[argc - 1], flags,
+                                dpctl_p);
+
     dpif_close(dpif);
-    netdev_close(in_port_netdev);
     return error;
 }
 
@@ -1020,33 +1256,21 @@ dpctl_get_flow(int argc, const char *argv[], struct dpctl_params *dpctl_p)
 {
     const char *key_s = argv[argc - 1];
     struct dpif_flow flow;
-    struct dpif_port dpif_port;
-    struct dpif_port_dump port_dump;
     struct dpif *dpif;
-    char *dp_name;
-    struct hmap portno_names;
     ovs_u128 ufid;
     struct ofpbuf buf;
     uint64_t stub[DPIF_FLOW_BUFSIZE / 8];
     struct ds ds;
     int n, error;
 
-    dp_name = argc == 3 ? xstrdup(argv[1]) : get_one_dp(dpctl_p);
-    if (!dp_name) {
-        return EINVAL;
-    }
-    error = parsed_dpif_open(dp_name, false, &dpif);
-    free(dp_name);
+    error = opt_dpif_open(argc, argv, dpctl_p, 3, &dpif);
     if (error) {
-        dpctl_error(dpctl_p, error, "opening datapath");
         return error;
     }
 
     ofpbuf_use_stub(&buf, &stub, sizeof stub);
-    hmap_init(&portno_names);
-    DPIF_PORT_FOR_EACH (&dpif_port, &port_dump, dpif) {
-        odp_portno_names_set(&portno_names, dpif_port.port_no, dpif_port.name);
-    }
+
+    struct hmap *portno_names = dpctl_get_portno_names(dpif, dpctl_p);
 
     n = odp_ufid_from_string(key_s, &ufid);
     if (n <= 0) {
@@ -1054,8 +1278,7 @@ dpctl_get_flow(int argc, const char *argv[], struct dpctl_params *dpctl_p)
         goto out;
     }
 
-    /* Does not work for DPDK, since do not know which 'pmd' to apply the
-     * operation.  So, just uses PMD_ID_NULL. */
+    /* In case of PMD will be returned flow from first PMD thread with match. */
     error = dpif_flow_get(dpif, NULL, 0, &ufid, PMD_ID_NULL, &buf, &flow);
     if (error) {
         dpctl_error(dpctl_p, error, "getting flow");
@@ -1063,45 +1286,32 @@ dpctl_get_flow(int argc, const char *argv[], struct dpctl_params *dpctl_p)
     }
 
     ds_init(&ds);
-    format_dpif_flow(&ds, &flow, &portno_names, dpctl_p);
+    format_dpif_flow(&ds, &flow, portno_names, dpctl_p);
     dpctl_print(dpctl_p, "%s\n", ds_cstr(&ds));
     ds_destroy(&ds);
 
 out:
-    odp_portno_names_destroy(&portno_names);
-    hmap_destroy(&portno_names);
+    dpctl_free_portno_names(portno_names);
     ofpbuf_uninit(&buf);
     dpif_close(dpif);
     return error;
 }
 
 static int
-dpctl_del_flow(int argc, const char *argv[], struct dpctl_params *dpctl_p)
+dpctl_del_flow_dpif(struct dpif *dpif, const char *key_s,
+                    struct dpctl_params *dpctl_p)
 {
-    const char *key_s = argv[argc - 1];
-    struct netdev *in_port_netdev = NULL;
     struct dpif_flow_stats stats;
     struct dpif_port dpif_port;
     struct dpif_port_dump port_dump;
     struct ofpbuf key;
     struct ofpbuf mask; /* To be ignored. */
-    struct dpif *dpif;
+
     ovs_u128 ufid;
+    bool ufid_generated;
     bool ufid_present;
-    char *dp_name;
     struct simap port_names;
     int n, error;
-
-    dp_name = argc == 3 ? xstrdup(argv[1]) : get_one_dp(dpctl_p);
-    if (!dp_name) {
-        return EINVAL;
-    }
-    error = parsed_dpif_open(dp_name, false, &dpif);
-    free(dp_name);
-    if (error) {
-        dpctl_error(dpctl_p, error, "opening datapath");
-        return error;
-    }
 
     ufid_present = false;
     n = odp_ufid_from_string(key_s, &ufid);
@@ -1121,42 +1331,30 @@ dpctl_del_flow(int argc, const char *argv[], struct dpctl_params *dpctl_p)
     ofpbuf_init(&key, 0);
     ofpbuf_init(&mask, 0);
 
-    error = odp_flow_from_string(key_s, &port_names, &key, &mask);
+    char *error_s;
+    error = odp_flow_from_string(key_s, &port_names, &key, &mask, &error_s);
     if (error) {
-        dpctl_error(dpctl_p, error, "parsing flow key");
+        dpctl_error(dpctl_p, error, "%s", error_s);
+        free(error_s);
         goto out;
     }
 
-    /* For DPDK interface, applies the operation to all pmd threads
-     * on the same numa node. */
-    in_port_netdev = get_in_port_netdev_from_key(dpif, &key);
-    if (in_port_netdev && netdev_is_pmd(in_port_netdev)) {
-        int numa_id;
-
-        numa_id = netdev_get_numa_id(in_port_netdev);
-        if (ovs_numa_numa_id_is_valid(numa_id)) {
-            struct ovs_numa_dump *dump = ovs_numa_dump_cores_on_numa(numa_id);
-            struct ovs_numa_info *iter;
-
-            FOR_EACH_CORE_ON_NUMA (iter, dump) {
-                if (ovs_numa_core_is_pinned(iter->core_id)) {
-                    error = dpif_flow_del(dpif, key.data,
-                                          key.size, ufid_present ? &ufid : NULL,
-                                          iter->core_id, dpctl_p->print_statistics ? &stats : NULL);
-                }
-            }
-            ovs_numa_dump_destroy(dump);
-        } else {
-            error = EINVAL;
-        }
-    } else {
-        error = dpif_flow_del(dpif, key.data, key.size,
-                              ufid_present ? &ufid : NULL, PMD_ID_NULL,
-                              dpctl_p->print_statistics ? &stats : NULL);
+    if (!ufid_present && dpctl_p->is_appctl) {
+        /* While adding flow via appctl we're generating UFID to make HW
+         * offloading possible.  Generating UFID here to be sure that such
+         * flows could be removed the same way they were added. */
+        odp_flow_key_hash(key.data, key.size, &ufid);
+        ufid_present = ufid_generated = true;
     }
+
+    /* The flow will be deleted from all pmds currently in the datapath. */
+    error = dpif_flow_del(dpif, key.data, key.size,
+                          ufid_present ? &ufid : NULL, PMD_ID_NULL,
+                          dpctl_p->print_statistics ? &stats : NULL);
+
     if (error) {
         dpctl_error(dpctl_p, error, "deleting flow");
-        if (error == ENOENT && !ufid_present) {
+        if (error == ENOENT && (!ufid_present || ufid_generated)) {
             struct ds s;
 
             ds_init(&s);
@@ -1180,26 +1378,158 @@ out:
     ofpbuf_uninit(&mask);
     ofpbuf_uninit(&key);
     simap_destroy(&port_names);
-    dpif_close(dpif);
-    netdev_close(in_port_netdev);
     return error;
+}
+
+static int
+dpctl_del_flow(int argc, const char *argv[], struct dpctl_params *dpctl_p)
+{
+    const char *key_s = argv[argc - 1];
+    struct dpif *dpif;
+    int error;
+
+    error = opt_dpif_open(argc, argv, dpctl_p, 3, &dpif);
+    if (error) {
+        return error;
+    }
+
+    error = dpctl_del_flow_dpif(dpif, key_s, dpctl_p);
+
+    dpif_close(dpif);
+    return error;
+}
+
+static int
+dpctl_parse_flow_line(int command, struct ds *s, char **flow, char **action)
+{
+    const char *line = ds_cstr(s);
+    size_t len;
+
+    /* First figure out the command, or fallback to FLOWS_ADD. */
+    line += strspn(line, " \t\r\n");
+    len = strcspn(line, ", \t\r\n");
+
+    if (!strncmp(line, "add", len)) {
+         command = DPCTL_FLOWS_ADD;
+    } else if (!strncmp(line, "delete", len)) {
+        command = DPCTL_FLOWS_DEL;
+    } else if (!strncmp(line, "modify", len)) {
+        command = DPCTL_FLOWS_MOD;
+    } else {
+        len = 0;
+    }
+    line += len;
+
+    /* Isolate flow and action (for add/modify). */
+    line += strspn(line, " \t\r\n");
+    len = strcspn(line, " \t\r\n");
+
+    if (len == 0) {
+        *flow = NULL;
+        *action = NULL;
+        return command;
+    }
+
+    *flow = xzalloc(len + 1);
+    ovs_strlcpy(*flow, line, len + 1);
+
+    line += len;
+    line += strspn(line, " \t\r\n");
+    if (strlen(line)) {
+        *action = xstrdup(line);
+    } else {
+        *action = NULL;
+    }
+
+    return command;
+}
+
+static int
+dpctl_process_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
+{
+    const char *file_name = argv[argc - 1];
+    int line_number = 0;
+    struct dpif *dpif;
+    struct ds line;
+    FILE *stream;
+    int error;
+    int def_cmd = DPCTL_FLOWS_ADD;
+
+    if (strstr(argv[0], "mod-flows")) {
+        def_cmd = DPCTL_FLOWS_MOD;
+    } else if (strstr(argv[0], "del-flows")) {
+        def_cmd = DPCTL_FLOWS_DEL;
+    }
+
+    error = opt_dpif_open(argc, argv, dpctl_p, 4, &dpif);
+    if (error) {
+        return error;
+    }
+
+    stream = !strcmp(file_name, "-") ? stdin : fopen(file_name, "r");
+    if (!stream) {
+        error = errno;
+        dpctl_error(dpctl_p, error, "Opening file \"%s\" failed", file_name);
+        goto out_close_dpif;
+    }
+
+    ds_init(&line);
+    while (!ds_get_preprocessed_line(&line, stream, &line_number)) {
+        /* We do not process all the lines first and then execute the actions
+         * as we would like to take commands as a continuous stream of
+         * commands from stdin.
+         */
+        char *flow = NULL;
+        char *action = NULL;
+        int cmd = dpctl_parse_flow_line(def_cmd, &line, &flow, &action);
+
+        if ((!flow && !action)
+            || ((cmd == DPCTL_FLOWS_ADD || cmd == DPCTL_FLOWS_MOD) && !action)
+            || (cmd == DPCTL_FLOWS_DEL && action)) {
+            dpctl_error(dpctl_p, 0,
+                        "Failed parsing line number %u, skipped!",
+                        line_number);
+        } else {
+            switch (cmd) {
+            case DPCTL_FLOWS_ADD:
+                dpctl_put_flow_dpif(dpif, flow, action,
+                                    DPIF_FP_CREATE, dpctl_p);
+                break;
+            case DPCTL_FLOWS_MOD:
+                dpctl_put_flow_dpif(dpif, flow, action,
+                                    DPIF_FP_MODIFY, dpctl_p);
+                break;
+            case DPCTL_FLOWS_DEL:
+                dpctl_del_flow_dpif(dpif, flow, dpctl_p);
+                break;
+            }
+        }
+
+        free(flow);
+        free(action);
+    }
+
+    ds_destroy(&line);
+    if (stream != stdin) {
+        fclose(stream);
+    }
+out_close_dpif:
+    dpif_close(dpif);
+    return 0;
 }
 
 static int
 dpctl_del_flows(int argc, const char *argv[], struct dpctl_params *dpctl_p)
 {
     struct dpif *dpif;
-    char *name;
     int error;
 
-    name = (argc == 2) ? xstrdup(argv[1]) : get_one_dp(dpctl_p);
-    if (!name) {
-        return EINVAL;
+    if ((!dp_arg_exists(argc, argv) && argc == 2) || argc > 2) {
+        return dpctl_process_flows(argc, argv, dpctl_p);
     }
-    error = parsed_dpif_open(name, false, &dpif);
-    free(name);
+
+    error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
     if (error) {
-        dpctl_error(dpctl_p, error, "opening datapath");
         return error;
     }
 
@@ -1233,6 +1563,10 @@ dpctl_list_commands(int argc OVS_UNUSED, const char *argv[] OVS_UNUSED,
     for (; commands->name; commands++) {
         const struct dpctl_command *c = commands;
 
+        if (dpctl_p->is_appctl && !strcmp(c->name, "help")) {
+            continue;
+        }
+
         ds_put_format(&ds, "  %s%-23s %s\n", dpctl_p->is_appctl ? "dpctl/" : "",
                       c->name, c->usage);
     }
@@ -1242,6 +1576,830 @@ dpctl_list_commands(int argc OVS_UNUSED, const char *argv[] OVS_UNUSED,
     return 0;
 }
 
+
+static int
+dpctl_dump_conntrack(int argc, const char *argv[],
+                     struct dpctl_params *dpctl_p)
+{
+    struct ct_dpif_dump_state *dump;
+    struct ct_dpif_entry cte;
+    uint16_t zone, *pzone = NULL;
+    int tot_bkts;
+    struct dpif *dpif;
+    int error;
+
+    if (argc > 1 && ovs_scan(argv[argc - 1], "zone=%"SCNu16, &zone)) {
+        pzone = &zone;
+        argc--;
+    }
+
+    error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
+    if (error) {
+        return error;
+    }
+
+    error = ct_dpif_dump_start(dpif, &dump, pzone, &tot_bkts);
+    if (error) {
+        dpctl_error(dpctl_p, error, "starting conntrack dump");
+        dpif_close(dpif);
+        return error;
+    }
+
+    while (!(error = ct_dpif_dump_next(dump, &cte))) {
+        struct ds s = DS_EMPTY_INITIALIZER;
+
+        ct_dpif_format_entry(&cte, &s, dpctl_p->verbosity,
+                             dpctl_p->print_statistics);
+        ct_dpif_entry_uninit(&cte);
+
+        dpctl_print(dpctl_p, "%s\n", ds_cstr(&s));
+        ds_destroy(&s);
+    }
+    if (error == EOF) {
+        /* Any CT entry was dumped with no issue. */
+        error = 0;
+    } else if (error) {
+        dpctl_error(dpctl_p, error, "dumping conntrack entry");
+    }
+
+    ct_dpif_dump_done(dump);
+    dpif_close(dpif);
+    return error;
+}
+
+static int
+dpctl_flush_conntrack(int argc, const char *argv[],
+                      struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif = NULL;
+    struct ct_dpif_tuple tuple, *ptuple = NULL;
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    uint16_t zone, *pzone = NULL;
+    int error;
+    int args = argc - 1;
+
+    /* Parse ct tuple */
+    if (args && ct_dpif_parse_tuple(&tuple, argv[args], &ds)) {
+        ptuple = &tuple;
+        args--;
+    }
+
+    /* Parse zone */
+    if (args && ovs_scan(argv[args], "zone=%"SCNu16, &zone)) {
+        pzone = &zone;
+        args--;
+    }
+
+    /* Report error if there are more than one unparsed argument. */
+    if (args > 1) {
+        ds_put_cstr(&ds, "invalid arguments");
+        error = EINVAL;
+        goto error;
+    }
+
+    error = opt_dpif_open(argc, argv, dpctl_p, 4, &dpif);
+    if (error) {
+        return error;
+    }
+
+    error = ct_dpif_flush(dpif, pzone, ptuple);
+    if (!error) {
+        dpif_close(dpif);
+        return 0;
+    } else {
+        ds_put_cstr(&ds, "failed to flush conntrack");
+    }
+
+error:
+    dpctl_error(dpctl_p, error, "%s", ds_cstr(&ds));
+    ds_destroy(&ds);
+    dpif_close(dpif);
+    return error;
+}
+
+static int
+dpctl_ct_stats_show(int argc, const char *argv[],
+                     struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    struct ct_dpif_dump_state *dump;
+    struct ct_dpif_entry cte;
+    uint16_t zone, *pzone = NULL;
+    int tot_bkts;
+    int lastargc = 0;
+
+    int proto_stats[CT_STATS_MAX];
+    int tcp_conn_per_states[CT_DPIF_TCPS_MAX_NUM];
+    int error;
+
+    bool verbose = dpctl_p->verbosity;
+
+    while (argc > 1 && lastargc != argc) {
+        lastargc = argc;
+        if (!strncmp(argv[argc - 1], "verbose", 7)) {
+            /* Support "verbose" argument for backwards compatibility. */
+            verbose = true;
+            argc--;
+        } else if (!strncmp(argv[argc - 1], "zone=", 5)) {
+            if (ovs_scan(argv[argc - 1], "zone=%"SCNu16, &zone)) {
+                pzone = &zone;
+                argc--;
+            }
+        }
+    }
+
+    error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
+    if (error) {
+        return error;
+    }
+
+    memset(proto_stats, 0, sizeof(proto_stats));
+    memset(tcp_conn_per_states, 0, sizeof(tcp_conn_per_states));
+    error = ct_dpif_dump_start(dpif, &dump, pzone, &tot_bkts);
+    if (error) {
+        dpctl_error(dpctl_p, error, "starting conntrack dump");
+        dpif_close(dpif);
+        return error;
+    }
+
+    int tot_conn = 0;
+    while (!(error = ct_dpif_dump_next(dump, &cte))) {
+        ct_dpif_entry_uninit(&cte);
+        tot_conn++;
+        switch (cte.tuple_orig.ip_proto) {
+        case IPPROTO_ICMP:
+            proto_stats[CT_STATS_ICMP]++;
+            break;
+        case IPPROTO_ICMPV6:
+            proto_stats[CT_STATS_ICMPV6]++;
+            break;
+        case IPPROTO_TCP:
+            proto_stats[CT_STATS_TCP]++;
+            uint8_t tcp_state;
+            /* We keep two separate tcp states, but we print just one. The
+             * Linux kernel connection tracker internally keeps only one state,
+             * so 'state_orig' and 'state_reply', will be the same. */
+            tcp_state = MAX(cte.protoinfo.tcp.state_orig,
+                            cte.protoinfo.tcp.state_reply);
+            tcp_state = ct_dpif_coalesce_tcp_state(tcp_state);
+            tcp_conn_per_states[tcp_state]++;
+            break;
+        case IPPROTO_UDP:
+            proto_stats[CT_STATS_UDP]++;
+            break;
+        case IPPROTO_SCTP:
+            proto_stats[CT_STATS_SCTP]++;
+            break;
+        case IPPROTO_UDPLITE:
+            proto_stats[CT_STATS_UDPLITE]++;
+            break;
+        case IPPROTO_DCCP:
+            proto_stats[CT_STATS_DCCP]++;
+            break;
+        case IPPROTO_IGMP:
+            proto_stats[CT_STATS_IGMP]++;
+            break;
+        default:
+            proto_stats[CT_STATS_OTHER]++;
+            break;
+        }
+    }
+    if (error == EOF) {
+        /* All CT entries were dumped with no issue.  */
+        error = 0;
+    } else if (error) {
+        dpctl_error(dpctl_p, error, "dumping conntrack entry");
+        /* Fall through to show any other info we collected. */
+    }
+
+    dpctl_print(dpctl_p, "Connections Stats:\n    Total: %d\n", tot_conn);
+    if (proto_stats[CT_STATS_TCP]) {
+        dpctl_print(dpctl_p, "  TCP: %d\n", proto_stats[CT_STATS_TCP]);
+        if (verbose) {
+            dpctl_print(dpctl_p, "    Conn per TCP states:\n");
+            for (int i = 0; i < CT_DPIF_TCPS_MAX_NUM; i++) {
+                if (tcp_conn_per_states[i]) {
+                    struct ds s = DS_EMPTY_INITIALIZER;
+                    ct_dpif_format_tcp_stat(&s, i, tcp_conn_per_states[i]);
+                    dpctl_print(dpctl_p, "%s\n", ds_cstr(&s));
+                    ds_destroy(&s);
+                }
+            }
+        }
+    }
+    if (proto_stats[CT_STATS_UDP]) {
+        dpctl_print(dpctl_p, "  UDP: %d\n", proto_stats[CT_STATS_UDP]);
+    }
+    if (proto_stats[CT_STATS_UDPLITE]) {
+        dpctl_print(dpctl_p, "  UDPLITE: %d\n", proto_stats[CT_STATS_UDPLITE]);
+    }
+    if (proto_stats[CT_STATS_SCTP]) {
+        dpctl_print(dpctl_p, "  SCTP: %d\n", proto_stats[CT_STATS_SCTP]);
+    }
+    if (proto_stats[CT_STATS_ICMP]) {
+        dpctl_print(dpctl_p, "  ICMP: %d\n", proto_stats[CT_STATS_ICMP]);
+    }
+    if (proto_stats[CT_STATS_DCCP]) {
+        dpctl_print(dpctl_p, "  DCCP: %d\n", proto_stats[CT_STATS_DCCP]);
+    }
+    if (proto_stats[CT_STATS_IGMP]) {
+        dpctl_print(dpctl_p, "  IGMP: %d\n", proto_stats[CT_STATS_IGMP]);
+    }
+    if (proto_stats[CT_STATS_OTHER]) {
+        dpctl_print(dpctl_p, "  Other: %d\n", proto_stats[CT_STATS_OTHER]);
+    }
+
+    ct_dpif_dump_done(dump);
+    dpif_close(dpif);
+    return error;
+}
+
+#define CT_BKTS_GT "gt="
+static int
+dpctl_ct_bkts(int argc, const char *argv[],
+                     struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    struct ct_dpif_dump_state *dump;
+    struct ct_dpif_entry cte;
+    uint16_t gt = 0; /* Threshold: display value when greater than gt. */
+    uint16_t *pzone = NULL;
+    int tot_bkts = 0;
+    int error;
+
+    if (argc > 1 && !strncmp(argv[argc - 1], CT_BKTS_GT, strlen(CT_BKTS_GT))) {
+        if (ovs_scan(argv[argc - 1], CT_BKTS_GT"%"SCNu16, &gt)) {
+            argc--;
+        }
+    }
+
+    error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
+    if (error) {
+        return error;
+    }
+
+    error = ct_dpif_dump_start(dpif, &dump, pzone, &tot_bkts);
+    if (error) {
+        dpctl_error(dpctl_p, error, "starting conntrack dump");
+        dpif_close(dpif);
+        return error;
+    }
+    if (tot_bkts == -1) {
+         /* Command not available when called by kernel OvS. */
+         dpctl_print(dpctl_p,
+             "Command is available for UserSpace ConnTracker only.\n");
+         ct_dpif_dump_done(dump);
+         dpif_close(dpif);
+         return 0;
+    }
+
+    dpctl_print(dpctl_p, "Total Buckets: %d\n", tot_bkts);
+
+    int tot_conn = 0;
+    uint32_t *conn_per_bkts = xzalloc(tot_bkts * sizeof(uint32_t));
+
+    while (!(error = ct_dpif_dump_next(dump, &cte))) {
+        ct_dpif_entry_uninit(&cte);
+        tot_conn++;
+        if (tot_bkts > 0) {
+            if (cte.bkt < tot_bkts) {
+                conn_per_bkts[cte.bkt]++;
+            } else {
+                dpctl_print(dpctl_p, "Bucket nr out of range: %d >= %d\n",
+                        cte.bkt, tot_bkts);
+            }
+        }
+    }
+    if (error == EOF) {
+        /* All CT entries were dumped with no issue.  */
+        error = 0;
+    } else if (error) {
+        dpctl_error(dpctl_p, error, "dumping conntrack entry");
+        /* Fall through and display all the collected info.  */
+    }
+
+    dpctl_print(dpctl_p, "Current Connections: %d\n", tot_conn);
+    dpctl_print(dpctl_p, "\n");
+    if (tot_bkts && tot_conn) {
+        dpctl_print(dpctl_p, "+-----------+"
+                "-----------------------------------------+\n");
+        dpctl_print(dpctl_p, "|  Buckets  |"
+                "         Connections per Buckets         |\n");
+        dpctl_print(dpctl_p, "+-----------+"
+                "-----------------------------------------+");
+#define NUM_BKTS_DIPLAYED_PER_ROW 8
+        for (int i = 0; i < tot_bkts; i++) {
+            if (i % NUM_BKTS_DIPLAYED_PER_ROW == 0) {
+                 dpctl_print(dpctl_p, "\n %3d..%3d   | ",
+                         i, i + NUM_BKTS_DIPLAYED_PER_ROW - 1);
+            }
+            if (conn_per_bkts[i] > gt) {
+                dpctl_print(dpctl_p, "%5d", conn_per_bkts[i]);
+            } else {
+                dpctl_print(dpctl_p, "%5s", ".");
+            }
+        }
+        dpctl_print(dpctl_p, "\n\n");
+    }
+
+    ct_dpif_dump_done(dump);
+    dpif_close(dpif);
+    free(conn_per_bkts);
+    return error;
+}
+
+static int
+dpctl_ct_set_maxconns(int argc, const char *argv[],
+                      struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    int error = opt_dpif_open(argc, argv, dpctl_p, 3, &dpif);
+    if (!error) {
+        uint32_t maxconns;
+        if (ovs_scan(argv[argc - 1], "%"SCNu32, &maxconns)) {
+            error = ct_dpif_set_maxconns(dpif, maxconns);
+
+            if (!error) {
+                dpctl_print(dpctl_p, "setting maxconns successful");
+            } else {
+                dpctl_error(dpctl_p, error, "ct set maxconns failed");
+            }
+        } else {
+            error = EINVAL;
+            dpctl_error(dpctl_p, error, "maxconns missing or malformed");
+        }
+        dpif_close(dpif);
+    }
+
+    return error;
+}
+
+static int
+dpctl_ct_get_maxconns(int argc, const char *argv[],
+                    struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    int error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
+    if (!error) {
+        uint32_t maxconns;
+        error = ct_dpif_get_maxconns(dpif, &maxconns);
+
+        if (!error) {
+            dpctl_print(dpctl_p, "%u\n", maxconns);
+        } else {
+            dpctl_error(dpctl_p, error, "maxconns could not be retrieved");
+        }
+        dpif_close(dpif);
+    }
+
+    return error;
+}
+
+static int
+dpctl_ct_get_nconns(int argc, const char *argv[],
+                    struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    int error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
+    if (!error) {
+        uint32_t nconns;
+        error = ct_dpif_get_nconns(dpif, &nconns);
+
+        if (!error) {
+            dpctl_print(dpctl_p, "%u\n", nconns);
+        } else {
+            dpctl_error(dpctl_p, error, "nconns could not be retrieved");
+        }
+        dpif_close(dpif);
+    }
+
+    return error;
+}
+
+static int
+dpctl_ct_set_tcp_seq_chk__(int argc, const char *argv[],
+                           struct dpctl_params *dpctl_p, bool enabled)
+{
+    struct dpif *dpif;
+    int error = opt_dpif_open(argc, argv, dpctl_p, 3, &dpif);
+    if (!error) {
+        error = ct_dpif_set_tcp_seq_chk(dpif, enabled);
+        if (!error) {
+            dpctl_print(dpctl_p,
+                        "%s TCP sequence checking successful",
+                        enabled ? "enabling" : "disabling");
+        } else {
+            dpctl_error(dpctl_p, error,
+                        "%s TCP sequence checking failed",
+                        enabled ? "enabling" : "disabling");
+        }
+        dpif_close(dpif);
+    }
+    return error;
+}
+
+static int
+dpctl_ct_enable_tcp_seq_chk(int argc, const char *argv[],
+                            struct dpctl_params *dpctl_p)
+{
+    return dpctl_ct_set_tcp_seq_chk__(argc, argv, dpctl_p, true);
+}
+
+static int
+dpctl_ct_disable_tcp_seq_chk(int argc, const char *argv[],
+                             struct dpctl_params *dpctl_p)
+{
+    return dpctl_ct_set_tcp_seq_chk__(argc, argv, dpctl_p, false);
+}
+
+static int
+dpctl_ct_get_tcp_seq_chk(int argc, const char *argv[],
+                         struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    int error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
+    if (!error) {
+        bool enabled;
+        error = ct_dpif_get_tcp_seq_chk(dpif, &enabled);
+        if (!error) {
+            dpctl_print(dpctl_p, "TCP sequence checking: %s\n",
+                        enabled ? "enabled" : "disabled");
+        } else {
+            dpctl_error(dpctl_p, error, "TCP sequence checking query failed");
+        }
+        dpif_close(dpif);
+    }
+    return error;
+}
+
+static int
+dpctl_ct_set_limits(int argc, const char *argv[],
+                    struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    int i =  dp_arg_exists(argc, argv) ? 2 : 1;
+    uint32_t default_limit, *p_default_limit = NULL;
+    struct ovs_list zone_limits = OVS_LIST_INITIALIZER(&zone_limits);
+
+    int error = opt_dpif_open(argc, argv, dpctl_p, INT_MAX, &dpif);
+    if (error) {
+        return error;
+    }
+
+    /* Parse default limit */
+    if (!strncmp(argv[i], "default=", 8)) {
+        if (ovs_scan(argv[i], "default=%"SCNu32, &default_limit)) {
+            p_default_limit = &default_limit;
+            i++;
+        } else {
+            ds_put_cstr(&ds, "invalid default limit");
+            error = EINVAL;
+            goto error;
+        }
+    }
+
+    /* Parse ct zone limit tuples */
+    while (i < argc) {
+        uint16_t zone;
+        uint32_t limit;
+        if (!ct_dpif_parse_zone_limit_tuple(argv[i++], &zone, &limit, &ds)) {
+            error = EINVAL;
+            goto error;
+        }
+        ct_dpif_push_zone_limit(&zone_limits, zone, limit, 0);
+    }
+
+    error = ct_dpif_set_limits(dpif, p_default_limit, &zone_limits);
+    if (!error) {
+        ct_dpif_free_zone_limits(&zone_limits);
+        dpif_close(dpif);
+        return 0;
+    } else {
+        ds_put_cstr(&ds, "failed to set conntrack limit");
+    }
+
+error:
+    dpctl_error(dpctl_p, error, "%s", ds_cstr(&ds));
+    ds_destroy(&ds);
+    ct_dpif_free_zone_limits(&zone_limits);
+    dpif_close(dpif);
+    return error;
+}
+
+static int
+parse_ct_limit_zones(const char *argv, struct ovs_list *zone_limits,
+                     struct ds *ds)
+{
+    char *save_ptr = NULL, *argcopy, *next_zone;
+    uint16_t zone;
+
+    if (strncmp(argv, "zone=", 5)) {
+        ds_put_format(ds, "invalid argument %s", argv);
+        return EINVAL;
+    }
+
+    argcopy = xstrdup(argv + 5);
+    next_zone = strtok_r(argcopy, ",", &save_ptr);
+
+    do {
+        if (ovs_scan(next_zone, "%"SCNu16, &zone)) {
+            ct_dpif_push_zone_limit(zone_limits, zone, 0, 0);
+        } else {
+            ds_put_cstr(ds, "invalid zone");
+            free(argcopy);
+            return EINVAL;
+        }
+    } while ((next_zone = strtok_r(NULL, ",", &save_ptr)) != NULL);
+
+    free(argcopy);
+    return 0;
+}
+
+static int
+dpctl_ct_del_limits(int argc, const char *argv[],
+                    struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    int error;
+    int i =  dp_arg_exists(argc, argv) ? 2 : 1;
+    struct ovs_list zone_limits = OVS_LIST_INITIALIZER(&zone_limits);
+
+    error = opt_dpif_open(argc, argv, dpctl_p, 3, &dpif);
+    if (error) {
+        return error;
+    }
+
+    error = parse_ct_limit_zones(argv[i], &zone_limits, &ds);
+    if (error) {
+        goto error;
+    }
+
+    error = ct_dpif_del_limits(dpif, &zone_limits);
+    if (!error) {
+        goto out;
+    } else {
+        ds_put_cstr(&ds, "failed to delete conntrack limit");
+    }
+
+error:
+    dpctl_error(dpctl_p, error, "%s", ds_cstr(&ds));
+    ds_destroy(&ds);
+out:
+    ct_dpif_free_zone_limits(&zone_limits);
+    dpif_close(dpif);
+    return error;
+}
+
+static int
+dpctl_ct_get_limits(int argc, const char *argv[],
+                    struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    uint32_t default_limit;
+    int i =  dp_arg_exists(argc, argv) ? 2 : 1;
+    struct ovs_list list_query = OVS_LIST_INITIALIZER(&list_query);
+    struct ovs_list list_reply = OVS_LIST_INITIALIZER(&list_reply);
+
+    int error = opt_dpif_open(argc, argv, dpctl_p, 3, &dpif);
+    if (error) {
+        return error;
+    }
+
+    if (argc > i) {
+        error = parse_ct_limit_zones(argv[i], &list_query, &ds);
+        if (error) {
+            goto error;
+        }
+    }
+
+    error = ct_dpif_get_limits(dpif, &default_limit, &list_query,
+                               &list_reply);
+    if (!error) {
+        ct_dpif_format_zone_limits(default_limit, &list_reply, &ds);
+        dpctl_print(dpctl_p, "%s\n", ds_cstr(&ds));
+        goto out;
+    } else {
+        ds_put_format(&ds, "failed to get conntrack limit %s",
+                      ovs_strerror(error));
+    }
+
+error:
+    dpctl_error(dpctl_p, error, "%s", ds_cstr(&ds));
+out:
+    ds_destroy(&ds);
+    ct_dpif_free_zone_limits(&list_query);
+    ct_dpif_free_zone_limits(&list_reply);
+    dpif_close(dpif);
+    return error;
+}
+
+static int
+ipf_set_enabled__(int argc, const char *argv[], struct dpctl_params *dpctl_p,
+                  bool enabled)
+{
+    struct dpif *dpif;
+    int error = opt_dpif_open(argc, argv, dpctl_p, 4, &dpif);
+    if (!error) {
+        char v4_or_v6[3] = {0};
+        if (ovs_scan(argv[argc - 1], "%2s", v4_or_v6) &&
+            (!strncmp(v4_or_v6, "v4", 2) || !strncmp(v4_or_v6, "v6", 2))) {
+            error = ct_dpif_ipf_set_enabled(
+                        dpif, !strncmp(v4_or_v6, "v6", 2), enabled);
+            if (!error) {
+                dpctl_print(dpctl_p,
+                            "%s fragmentation reassembly successful",
+                            enabled ? "enabling" : "disabling");
+            } else {
+                dpctl_error(dpctl_p, error,
+                            "%s fragmentation reassembly failed",
+                            enabled ? "enabling" : "disabling");
+            }
+        } else {
+            error = EINVAL;
+            dpctl_error(dpctl_p, error,
+                        "parameter missing: 'v4' for IPv4 or 'v6' for IPv6");
+        }
+        dpif_close(dpif);
+    }
+    return error;
+}
+
+static int
+dpctl_ipf_set_enabled(int argc, const char *argv[],
+                      struct dpctl_params *dpctl_p)
+{
+    return ipf_set_enabled__(argc, argv, dpctl_p, true);
+}
+
+static int
+dpctl_ipf_set_disabled(int argc, const char *argv[],
+                       struct dpctl_params *dpctl_p)
+{
+    return ipf_set_enabled__(argc, argv, dpctl_p, false);
+}
+
+static int
+dpctl_ipf_set_min_frag(int argc, const char *argv[],
+                       struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    int error = opt_dpif_open(argc, argv, dpctl_p, 4, &dpif);
+    if (!error) {
+        char v4_or_v6[3] = {0};
+        if (ovs_scan(argv[argc - 2], "%2s", v4_or_v6) &&
+            (!strncmp(v4_or_v6, "v4", 2) || !strncmp(v4_or_v6, "v6", 2))) {
+            uint32_t min_fragment;
+            if (ovs_scan(argv[argc - 1], "%"SCNu32, &min_fragment)) {
+                error = ct_dpif_ipf_set_min_frag(
+                            dpif, !strncmp(v4_or_v6, "v6", 2), min_fragment);
+                if (!error) {
+                    dpctl_print(dpctl_p,
+                                "setting minimum fragment size successful");
+                } else {
+                    dpctl_error(dpctl_p, error,
+                                "requested minimum fragment size too small;"
+                                " see documentation");
+                }
+            } else {
+                error = EINVAL;
+                dpctl_error(dpctl_p, error,
+                            "parameter missing for minimum fragment size");
+            }
+        } else {
+            error = EINVAL;
+            dpctl_error(dpctl_p, error,
+                        "parameter missing: v4 for IPv4 or v6 for IPv6");
+        }
+        dpif_close(dpif);
+    }
+
+    return error;
+}
+
+static int
+dpctl_ipf_set_max_nfrags(int argc, const char *argv[],
+                         struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    int error = opt_dpif_open(argc, argv, dpctl_p, 3, &dpif);
+    if (!error) {
+        uint32_t nfrags_max;
+        if (ovs_scan(argv[argc - 1], "%"SCNu32, &nfrags_max)) {
+            error = ct_dpif_ipf_set_max_nfrags(dpif, nfrags_max);
+            if (!error) {
+                dpctl_print(dpctl_p,
+                            "setting maximum fragments successful");
+            } else {
+                dpctl_error(dpctl_p, error,
+                            "setting maximum fragments failed");
+            }
+        } else {
+            error = EINVAL;
+            dpctl_error(dpctl_p, error,
+                        "parameter missing for maximum fragments");
+        }
+        dpif_close(dpif);
+    }
+
+    return error;
+}
+
+static void
+dpctl_dump_ipf(struct dpif *dpif, struct dpctl_params *dpctl_p)
+{
+    struct ipf_dump_ctx *dump_ctx;
+    char *dump;
+
+    int error = ct_dpif_ipf_dump_start(dpif, &dump_ctx);
+    if (error) {
+        dpctl_error(dpctl_p, error, "starting ipf list dump");
+        /* Nothing to clean up, just return. */
+        return;
+    }
+
+    dpctl_print(dpctl_p, "\n        Fragment Lists:\n\n");
+    while (!(error = ct_dpif_ipf_dump_next(dpif, dump_ctx, &dump))) {
+        dpctl_print(dpctl_p, "%s\n", dump);
+        free(dump);
+    }
+
+    if (error && error != EOF) {
+        dpctl_error(dpctl_p, error, "dumping ipf lists failed");
+    }
+
+    ct_dpif_ipf_dump_done(dpif, dump_ctx);
+}
+
+static int
+dpctl_ct_ipf_get_status(int argc, const char *argv[],
+                        struct dpctl_params *dpctl_p)
+{
+    struct dpif *dpif;
+    int error = opt_dpif_open(argc, argv, dpctl_p, 2, &dpif);
+
+    if (!error) {
+        struct dpif_ipf_status dpif_ipf_status;
+        error = ct_dpif_ipf_get_status(dpif, &dpif_ipf_status);
+
+        if (!error) {
+            dpctl_print(dpctl_p, "        Fragmentation Module Status\n");
+            dpctl_print(dpctl_p, "        ---------------------------\n");
+            dpctl_print(dpctl_p, "        v4 enabled: %u\n",
+                        dpif_ipf_status.v4.enabled);
+            dpctl_print(dpctl_p, "        v6 enabled: %u\n",
+                        dpif_ipf_status.v6.enabled);
+            dpctl_print(dpctl_p, "        max num frags (v4/v6): %u\n",
+                        dpif_ipf_status.nfrag_max);
+            dpctl_print(dpctl_p, "        num frag: %u\n",
+                        dpif_ipf_status.nfrag);
+            dpctl_print(dpctl_p, "        min v4 frag size: %u\n",
+                        dpif_ipf_status.v4.min_frag_size);
+            dpctl_print(dpctl_p, "        v4 frags accepted: %"PRIu64"\n",
+                        dpif_ipf_status.v4.nfrag_accepted);
+            dpctl_print(dpctl_p, "        v4 frags completed: %"PRIu64"\n",
+                        dpif_ipf_status.v4.nfrag_completed_sent);
+            dpctl_print(dpctl_p, "        v4 frags expired: %"PRIu64"\n",
+                        dpif_ipf_status.v4.nfrag_expired_sent);
+            dpctl_print(dpctl_p, "        v4 frags too small: %"PRIu64"\n",
+                        dpif_ipf_status.v4.nfrag_too_small);
+            dpctl_print(dpctl_p, "        v4 frags overlapped: %"PRIu64"\n",
+                        dpif_ipf_status.v4.nfrag_overlap);
+            dpctl_print(dpctl_p, "        v4 frags purged: %"PRIu64"\n",
+                        dpif_ipf_status.v4.nfrag_purged);
+
+            dpctl_print(dpctl_p, "        min v6 frag size: %u\n",
+                        dpif_ipf_status.v6.min_frag_size);
+            dpctl_print(dpctl_p, "        v6 frags accepted: %"PRIu64"\n",
+                        dpif_ipf_status.v6.nfrag_accepted);
+            dpctl_print(dpctl_p, "        v6 frags completed: %"PRIu64"\n",
+                        dpif_ipf_status.v6.nfrag_completed_sent);
+            dpctl_print(dpctl_p, "        v6 frags expired: %"PRIu64"\n",
+                        dpif_ipf_status.v6.nfrag_expired_sent);
+            dpctl_print(dpctl_p, "        v6 frags too small: %"PRIu64"\n",
+                        dpif_ipf_status.v6.nfrag_too_small);
+            dpctl_print(dpctl_p, "        v6 frags overlapped: %"PRIu64"\n",
+                        dpif_ipf_status.v6.nfrag_overlap);
+            dpctl_print(dpctl_p, "        v6 frags purged: %"PRIu64"\n",
+                        dpif_ipf_status.v6.nfrag_purged);
+        } else {
+            dpctl_error(dpctl_p, error,
+                        "ipf status could not be retrieved");
+            return error;
+        }
+
+        if (dpctl_p->verbosity) {
+            dpctl_dump_ipf(dpif, dpctl_p);
+        }
+
+        dpif_close(dpif);
+    }
+
+    return error;
+}
+
 /* Undocumented commands for unit testing. */
 
 static int
@@ -1263,7 +2421,7 @@ dpctl_parse_actions(int argc, const char *argv[], struct dpctl_params* dpctl_p)
         }
 
         ds_init(&s);
-        format_odp_actions(&s, actions.data, actions.size);
+        format_odp_actions(&s, actions.data, actions.size, NULL);
         dpctl_print(dpctl_p, "%s\n", ds_cstr(&s));
         ds_destroy(&s);
 
@@ -1380,6 +2538,7 @@ dpctl_normalize_actions(int argc, const char *argv[],
     struct ds s;
     int left;
     int i, error;
+    int encaps = 0;
 
     ds_init(&s);
 
@@ -1400,9 +2559,12 @@ dpctl_normalize_actions(int argc, const char *argv[],
 
     /* Parse flow key. */
     ofpbuf_init(&keybuf, 0);
-    error = odp_flow_from_string(argv[1], &port_names, &keybuf, NULL);
+    char *error_s;
+    error = odp_flow_from_string(argv[1], &port_names, &keybuf, NULL,
+                                 &error_s);
     if (error) {
-        dpctl_error(dpctl_p, error, "odp_flow_key_from_string");
+        dpctl_error(dpctl_p, error, "odp_flow_key_from_string (%s)", error_s);
+        free(error_s);
         goto out_freekeybuf;
     }
 
@@ -1411,9 +2573,11 @@ dpctl_normalize_actions(int argc, const char *argv[],
                     &s, dpctl_p->verbosity);
     dpctl_print(dpctl_p, "input flow: %s\n", ds_cstr(&s));
 
-    error = odp_flow_key_to_flow(keybuf.data, keybuf.size, &flow);
+    error = odp_flow_key_to_flow(keybuf.data, keybuf.size, &flow, &error_s);
     if (error) {
-        dpctl_error(dpctl_p, error, "odp_flow_key_to_flow");
+        dpctl_error(dpctl_p, error, "odp_flow_key_to_flow failed (%s)",
+                    error_s ? error_s : "reason unknown");
+        free(error_s);
         goto out_freekeybuf;
     }
 
@@ -1427,7 +2591,7 @@ dpctl_normalize_actions(int argc, const char *argv[],
 
     if (dpctl_p->verbosity) {
         ds_clear(&s);
-        format_odp_actions(&s, odp_actions.data, odp_actions.size);
+        format_odp_actions(&s, odp_actions.data, odp_actions.size, NULL);
         dpctl_print(dpctl_p, "input actions: %s\n", ds_cstr(&s));
     }
 
@@ -1436,12 +2600,14 @@ dpctl_normalize_actions(int argc, const char *argv[],
         const struct ovs_action_push_vlan *push;
         switch(nl_attr_type(a)) {
         case OVS_ACTION_ATTR_POP_VLAN:
-            flow.vlan_tci = htons(0);
+            flow_pop_vlan(&flow, NULL);
             continue;
 
         case OVS_ACTION_ATTR_PUSH_VLAN:
+            flow_push_vlan_uninit(&flow, NULL);
             push = nl_attr_get_unspec(a, sizeof *push);
-            flow.vlan_tci = push->vlan_tci;
+            flow.vlans[0].tpid = push->vlan_tpid;
+            flow.vlans[0].tci = push->vlan_tci;
             continue;
         }
 
@@ -1463,16 +2629,25 @@ dpctl_normalize_actions(int argc, const char *argv[],
     qsort(afs, n_afs, sizeof *afs, compare_actions_for_flow);
 
     for (i = 0; i < n_afs; i++) {
-        struct actions_for_flow *af = afs[i];
-
+        af = afs[i];
         sort_output_actions(af->actions.data, af->actions.size);
 
-        if (af->flow.vlan_tci != htons(0)) {
-            dpctl_print(dpctl_p, "vlan(vid=%"PRIu16",pcp=%d): ",
-                        vlan_tci_to_vid(af->flow.vlan_tci),
-                        vlan_tci_to_pcp(af->flow.vlan_tci));
-        } else {
-            dpctl_print(dpctl_p, "no vlan: ");
+        for (encaps = 0; encaps < FLOW_MAX_VLAN_HEADERS; encaps ++) {
+            union flow_vlan_hdr *vlan = &af->flow.vlans[encaps];
+            if (vlan->tci != htons(0)) {
+                dpctl_print(dpctl_p, "vlan(");
+                if (vlan->tpid != htons(ETH_TYPE_VLAN)) {
+                    dpctl_print(dpctl_p, "tpid=0x%04"PRIx16",", vlan->tpid);
+                }
+                dpctl_print(dpctl_p, "vid=%"PRIu16",pcp=%d): ",
+                            vlan_tci_to_vid(vlan->tci),
+                            vlan_tci_to_pcp(vlan->tci));
+            } else {
+                if (encaps == 0) {
+                    dpctl_print(dpctl_p, "no vlan: ");
+                }
+                break;
+            }
         }
 
         if (eth_type_mpls(af->flow.dl_type)) {
@@ -1485,7 +2660,7 @@ dpctl_normalize_actions(int argc, const char *argv[],
         }
 
         ds_clear(&s);
-        format_odp_actions(&s, af->actions.data, af->actions.size);
+        format_odp_actions(&s, af->actions.data, af->actions.size, NULL);
         dpctl_puts(dpctl_p, false, ds_cstr(&s));
 
         ofpbuf_uninit(&af->actions);
@@ -1506,27 +2681,61 @@ out:
 }
 
 static const struct dpctl_command all_commands[] = {
-    { "add-dp", "add-dp dp [iface...]", 1, INT_MAX, dpctl_add_dp },
-    { "del-dp", "del-dp dp", 1, 1, dpctl_del_dp },
-    { "add-if", "add-if dp iface...", 2, INT_MAX, dpctl_add_if },
-    { "del-if", "del-if dp iface...", 2, INT_MAX, dpctl_del_if },
-    { "set-if", "set-if dp iface...", 2, INT_MAX, dpctl_set_if },
-    { "dump-dps", "", 0, 0, dpctl_dump_dps },
-    { "show", "[dp...]", 0, INT_MAX, dpctl_show },
-    { "dump-flows", "[dp]", 0, 2, dpctl_dump_flows },
-    { "add-flow", "add-flow [dp] flow actions", 2, 3, dpctl_add_flow },
-    { "mod-flow", "mod-flow [dp] flow actions", 2, 3, dpctl_mod_flow },
-    { "get-flow", "get-flow [dp] ufid", 1, 2, dpctl_get_flow },
-    { "del-flow", "del-flow [dp] flow", 1, 2, dpctl_del_flow },
-    { "del-flows", "[dp]", 0, 1, dpctl_del_flows },
-    { "help", "", 0, INT_MAX, dpctl_help },
-    { "list-commands", "", 0, INT_MAX, dpctl_list_commands },
+    { "add-dp", "dp [iface...]", 1, INT_MAX, dpctl_add_dp, DP_RW },
+    { "del-dp", "dp", 1, 1, dpctl_del_dp, DP_RW },
+    { "add-if", "dp iface...", 2, INT_MAX, dpctl_add_if, DP_RW },
+    { "del-if", "dp iface...", 2, INT_MAX, dpctl_del_if, DP_RW },
+    { "set-if", "dp iface...", 2, INT_MAX, dpctl_set_if, DP_RW },
+    { "dump-dps", "", 0, 0, dpctl_dump_dps, DP_RO },
+    { "show", "[-s] [dp...]", 0, INT_MAX, dpctl_show, DP_RO },
+    { "dump-flows", "[-m] [--names] [dp] [filter=..] [type=..] [pmd=..]",
+      0, 6, dpctl_dump_flows, DP_RO },
+    { "add-flow", "[dp] flow actions", 2, 3, dpctl_add_flow, DP_RW },
+    { "mod-flow", "[dp] flow actions", 2, 3, dpctl_mod_flow, DP_RW },
+    { "get-flow", "[dp] ufid", 1, 2, dpctl_get_flow, DP_RO },
+    { "del-flow", "[dp] flow", 1, 2, dpctl_del_flow, DP_RW },
+    { "add-flows", "[dp] file", 1, 2, dpctl_process_flows, DP_RW },
+    { "mod-flows", "[dp] file", 1, 2, dpctl_process_flows, DP_RW },
+    { "del-flows", "[dp] [file]", 0, 2, dpctl_del_flows, DP_RW },
+    { "dump-conntrack", "[-m] [-s] [dp] [zone=N]",
+      0, 4, dpctl_dump_conntrack, DP_RO },
+    { "flush-conntrack", "[dp] [zone=N] [ct-tuple]", 0, 3,
+      dpctl_flush_conntrack, DP_RW },
+    { "ct-stats-show", "[dp] [zone=N]",
+      0, 3, dpctl_ct_stats_show, DP_RO },
+    { "ct-bkts", "[dp] [gt=N]", 0, 2, dpctl_ct_bkts, DP_RO },
+    { "ct-set-maxconns", "[dp] maxconns", 1, 2, dpctl_ct_set_maxconns,
+       DP_RW },
+    { "ct-get-maxconns", "[dp]", 0, 1, dpctl_ct_get_maxconns, DP_RO },
+    { "ct-get-nconns", "[dp]", 0, 1, dpctl_ct_get_nconns, DP_RO },
+    { "ct-enable-tcp-seq-chk", "[dp]", 0, 1, dpctl_ct_enable_tcp_seq_chk,
+       DP_RW },
+    { "ct-disable-tcp-seq-chk", "[dp]", 0, 1, dpctl_ct_disable_tcp_seq_chk,
+       DP_RW },
+    { "ct-get-tcp-seq-chk", "[dp]", 0, 1, dpctl_ct_get_tcp_seq_chk, DP_RO },
+    { "ct-set-limits", "[dp] [default=L] [zone=N,limit=L]...", 1, INT_MAX,
+        dpctl_ct_set_limits, DP_RO },
+    { "ct-del-limits", "[dp] zone=N1[,N2]...", 1, 2, dpctl_ct_del_limits,
+        DP_RO },
+    { "ct-get-limits", "[dp] [zone=N1[,N2]...]", 0, 2, dpctl_ct_get_limits,
+        DP_RO },
+    { "ipf-set-enabled", "[dp] v4|v6", 1, 2, dpctl_ipf_set_enabled, DP_RW },
+    { "ipf-set-disabled", "[dp] v4|v6", 1, 2, dpctl_ipf_set_disabled, DP_RW },
+    { "ipf-set-min-frag", "[dp] v4|v6 minfragment", 2, 3,
+       dpctl_ipf_set_min_frag, DP_RW },
+    { "ipf-set-max-nfrags", "[dp] maxfrags", 1, 2,
+       dpctl_ipf_set_max_nfrags, DP_RW },
+    { "ipf-get-status", "[dp]", 0, 1, dpctl_ct_ipf_get_status,
+       DP_RO },
+    { "help", "", 0, INT_MAX, dpctl_help, DP_RO },
+    { "list-commands", "", 0, INT_MAX, dpctl_list_commands, DP_RO },
 
     /* Undocumented commands for testing. */
-    { "parse-actions", "actions", 1, INT_MAX, dpctl_parse_actions },
-    { "normalize-actions", "actions", 2, INT_MAX, dpctl_normalize_actions },
+    { "parse-actions", "actions", 1, INT_MAX, dpctl_parse_actions, DP_RO },
+    { "normalize-actions", "actions",
+      2, INT_MAX, dpctl_normalize_actions, DP_RO },
 
-    { NULL, NULL, 0, 0, NULL },
+    { NULL, NULL, 0, 0, NULL, DP_RO },
 };
 
 static const struct dpctl_command *get_all_dpctl_commands(void)
@@ -1541,7 +2750,6 @@ int
 dpctl_run_command(int argc, const char *argv[], struct dpctl_params *dpctl_p)
 {
     const struct dpctl_command *p;
-
     if (argc < 1) {
         dpctl_error(dpctl_p, 0, "missing command name; use --help for help");
         return EINVAL;
@@ -1561,6 +2769,12 @@ dpctl_run_command(int argc, const char *argv[], struct dpctl_params *dpctl_p)
                             p->name, p->max_args);
                 return EINVAL;
             } else {
+                if (p->mode == DP_RW && dpctl_p->read_only) {
+                    dpctl_error(dpctl_p, 0,
+                                "'%s' command does not work in read only mode",
+                                p->name);
+                    return EINVAL;
+                }
                 return p->handler(argc, argv, dpctl_p);
             }
         }
@@ -1583,19 +2797,18 @@ dpctl_unixctl_handler(struct unixctl_conn *conn, int argc, const char *argv[],
                       void *aux)
 {
     struct ds ds = DS_EMPTY_INITIALIZER;
-    struct dpctl_params dpctl_p;
     bool error = false;
 
-    dpctl_command_handler *handler = (dpctl_command_handler *) aux;
-
-    dpctl_p.print_statistics = false;
-    dpctl_p.zero_statistics = false;
-    dpctl_p.may_create = false;
-    dpctl_p.verbosity = 0;
+    struct dpctl_params dpctl_p = {
+        .is_appctl = true,
+        .output = dpctl_unixctl_print,
+        .aux = &ds,
+    };
 
     /* Parse options (like getopt). Unfortunately it does
      * not seem a good idea to call getopt_long() here, since it uses global
      * variables */
+    bool set_names = false;
     while (argc > 1 && !error) {
         const char *arg = argv[1];
         if (!strncmp(arg, "--", 2)) {
@@ -1608,6 +2821,12 @@ dpctl_unixctl_handler(struct unixctl_conn *conn, int argc, const char *argv[],
                 dpctl_p.may_create = true;
             } else if (!strcmp(arg, "--more")) {
                 dpctl_p.verbosity++;
+            } else if (!strcmp(arg, "--names")) {
+                dpctl_p.names = true;
+                set_names = true;
+            } else if (!strcmp(arg, "--no-names")) {
+                dpctl_p.names = false;
+                set_names = true;
             } else {
                 ds_put_format(&ds, "Unrecognized option %s", argv[1]);
                 error = true;
@@ -1642,12 +2861,12 @@ dpctl_unixctl_handler(struct unixctl_conn *conn, int argc, const char *argv[],
         argv++;
         argc--;
     }
+    if (!set_names) {
+        dpctl_p.names = dpctl_p.verbosity > 0;
+    }
 
     if (!error) {
-        dpctl_p.is_appctl = true;
-        dpctl_p.output = dpctl_unixctl_print;
-        dpctl_p.aux = &ds;
-
+        dpctl_command_handler *handler = (dpctl_command_handler *) aux;
         error = handler(argc, argv, &dpctl_p) != 0;
     }
 
@@ -1666,9 +2885,15 @@ dpctl_unixctl_register(void)
     const struct dpctl_command *p;
 
     for (p = all_commands; p->name != NULL; p++) {
-        char *cmd_name = xasprintf("dpctl/%s", p->name);
-        unixctl_command_register(cmd_name, "", p->min_args, p->max_args,
-                                 dpctl_unixctl_handler, p->handler);
-        free(cmd_name);
+        if (strcmp(p->name, "help")) {
+            char *cmd_name = xasprintf("dpctl/%s", p->name);
+            unixctl_command_register(cmd_name,
+                                     p->usage,
+                                     p->min_args,
+                                     p->max_args,
+                                     dpctl_unixctl_handler,
+                                     p->handler);
+            free(cmd_name);
+        }
     }
 }

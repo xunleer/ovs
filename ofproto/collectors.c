@@ -40,7 +40,7 @@ struct collectors {
  * otherwise a positive errno value if opening at least one collector failed.
  *
  * Each target in 'targets' should be a string in the format "<host>[:<port>]".
- * <port> may be omitted if 'default_port' is nonzero, in which case it
+ * <port> may be omitted if 'default_port' is nonnegative, in which case it
  * defaults to 'default_port'.
  *
  * '*collectorsp' is set to a null pointer if no targets were successfully
@@ -49,7 +49,7 @@ struct collectors {
  * is nonnull, and even on a successful return, it is possible that
  * '*collectorsp' is null, if 'target's is an empty sset. */
 int
-collectors_create(const struct sset *targets, uint16_t default_port,
+collectors_create(const struct sset *targets, int default_port,
                   struct collectors **collectorsp)
 {
     struct collectors *c;
@@ -102,10 +102,13 @@ collectors_destroy(struct collectors *c)
     }
 }
 
-/* Sends the 'n'-byte 'payload' to each of the collectors in 'c'. */
-void
+/* Sends the 'n'-byte 'payload' to each of the collectors in 'c'.
+ * Return the number of IPFIX packets which were sent unsuccessfully*/
+size_t
 collectors_send(const struct collectors *c, const void *payload, size_t n)
 {
+    size_t errors = 0;
+
     if (c) {
         size_t i;
 
@@ -116,9 +119,12 @@ collectors_send(const struct collectors *c, const void *payload, size_t n)
                 VLOG_WARN_RL(&rl, "%s: sending to collector failed (%s)",
                              s, ovs_strerror(errno));
                 free(s);
+                errors++;
             }
         }
     }
+
+    return errors;
 }
 
 int

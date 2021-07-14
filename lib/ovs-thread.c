@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2013, 2014, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,10 +26,9 @@
 #include "compiler.h"
 #include "fatal-signal.h"
 #include "hash.h"
-#include "list.h"
-#include "netdev-dpdk.h"
+#include "openvswitch/list.h"
 #include "ovs-rcu.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "seq.h"
 #include "socket-util.h"
 #include "util.h"
@@ -76,6 +75,9 @@ static bool multithreaded;
 LOCK_FUNCTION(mutex, lock);
 LOCK_FUNCTION(rwlock, rdlock);
 LOCK_FUNCTION(rwlock, wrlock);
+#ifdef HAVE_PTHREAD_SPIN_LOCK
+LOCK_FUNCTION(spin, lock);
+#endif
 
 #define TRY_LOCK_FUNCTION(TYPE, FUN) \
     int \
@@ -104,6 +106,9 @@ LOCK_FUNCTION(rwlock, wrlock);
 TRY_LOCK_FUNCTION(mutex, trylock);
 TRY_LOCK_FUNCTION(rwlock, tryrdlock);
 TRY_LOCK_FUNCTION(rwlock, trywrlock);
+#ifdef HAVE_PTHREAD_SPIN_LOCK
+TRY_LOCK_FUNCTION(spin, trylock);
+#endif
 
 #define UNLOCK_FUNCTION(TYPE, FUN, WHERE) \
     void \
@@ -119,13 +124,17 @@ TRY_LOCK_FUNCTION(rwlock, trywrlock);
         l->where = WHERE; \
         error = pthread_##TYPE##_##FUN(&l->lock); \
         if (OVS_UNLIKELY(error)) { \
-            ovs_abort(error, "pthread_%s_%sfailed", #TYPE, #FUN); \
+            ovs_abort(error, "pthread_%s_%s failed", #TYPE, #FUN); \
         } \
     }
 UNLOCK_FUNCTION(mutex, unlock, "<unlocked>");
 UNLOCK_FUNCTION(mutex, destroy, NULL);
 UNLOCK_FUNCTION(rwlock, unlock, "<unlocked>");
 UNLOCK_FUNCTION(rwlock, destroy, NULL);
+#ifdef HAVE_PTHREAD_SPIN_LOCK
+UNLOCK_FUNCTION(spin, unlock, "<unlocked>");
+UNLOCK_FUNCTION(spin, destroy, NULL);
+#endif
 
 #define XPTHREAD_FUNC1(FUNCTION, PARAM1)                \
     void                                                \
@@ -155,8 +164,6 @@ UNLOCK_FUNCTION(rwlock, destroy, NULL);
         }                                               \
     }
 
-XPTHREAD_FUNC1(pthread_mutex_lock, pthread_mutex_t *);
-XPTHREAD_FUNC1(pthread_mutex_unlock, pthread_mutex_t *);
 XPTHREAD_FUNC1(pthread_mutexattr_init, pthread_mutexattr_t *);
 XPTHREAD_FUNC1(pthread_mutexattr_destroy, pthread_mutexattr_t *);
 XPTHREAD_FUNC2(pthread_mutexattr_settype, pthread_mutexattr_t *, int);
@@ -230,37 +237,67 @@ void
 ovs_rwlock_init(const struct ovs_rwlock *l_)
 {
     struct ovs_rwlock *l = CONST_CAST(struct ovs_rwlock *, l_);
-    pthread_rwlockattr_t attr;
     int error;
 
     l->where = "<unlocked>";
 
-    xpthread_rwlockattr_init(&attr);
 #ifdef PTHREAD_RWLOCK_WRITER_NONRECURSIVE_INITIALIZER_NP
+    pthread_rwlockattr_t attr;
+    xpthread_rwlockattr_init(&attr);
     xpthread_rwlockattr_setkind_np(
         &attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-#endif
+    error = pthread_rwlock_init(&l->lock, &attr);
+    xpthread_rwlockattr_destroy(&attr);
+#else
+    /* It is important to avoid passing a rwlockattr in this case because
+     * Windows pthreads 2.9.1 (and earlier) fail and abort if passed one, even
+     * one without any special attributes. */
     error = pthread_rwlock_init(&l->lock, NULL);
+#endif
+
     if (OVS_UNLIKELY(error)) {
         ovs_abort(error, "pthread_rwlock_init failed");
     }
-    xpthread_rwlockattr_destroy(&attr);
 }
 
+/* Provides an error-checking wrapper around pthread_cond_wait().
+ *
+ * If the wait can take a significant amount of time, consider bracketing this
+ * call with calls to ovsrcu_quiesce_start() and ovsrcu_quiesce_end().  */
 void
 ovs_mutex_cond_wait(pthread_cond_t *cond, const struct ovs_mutex *mutex_)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
 {
     struct ovs_mutex *mutex = CONST_CAST(struct ovs_mutex *, mutex_);
     int error;
 
-    ovsrcu_quiesce_start();
     error = pthread_cond_wait(cond, &mutex->lock);
-    ovsrcu_quiesce_end();
 
     if (OVS_UNLIKELY(error)) {
         ovs_abort(error, "pthread_cond_wait failed");
     }
 }
+
+#ifdef HAVE_PTHREAD_SPIN_LOCK
+static void
+ovs_spin_init__(const struct ovs_spin *l_, int pshared)
+{
+    struct ovs_spin *l = CONST_CAST(struct ovs_spin *, l_);
+    int error;
+
+    l->where = "<unlocked>";
+    error = pthread_spin_init(&l->lock, pshared);
+    if (OVS_UNLIKELY(error)) {
+        ovs_abort(error, "pthread_spin_init failed");
+    }
+}
+
+void
+ovs_spin_init(const struct ovs_spin *spin)
+{
+    ovs_spin_init__(spin, PTHREAD_PROCESS_PRIVATE);
+}
+#endif
 
 /* Initializes the 'barrier'.  'size' is the number of threads
  * expected to hit the barrier. */
@@ -307,7 +344,7 @@ ovs_barrier_block(struct ovs_barrier *barrier)
     }
 }
 
-DEFINE_EXTERN_PER_THREAD_DATA(ovsthread_id, 0);
+DEFINE_EXTERN_PER_THREAD_DATA(ovsthread_id, OVSTHREAD_ID_UNSET);
 
 struct ovsthread_aux {
     void *(*start)(void *);
@@ -315,17 +352,23 @@ struct ovsthread_aux {
     char name[16];
 };
 
+unsigned int
+ovsthread_id_init(void)
+{
+    static atomic_count next_id = ATOMIC_COUNT_INIT(0);
+
+    ovs_assert(*ovsthread_id_get() == OVSTHREAD_ID_UNSET);
+    return *ovsthread_id_get() = atomic_count_inc(&next_id);
+}
+
 static void *
 ovsthread_wrapper(void *aux_)
 {
-    static atomic_count next_id = ATOMIC_COUNT_INIT(1);
-
     struct ovsthread_aux *auxp = aux_;
     struct ovsthread_aux aux;
     unsigned int id;
 
-    id = atomic_count_inc(&next_id);
-    *ovsthread_id_get() = id;
+    id = ovsthread_id_init();
 
     aux = *auxp;
     free(auxp);
@@ -340,28 +383,72 @@ ovsthread_wrapper(void *aux_)
     return aux.start(aux.arg);
 }
 
+static void
+set_min_stack_size(pthread_attr_t *attr, size_t min_stacksize)
+{
+    size_t stacksize;
+    int error;
+
+    error = pthread_attr_getstacksize(attr, &stacksize);
+    if (error) {
+        ovs_abort(error, "pthread_attr_getstacksize failed");
+    }
+
+    if (stacksize < min_stacksize) {
+        error = pthread_attr_setstacksize(attr, min_stacksize);
+        if (error) {
+            ovs_abort(error, "pthread_attr_setstacksize failed");
+        }
+    }
+}
+
 /* Starts a thread that calls 'start(arg)'.  Sets the thread's name to 'name'
  * (suffixed by its ovsthread_id()).  Returns the new thread's pthread_t. */
 pthread_t
 ovs_thread_create(const char *name, void *(*start)(void *), void *arg)
 {
+    static struct ovsthread_once once = OVSTHREAD_ONCE_INITIALIZER;
     struct ovsthread_aux *aux;
     pthread_t thread;
     int error;
 
     forbid_forking("multiple threads exist");
-    multithreaded = true;
-    ovsrcu_quiesce_end();
 
+    if (ovsthread_once_start(&once)) {
+        /* The first call to this function has to happen in the main thread.
+         * Before the process becomes multithreaded we make sure that the
+         * main thread is considered non quiescent.
+         *
+         * For other threads this is done in ovs_thread_wrapper(), but the
+         * main thread has no such wrapper.
+         *
+         * There's no reason to call ovsrcu_quiesce_end() in subsequent
+         * invocations of this function and it might introduce problems
+         * for other threads. */
+        ovsrcu_quiesce_end();
+        ovsthread_once_done(&once);
+    }
+
+    multithreaded = true;
     aux = xmalloc(sizeof *aux);
     aux->start = start;
     aux->arg = arg;
     ovs_strlcpy(aux->name, name, sizeof aux->name);
 
-    error = pthread_create(&thread, NULL, ovsthread_wrapper, aux);
+    /* Some small systems use a default stack size as small as 80 kB, but OVS
+     * requires approximately 384 kB according to the following analysis:
+     * https://mail.openvswitch.org/pipermail/ovs-dev/2016-January/308592.html
+     *
+     * We use 512 kB to give us some margin of error. */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    set_min_stack_size(&attr, 512 * 1024);
+
+    error = pthread_create(&thread, &attr, ovsthread_wrapper, aux);
     if (error) {
         ovs_abort(error, "pthread_create failed");
     }
+    pthread_attr_destroy(&attr);
     return thread;
 }
 
@@ -501,67 +588,8 @@ ovs_thread_stats_next_bucket(const struct ovsthread_stats *stats, size_t i)
 }
 
 
-/* Parses /proc/cpuinfo for the total number of physical cores on this system
- * across all CPU packages, not counting hyper-threads.
- *
- * Sets *n_cores to the total number of cores on this system, or 0 if the
+/* Returns the total number of cores available to this process, or 0 if the
  * number cannot be determined. */
-static void
-parse_cpuinfo(long int *n_cores)
-{
-    static const char file_name[] = "/proc/cpuinfo";
-    char line[128];
-    uint64_t cpu = 0; /* Support up to 64 CPU packages on a single system. */
-    long int cores = 0;
-    FILE *stream;
-
-    stream = fopen(file_name, "r");
-    if (!stream) {
-        VLOG_DBG("%s: open failed (%s)", file_name, ovs_strerror(errno));
-        return;
-    }
-
-    while (fgets(line, sizeof line, stream)) {
-        unsigned int id;
-
-        /* Find the next CPU package. */
-        if (ovs_scan(line, "physical id%*[^:]: %u", &id)) {
-            if (id > 63) {
-                VLOG_WARN("Counted over 64 CPU packages on this system. "
-                          "Parsing %s for core count may be inaccurate.",
-                          file_name);
-                cores = 0;
-                break;
-            }
-
-            if (cpu & (1ULL << id)) {
-                /* We've already counted this package's cores. */
-                continue;
-            }
-            cpu |= 1ULL << id;
-
-            /* Find the number of cores for this package. */
-            while (fgets(line, sizeof line, stream)) {
-                int count;
-
-                if (ovs_scan(line, "cpu cores%*[^:]: %u", &count)) {
-                    cores += count;
-                    break;
-                }
-            }
-        }
-    }
-    fclose(stream);
-
-    *n_cores = cores;
-}
-
-/* Returns the total number of cores on this system, or 0 if the number cannot
- * be determined.
- *
- * Tries not to count hyper-threads, but may be inaccurate - particularly on
- * platforms that do not provide /proc/cpuinfo, but also if /proc/cpuinfo is
- * formatted different to the layout that parse_cpuinfo() expects. */
 int
 count_cpu_cores(void)
 {
@@ -570,10 +598,21 @@ count_cpu_cores(void)
 
     if (ovsthread_once_start(&once)) {
 #ifndef _WIN32
-        parse_cpuinfo(&n_cores);
-        if (!n_cores) {
-            n_cores = sysconf(_SC_NPROCESSORS_ONLN);
+        n_cores = sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef __linux__
+        if (n_cores > 0) {
+            cpu_set_t *set = CPU_ALLOC(n_cores);
+
+            if (set) {
+                size_t size = CPU_ALLOC_SIZE(n_cores);
+
+                if (!sched_getaffinity(0, size, set)) {
+                    n_cores = CPU_COUNT_S(size, set);
+                }
+                CPU_FREE(set);
+            }
         }
+#endif
 #else
         SYSTEM_INFO sysinfo;
         GetSystemInfo(&sysinfo);
@@ -584,6 +623,15 @@ count_cpu_cores(void)
 
     return n_cores > 0 ? n_cores : 0;
 }
+
+/* Returns 'true' if current thread is PMD thread. */
+bool
+thread_is_pmd(void)
+{
+    const char *name = get_subprogram_name();
+    return !strncmp(name, "pmd", 3);
+}
+
 
 /* ovsthread_key. */
 
@@ -655,7 +703,7 @@ ovsthread_key_destruct__(void *slots_)
     int i;
 
     ovs_mutex_lock(&key_mutex);
-    list_remove(&slots->list_node);
+    ovs_list_remove(&slots->list_node);
     LIST_FOR_EACH (key, list_node, &inuse_keys) {
         void *value = clear_slot(slots, key->index);
         if (value && key->destructor) {
@@ -665,7 +713,7 @@ ovsthread_key_destruct__(void *slots_)
     n = n_keys;
     ovs_mutex_unlock(&key_mutex);
 
-    for (i = 0; i < n / L2_SIZE; i++) {
+    for (i = 0; i < DIV_ROUND_UP(n, L2_SIZE); i++) {
         free(slots->p1[i]);
     }
     free(slots);
@@ -705,17 +753,17 @@ ovsthread_key_create(ovsthread_key_t *keyp, void (*destructor)(void *))
     }
 
     ovs_mutex_lock(&key_mutex);
-    if (list_is_empty(&free_keys)) {
+    if (ovs_list_is_empty(&free_keys)) {
         key = xmalloc(sizeof *key);
         key->index = n_keys++;
         if (key->index >= MAX_KEYS) {
             abort();
         }
     } else {
-        key = CONTAINER_OF(list_pop_back(&free_keys),
+        key = CONTAINER_OF(ovs_list_pop_back(&free_keys),
                             struct ovsthread_key, list_node);
     }
-    list_push_back(&inuse_keys, &key->list_node);
+    ovs_list_push_back(&inuse_keys, &key->list_node);
     key->destructor = destructor;
     ovs_mutex_unlock(&key_mutex);
 
@@ -734,8 +782,8 @@ ovsthread_key_delete(ovsthread_key_t key)
     ovs_mutex_lock(&key_mutex);
 
     /* Move 'key' from 'inuse_keys' to 'free_keys'. */
-    list_remove(&key->list_node);
-    list_push_back(&free_keys, &key->list_node);
+    ovs_list_remove(&key->list_node);
+    ovs_list_push_back(&free_keys, &key->list_node);
 
     /* Clear this slot in all threads. */
     LIST_FOR_EACH (slots, list_node, &slots_list) {
@@ -757,7 +805,7 @@ ovsthread_key_lookup__(const struct ovsthread_key *key)
 
         ovs_mutex_lock(&key_mutex);
         pthread_setspecific(tsd_key, slots);
-        list_push_back(&slots_list, &slots->list_node);
+        ovs_list_push_back(&slots_list, &slots->list_node);
         ovs_mutex_unlock(&key_mutex);
     }
 

@@ -16,21 +16,6 @@ static inline __be16 nla_get_be16(const struct nlattr *nla)
 }
 #endif  /* !HAVE_NLA_GET_BE16 */
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,34)
-/* This function was introduced in 2.6.31, but initially it performed an
- * unaligned access, so we replace it up to 2.6.34 where it was fixed.  */
-#define nla_get_be64 rpl_nla_get_be64
-static inline __be64 nla_get_be64(const struct nlattr *nla)
-{
-	__be64 tmp;
-
-	/* The additional cast is necessary because  */
-	nla_memcpy(&tmp, (struct nlattr *) nla, sizeof(tmp));
-
-	return tmp;
-}
-#endif
-
 #ifndef HAVE_NLA_PUT_BE16
 static inline int nla_put_be16(struct sk_buff *skb, int attrtype, __be16 value)
 {
@@ -96,6 +81,105 @@ static inline struct in6_addr nla_get_in6_addr(const struct nlattr *nla)
 	nla_memcpy(&tmp, nla, sizeof(tmp));
 	return tmp;
 }
+#endif
+
+#ifndef HAVE_NLA_PUT_64BIT
+static inline bool nla_need_padding_for_64bit(struct sk_buff *skb)
+{
+#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+	/* The nlattr header is 4 bytes in size, that's why we test
+	 * if the skb->data _is_ aligned.  A NOP attribute, plus
+	 * nlattr header for next attribute, will make nla_data()
+	 * 8-byte aligned.
+	 */
+	if (IS_ALIGNED((unsigned long)skb_tail_pointer(skb), 8))
+		return true;
+#endif
+	return false;
+}
+
+static inline int nla_align_64bit(struct sk_buff *skb, int padattr)
+{
+	if (nla_need_padding_for_64bit(skb) &&
+	    !nla_reserve(skb, padattr, 0))
+		return -EMSGSIZE;
+
+	return 0;
+}
+
+static inline int nla_total_size_64bit(int payload)
+{
+	return NLA_ALIGN(nla_attr_size(payload))
+#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+		+ NLA_ALIGN(nla_attr_size(0))
+#endif
+		;
+}
+
+#define nla_put_64bit rpl_nla_put_64bit
+int rpl_nla_put_64bit(struct sk_buff *skb, int attrtype, int attrlen,
+		  const void *data, int padattr);
+
+#define __nla_put_64bit rpl___nla_put_64bit
+void rpl___nla_put_64bit(struct sk_buff *skb, int attrtype, int attrlen,
+                     const void *data, int padattr);
+
+#define __nla_reserve_64bit rpl___nla_reserve_64bit
+struct nlattr *rpl___nla_reserve_64bit(struct sk_buff *skb, int attrtype,
+				   int attrlen, int padattr);
+
+static inline int nla_put_u64_64bit(struct sk_buff *skb, int attrtype,
+                                    u64 value, int padattr)
+{
+        return nla_put_64bit(skb, attrtype, sizeof(u64), &value, padattr);
+}
+
+#define nla_put_be64 rpl_nla_put_be64
+static inline int nla_put_be64(struct sk_buff *skb, int attrtype, __be64 value,
+                               int padattr)
+{
+        return nla_put_64bit(skb, attrtype, sizeof(__be64), &value, padattr);
+}
+
+#endif
+
+#ifndef HAVE_NLA_PARSE_DEPRECATED_STRICT
+#define nla_parse_nested_deprecated nla_parse_nested
+#define nla_parse_deprecated_strict nla_parse
+#define genlmsg_parse_deprecated genlmsg_parse
+
+#ifndef HAVE_NETLINK_EXT_ACK
+struct netlink_ext_ack;
+
+static inline int rpl_nla_parse_nested(struct nlattr *tb[], int maxtype,
+				       const struct nlattr *nla,
+				       const struct nla_policy *policy,
+				       struct netlink_ext_ack *extack)
+{
+	return nla_parse_nested(tb, maxtype, nla, policy);
+}
+#undef nla_parse_nested_deprecated
+#define nla_parse_nested_deprecated rpl_nla_parse_nested
+
+static inline int rpl_nla_parse(struct nlattr **tb, int maxtype,
+				const struct nlattr *head, int len,
+				const struct nla_policy *policy,
+				struct netlink_ext_ack *extack)
+{
+	return nla_parse(tb, maxtype, head, len, policy);
+}
+#undef nla_parse_deprecated_strict
+#define nla_parse_deprecated_strict rpl_nla_parse
+#endif
+#endif /* HAVE_NLA_PARSE_DEPRECATED_STRICT */
+
+#ifndef HAVE_NLA_NEST_START_NOFLAG
+static inline struct nlattr *rpl_nla_nest_start_noflag(struct sk_buff *skb,
+						       int attrtype)
+{
+	return nla_nest_start(skb, attrtype);
+}
+#define nla_nest_start_noflag rpl_nla_nest_start_noflag
 #endif
 
 #endif /* net/netlink.h */

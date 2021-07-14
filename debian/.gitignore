@@ -1,9 +1,13 @@
 *.debhelper
 *.debhelper.log
 *.substvars
+/autoreconf.after
+/autoreconf.before
 /control
 /copyright
 /files
+/libopenvswitch
+/libopenvswitch-dev
 /nicira-switch
 /openvswitch
 /openvswitch-common
@@ -19,4 +23,5 @@
 /openvswitch-testcontroller
 /openvswitch-vtep
 /python-openvswitch
+/python3-openvswitch
 /tmp

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#if !defined(__MACH__)
 #include <config.h>
 
 #include "netdev-provider.h"
@@ -50,13 +51,13 @@
 #include "coverage.h"
 #include "dp-packet.h"
 #include "dpif-netdev.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
 #include "openflow/openflow.h"
 #include "ovs-thread.h"
 #include "packets.h"
-#include "poll-loop.h"
-#include "shash.h"
+#include "openvswitch/poll-loop.h"
+#include "openvswitch/shash.h"
 #include "socket-util.h"
 #include "svec.h"
 #include "util.h"
@@ -64,7 +65,6 @@
 
 VLOG_DEFINE_THIS_MODULE(netdev_bsd);
 
-
 struct netdev_rxq_bsd {
     struct netdev_rxq up;
 
@@ -90,9 +90,6 @@ struct netdev_bsd {
 
     int ifindex;
     struct eth_addr etheraddr;
-    struct in_addr in4;
-    struct in_addr netmask;
-    struct in6_addr in6;
     int mtu;
     int carrier;
 
@@ -105,12 +102,11 @@ struct netdev_bsd {
 
 
 enum {
-    VALID_IFINDEX = 1 << 0,
+    VALID_IFINDEX   = 1 << 0,
     VALID_ETHERADDR = 1 << 1,
-    VALID_IN4 = 1 << 2,
-    VALID_IN6 = 1 << 3,
-    VALID_MTU = 1 << 4,
-    VALID_CARRIER = 1 << 5
+    VALID_IN        = 1 << 2,
+    VALID_MTU       = 1 << 3,
+    VALID_CARRIER   = 1 << 4
 };
 
 #define PCAP_SNAPLEN 2048
@@ -149,7 +145,7 @@ static void ifr_set_flags(struct ifreq *, int flags);
 static int af_link_ioctl(unsigned long command, const void *arg);
 #endif
 
-static void netdev_bsd_run(void);
+static void netdev_bsd_run(const struct netdev_class *);
 static int netdev_bsd_get_mtu(const struct netdev *netdev_, int *mtup);
 
 static bool
@@ -183,7 +179,7 @@ netdev_get_kernel_name(const struct netdev *netdev)
  * interface status changes, and eventually calls all the user callbacks.
  */
 static void
-netdev_bsd_run(void)
+netdev_bsd_run(const struct netdev_class *netdev_class OVS_UNUSED)
 {
     rtbsd_notifier_run();
 }
@@ -193,7 +189,7 @@ netdev_bsd_run(void)
  * be called.
  */
 static void
-netdev_bsd_wait(void)
+netdev_bsd_wait(const struct netdev_class *netdev_class OVS_UNUSED)
 {
     rtbsd_notifier_wait();
 }
@@ -294,6 +290,7 @@ netdev_bsd_construct_system(struct netdev *netdev_)
     if (error == ENXIO) {
         free(netdev->kernel_name);
         cache_notifier_unref();
+        ovs_mutex_destroy(&netdev->mutex);
         return error;
     }
 
@@ -620,8 +617,8 @@ netdev_rxq_bsd_recv_tap(struct netdev_rxq_bsd *rxq, struct dp_packet *buffer)
 }
 
 static int
-netdev_bsd_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet **packets,
-                    int *c)
+netdev_bsd_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet_batch *batch,
+                    int *qfill)
 {
     struct netdev_rxq_bsd *rxq = netdev_rxq_bsd_cast(rxq_);
     struct netdev *netdev = rxq->up.netdev;
@@ -633,6 +630,7 @@ netdev_bsd_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet **packets,
         mtu = ETH_PAYLOAD_MAX;
     }
 
+    /* Assume Ethernet port. No need to set packet_type. */
     packet = dp_packet_new_with_headroom(VLAN_ETH_HEADER_LEN + mtu,
                                            DP_NETDEV_HEADROOM);
     retval = (rxq->pcap_handle
@@ -642,11 +640,13 @@ netdev_bsd_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet **packets,
     if (retval) {
         dp_packet_delete(packet);
     } else {
-        dp_packet_pad(packet);
-        dp_packet_rss_invalidate(packet);
-        packets[0] = packet;
-        *c = 1;
+        dp_packet_batch_init_packet(batch, packet);
     }
+
+    if (qfill) {
+        *qfill = -ENOTSUP;
+    }
+
     return retval;
 }
 
@@ -684,12 +684,13 @@ netdev_bsd_rxq_drain(struct netdev_rxq *rxq_)
  */
 static int
 netdev_bsd_send(struct netdev *netdev_, int qid OVS_UNUSED,
-                struct dp_packet **pkts, int cnt, bool may_steal)
+                struct dp_packet_batch *batch,
+                bool concurrent_txq OVS_UNUSED)
 {
     struct netdev_bsd *dev = netdev_bsd_cast(netdev_);
     const char *name = netdev_get_name(netdev_);
+    struct dp_packet *packet;
     int error;
-    int i;
 
     ovs_mutex_lock(&dev->mutex);
     if (dev->tap_fd < 0 && !dev->pcap) {
@@ -698,9 +699,9 @@ netdev_bsd_send(struct netdev *netdev_, int qid OVS_UNUSED,
         error = 0;
     }
 
-    for (i = 0; i < cnt; i++) {
-        const void *data = dp_packet_data(pkts[i]);
-        size_t size = dp_packet_size(pkts[i]);
+    DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+        const void *data = dp_packet_data(packet);
+        size_t size = dp_packet_size(packet);
 
         while (!error) {
             ssize_t retval;
@@ -731,11 +732,7 @@ netdev_bsd_send(struct netdev *netdev_, int qid OVS_UNUSED,
     }
 
     ovs_mutex_unlock(&dev->mutex);
-    if (may_steal) {
-        for (i = 0; i < cnt; i++) {
-            dp_packet_delete(pkts[i]);
-        }
-    }
+    dp_packet_delete_batch(batch, true);
 
     return error;
 }
@@ -999,7 +996,7 @@ netdev_bsd_get_stats(const struct netdev *netdev_, struct netdev_stats *stats)
     mib[3] = IFMIB_IFDATA;
     len = sizeof(ifmd);
     for (i = 1; i <= if_count; i++) {
-        mib[4] = i; //row
+        mib[4] = i; /* row */
         if (sysctl(mib, 6, &ifmd, &len, (void *)0, 0) == -1) {
             VLOG_DBG_RL(&rl, "%s: sysctl failed: %s",
                         netdev_get_name(netdev_), ovs_strerror(errno));
@@ -1172,46 +1169,6 @@ cleanup:
 }
 
 /*
- * If 'netdev' has an assigned IPv4 address, sets '*in4' to that address and
- * '*netmask' to its netmask and returns true.  Otherwise, returns false.
- */
-static int
-netdev_bsd_get_in4(const struct netdev *netdev_, struct in_addr *in4,
-                   struct in_addr *netmask)
-{
-    struct netdev_bsd *netdev = netdev_bsd_cast(netdev_);
-    int error = 0;
-
-    ovs_mutex_lock(&netdev->mutex);
-    if (!(netdev->cache_valid & VALID_IN4)) {
-        struct ifreq ifr;
-
-        ifr.ifr_addr.sa_family = AF_INET;
-        error = af_inet_ifreq_ioctl(netdev_get_kernel_name(netdev_), &ifr,
-                                    SIOCGIFADDR, "SIOCGIFADDR");
-        if (!error) {
-            const struct sockaddr_in *sin;
-
-            sin = ALIGNED_CAST(struct sockaddr_in *, &ifr.ifr_addr);
-            netdev->in4 = sin->sin_addr;
-            netdev->cache_valid |= VALID_IN4;
-            error = af_inet_ifreq_ioctl(netdev_get_kernel_name(netdev_), &ifr,
-                                        SIOCGIFNETMASK, "SIOCGIFNETMASK");
-            if (!error) {
-                *netmask = sin->sin_addr;
-            }
-        }
-    }
-    if (!error) {
-        *in4 = netdev->in4;
-        *netmask = netdev->netmask;
-    }
-    ovs_mutex_unlock(&netdev->mutex);
-
-    return error ? error : in4->s_addr == INADDR_ANY ? EADDRNOTAVAIL : 0;
-}
-
-/*
  * Assigns 'addr' as 'netdev''s IPv4 address and 'mask' as its netmask.  If
  * 'addr' is INADDR_ANY, 'netdev''s IPv4 address is cleared.  Returns a
  * positive errno value.
@@ -1229,11 +1186,6 @@ netdev_bsd_set_in4(struct netdev *netdev_, struct in_addr addr,
         if (addr.s_addr != INADDR_ANY) {
             error = do_set_addr(netdev_, SIOCSIFNETMASK,
                                 "SIOCSIFNETMASK", mask);
-            if (!error) {
-                netdev->cache_valid |= VALID_IN4;
-                netdev->in4 = addr;
-                netdev->netmask = mask;
-            }
         }
         netdev_change_seq_changed(netdev_);
     }
@@ -1243,37 +1195,20 @@ netdev_bsd_set_in4(struct netdev *netdev_, struct in_addr addr,
 }
 
 static int
-netdev_bsd_get_in6(const struct netdev *netdev_, struct in6_addr *in6)
+netdev_bsd_get_addr_list(const struct netdev *netdev_,
+                         struct in6_addr **addr, struct in6_addr **mask, int *n_cnt)
 {
     struct netdev_bsd *netdev = netdev_bsd_cast(netdev_);
-    if (!(netdev->cache_valid & VALID_IN6)) {
-        struct ifaddrs *ifa, *head;
-        struct sockaddr_in6 *sin6;
-        const char *netdev_name = netdev_get_name(netdev_);
+    int error;
 
-        if (getifaddrs(&head) != 0) {
-            VLOG_ERR("getifaddrs on %s device failed: %s", netdev_name,
-                    ovs_strerror(errno));
-            return errno;
-        }
-
-        for (ifa = head; ifa; ifa = ifa->ifa_next) {
-            if (ifa->ifa_addr->sa_family == AF_INET6 &&
-                    !strcmp(ifa->ifa_name, netdev_name)) {
-                sin6 = ALIGNED_CAST(struct sockaddr_in6 *, ifa->ifa_addr);
-                if (sin6) {
-                    memcpy(&netdev->in6, &sin6->sin6_addr, sin6->sin6_len);
-                    netdev->cache_valid |= VALID_IN6;
-                    *in6 = netdev->in6;
-                    freeifaddrs(head);
-                    return 0;
-                }
-            }
-        }
-        return EADDRNOTAVAIL;
+    if (!(netdev->cache_valid & VALID_IN)) {
+        netdev_get_addrs_list_flush();
     }
-    *in6 = netdev->in6;
-    return 0;
+    error = netdev_get_addrs(netdev_get_name(netdev_), addr, mask, n_cnt);
+    if (!error) {
+        netdev->cache_valid |= VALID_IN;
+    }
+    return error;
 }
 
 #if defined(__NetBSD__)
@@ -1424,7 +1359,11 @@ netdev_bsd_arp_lookup(const struct netdev *netdev OVS_UNUSED,
     mib[2] = 0;
     mib[3] = AF_INET;
     mib[4] = NET_RT_FLAGS;
+#ifdef RTF_LLINFO
     mib[5] = RTF_LLINFO;
+#else
+    mib[5] = 0;
+#endif
     if (sysctl(mib, 6, NULL, &needed, NULL, 0) == -1) {
         error = errno;
         goto error;
@@ -1539,89 +1478,45 @@ netdev_bsd_update_flags(struct netdev *netdev_, enum netdev_flags off,
     return error;
 }
 
-/* Linux has also different GET_STATS, SET_STATS,
- * GET_STATUS)
- */
-#define NETDEV_BSD_CLASS(NAME, CONSTRUCT,            \
-                         GET_FEATURES)               \
-{                                                    \
-    NAME,                                            \
-                                                     \
-    NULL, /* init */                                 \
-    netdev_bsd_run,                                  \
-    netdev_bsd_wait,                                 \
-    netdev_bsd_alloc,                                \
-    CONSTRUCT,                                       \
-    netdev_bsd_destruct,                             \
-    netdev_bsd_dealloc,                              \
-    NULL, /* get_config */                           \
-    NULL, /* set_config */                           \
-    NULL, /* get_tunnel_config */                    \
-    NULL, /* build header */                         \
-    NULL, /* push header */                          \
-    NULL, /* pop header */                           \
-    NULL, /* get_numa_id */                          \
-    NULL, /* set_multiq */                           \
-                                                     \
-    netdev_bsd_send,                                 \
-    netdev_bsd_send_wait,                            \
-                                                     \
-    netdev_bsd_set_etheraddr,                        \
-    netdev_bsd_get_etheraddr,                        \
-    netdev_bsd_get_mtu,                              \
-    NULL, /* set_mtu */                              \
-    netdev_bsd_get_ifindex,                          \
-    netdev_bsd_get_carrier,                          \
-    NULL, /* get_carrier_resets */                   \
-    NULL, /* set_miimon_interval */                  \
-    netdev_bsd_get_stats,                            \
-                                                     \
-    GET_FEATURES,                                    \
-    NULL, /* set_advertisement */                    \
-    NULL, /* set_policing */                         \
-    NULL, /* get_qos_type */                         \
-    NULL, /* get_qos_capabilities */                 \
-    NULL, /* get_qos */                              \
-    NULL, /* set_qos */                              \
-    NULL, /* get_queue */                            \
-    NULL, /* set_queue */                            \
-    NULL, /* delete_queue */                         \
-    NULL, /* get_queue_stats */                      \
-    NULL, /* queue_dump_start */                     \
-    NULL, /* queue_dump_next */                      \
-    NULL, /* queue_dump_done */                      \
-    NULL, /* dump_queue_stats */                     \
-                                                     \
-    netdev_bsd_get_in4,                              \
-    netdev_bsd_set_in4,                              \
-    netdev_bsd_get_in6,                              \
-    NULL, /* add_router */                           \
-    netdev_bsd_get_next_hop,                         \
-    NULL, /* get_status */                           \
-    netdev_bsd_arp_lookup, /* arp_lookup */          \
-                                                     \
-    netdev_bsd_update_flags,                         \
-                                                     \
-    netdev_bsd_rxq_alloc,                            \
-    netdev_bsd_rxq_construct,                        \
-    netdev_bsd_rxq_destruct,                         \
-    netdev_bsd_rxq_dealloc,                          \
-    netdev_bsd_rxq_recv,                             \
-    netdev_bsd_rxq_wait,                             \
-    netdev_bsd_rxq_drain,                            \
-}
+#define NETDEV_BSD_CLASS_COMMON                      \
+    .run = netdev_bsd_run,                           \
+    .wait = netdev_bsd_wait,                         \
+    .alloc = netdev_bsd_alloc,                       \
+    .destruct = netdev_bsd_destruct,                 \
+    .dealloc = netdev_bsd_dealloc,                   \
+    .send = netdev_bsd_send,                         \
+    .send_wait = netdev_bsd_send_wait,               \
+    .set_etheraddr = netdev_bsd_set_etheraddr,       \
+    .get_etheraddr = netdev_bsd_get_etheraddr,       \
+    .get_mtu = netdev_bsd_get_mtu,                   \
+    .get_ifindex = netdev_bsd_get_ifindex,           \
+    .get_carrier = netdev_bsd_get_carrier,           \
+    .get_stats = netdev_bsd_get_stats,               \
+    .get_features = netdev_bsd_get_features,         \
+    .set_in4 = netdev_bsd_set_in4,                   \
+    .get_addr_list = netdev_bsd_get_addr_list,       \
+    .get_next_hop = netdev_bsd_get_next_hop,         \
+    .arp_lookup = netdev_bsd_arp_lookup,             \
+    .update_flags = netdev_bsd_update_flags,         \
+    .rxq_alloc = netdev_bsd_rxq_alloc,               \
+    .rxq_construct = netdev_bsd_rxq_construct,       \
+    .rxq_destruct = netdev_bsd_rxq_destruct,         \
+    .rxq_dealloc = netdev_bsd_rxq_dealloc,           \
+    .rxq_recv = netdev_bsd_rxq_recv,                 \
+    .rxq_wait = netdev_bsd_rxq_wait,                 \
+    .rxq_drain = netdev_bsd_rxq_drain
 
-const struct netdev_class netdev_bsd_class =
-    NETDEV_BSD_CLASS(
-        "system",
-        netdev_bsd_construct_system,
-        netdev_bsd_get_features);
+const struct netdev_class netdev_bsd_class = {
+    NETDEV_BSD_CLASS_COMMON,
+    .type = "system",
+    .construct = netdev_bsd_construct_system,
+};
 
-const struct netdev_class netdev_tap_class =
-    NETDEV_BSD_CLASS(
-        "tap",
-        netdev_bsd_construct_tap,
-        netdev_bsd_get_features);
+const struct netdev_class netdev_tap_class = {
+    NETDEV_BSD_CLASS_COMMON,
+    .type = "tap",
+    .construct = netdev_bsd_construct_tap,
+};
 
 
 static void
@@ -1753,7 +1648,7 @@ set_etheraddr(const char *netdev_name OVS_UNUSED, int hwaddr_family OVS_UNUSED,
     if (error) {
         return error;
     }
-    if (!memcmp(&sdl->sdl_data[sdl->sdl_nlen], mac, hwaddr_len)) {
+    if (!memcmp(&sdl->sdl_data[sdl->sdl_nlen], &mac, hwaddr_len)) {
         return 0;
     }
     oldaddr = req.addr;
@@ -1765,7 +1660,7 @@ set_etheraddr(const char *netdev_name OVS_UNUSED, int hwaddr_family OVS_UNUSED,
     sdl->sdl_len = offsetof(struct sockaddr_dl, sdl_data) + hwaddr_len;
     sdl->sdl_alen = hwaddr_len;
     sdl->sdl_family = hwaddr_family;
-    memcpy(sdl->sdl_data, mac, hwaddr_len);
+    memcpy(sdl->sdl_data, &mac, hwaddr_len);
     error = af_link_ioctl(SIOCALIFADDR, &req);
     if (error) {
         return error;
@@ -1824,3 +1719,4 @@ af_link_ioctl(unsigned long command, const void *arg)
             : 0);
 }
 #endif
+#endif /* !defined(__MACH__) */

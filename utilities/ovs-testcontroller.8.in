@@ -1,9 +1,5 @@
 .\" -*- nroff -*-
-.de IQ
-.  br
-.  ns
-.  IP "\\$1"
-..
+.so lib/ovs.tmac
 .TH ovs\-testcontroller 8 "@VERSION@" "Open vSwitch" "Open vSwitch Manual"
 .ds PN ovs\-testcontroller
 .
@@ -139,6 +135,7 @@ Use this option more than once to add flows from multiple files.
 .so lib/ssl.man
 .so lib/ssl-peer-ca-cert.man
 .ds DD
+.SS "Daemon Options"
 .so lib/daemon.man
 .so lib/vlog.man
 .so lib/unixctl.man

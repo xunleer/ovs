@@ -18,6 +18,8 @@
 
 #include <config.h>
 #include "lldpd.h"
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -28,7 +30,6 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #ifndef _WIN32
@@ -39,7 +40,8 @@
 #include <sys/utsname.h>
 #endif
 #include "compiler.h"
-#include "list.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/list.h"
 #include "packets.h"
 #include "timeval.h"
 
@@ -75,7 +77,7 @@ lldpd_get_hardware(struct lldpd *cfg, char *name, int index,
 }
 
 struct lldpd_hardware *
-lldpd_alloc_hardware(struct lldpd *cfg, char *name, int index)
+lldpd_alloc_hardware(struct lldpd *cfg, const char *name, int index)
 {
     struct lldpd_hardware *hw;
 
@@ -85,10 +87,10 @@ lldpd_alloc_hardware(struct lldpd *cfg, char *name, int index)
     hw->h_cfg = cfg;
     ovs_strlcpy(hw->h_ifname, name, sizeof hw->h_ifname);
     hw->h_ifindex = index;
-    hw->h_lport.p_chassis = CONTAINER_OF(list_front(&cfg->g_chassis),
+    hw->h_lport.p_chassis = CONTAINER_OF(ovs_list_front(&cfg->g_chassis),
                                          struct lldpd_chassis, list);
     hw->h_lport.p_chassis->c_refcount++;
-    list_init(&hw->h_rports);
+    ovs_list_init(&hw->h_rports);
 
     return hw;
 }
@@ -139,7 +141,7 @@ lldpd_cleanup(struct lldpd *cfg)
 
     LIST_FOR_EACH_SAFE (hw, hw_next, h_entries, &cfg->g_hardware) {
         if (!hw->h_flags) {
-            list_remove(&hw->h_entries);
+            ovs_list_remove(&hw->h_entries);
             lldpd_remote_cleanup(hw, NULL, true);
             lldpd_hardware_cleanup(cfg, hw);
         } else {
@@ -151,7 +153,7 @@ lldpd_cleanup(struct lldpd *cfg)
 
     LIST_FOR_EACH_SAFE (chassis, chassis_next, list, &cfg->g_chassis) {
         if (chassis->c_refcount == 0) {
-            list_remove(&chassis->list);
+            ovs_list_remove(&chassis->list);
             lldpd_chassis_cleanup(chassis, 1);
         }
     }
@@ -179,11 +181,11 @@ lldpd_move_chassis(struct lldpd_chassis *ochassis,
      * marshaling.
      */
     memcpy(ochassis, chassis, sizeof *ochassis);
-    list_init(&ochassis->c_mgmt);
+    ovs_list_init(&ochassis->c_mgmt);
 
     /* Copy of management addresses */
     LIST_FOR_EACH_POP (mgmt, m_entries, &chassis->c_mgmt) {
-        list_insert(&ochassis->c_mgmt, &mgmt->m_entries);
+        ovs_list_insert(&ochassis->c_mgmt, &mgmt->m_entries);
     }
 
     /* Restore saved values */
@@ -242,6 +244,7 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
 
     if (s < sizeof(struct eth_header) + 4) {
         /* Too short, just discard it */
+        hw->h_rx_discarded_cnt++;
         return;
     }
 
@@ -282,6 +285,7 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
                 VLOG_DBG("function for %s protocol did not "
                          "decode this frame",
                          cfg->g_protocols[i].name);
+                hw->h_rx_discarded_cnt++;
                 return;
             }
             chassis->c_protocol = port->p_protocol = cfg->g_protocols[i].mode;
@@ -339,7 +343,7 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
 
     /* No, but do we already know the system? */
     if (!oport) {
-        bool found = false;
+        found = false;
         VLOG_DBG("MSAP is unknown, search for the chassis");
 
         LIST_FOR_EACH (ochassis, list, &cfg->g_chassis) {
@@ -360,7 +364,7 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
 
     if (oport) {
         /* The port is known, remove it before adding it back */
-        list_remove(&oport->p_entries);
+        ovs_list_remove(&oport->p_entries);
         lldpd_port_cleanup(oport, 1);
         free(oport);
     }
@@ -373,8 +377,8 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
         VLOG_DBG("unknown chassis, add it to the list");
         chassis->c_index = ++cfg->g_lastrid;
         chassis->c_refcount = 0;
-        list_push_back(&cfg->g_chassis, &chassis->list);
-        listsize = list_size(&cfg->g_chassis);
+        ovs_list_push_back(&cfg->g_chassis, &chassis->list);
+        listsize = ovs_list_size(&cfg->g_chassis);
         VLOG_DBG("%"PRIuSIZE " different systems are known", listsize);
     }
 
@@ -383,7 +387,7 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
     port->p_lastframe = xmalloc(s + sizeof(struct lldpd_frame));
     port->p_lastframe->size = s;
     memcpy(port->p_lastframe->frame, frame, s);
-    list_insert(&hw->h_rports, &port->p_entries);
+    ovs_list_insert(&hw->h_rports, &port->p_entries);
 
     port->p_chassis = chassis;
     port->p_chassis->c_refcount++;
@@ -400,14 +404,12 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
      * freed with lldpd_port_cleanup() and therefore, the refcount
      * of the chassis that was attached to it is decreased.
      */
-    i = list_size(&hw->h_rports);
+    i = ovs_list_size(&hw->h_rports);
     VLOG_DBG("%"PRIuSIZE " neighbors for %s", i, hw->h_ifname);
 
     if (!oport)  {
         hw->h_insert_cnt++;
     }
-
-    return;
 }
 
 static void
@@ -416,7 +418,6 @@ lldpd_hide_ports(struct lldpd *cfg,
                  int mask) {
     struct lldpd_port *port;
     int protocols[LLDPD_MODE_MAX + 1];
-    char buffer[256];
     bool found = false;
     int i, j, k;
     unsigned int min;
@@ -504,29 +505,25 @@ lldpd_hide_ports(struct lldpd *cfg,
         j++;
     }
 
-    buffer[0] = '\0';
-    for (i = 0; cfg->g_protocols[i].mode != 0; i++) {
-        if (cfg->g_protocols[i].enabled &&
-            protocols[cfg->g_protocols[i].mode]) {
-            if (strlen(buffer) +
-                strlen(cfg->g_protocols[i].name) + 3 > sizeof(buffer)) {
-                /* Unlikely, our buffer is too small */
-                memcpy(buffer + sizeof(buffer) - 4, "...", 4);
-                break;
-            }
-            if (buffer[0]) {
-                strncat(buffer, ", ", 2);
-                strncat(buffer, cfg->g_protocols[i].name,
-                strlen(cfg->g_protocols[i].name));
+    if (VLOG_IS_DBG_ENABLED()) {
+        struct ds buffer = DS_EMPTY_INITIALIZER;
+        for (struct protocol *p = cfg->g_protocols; p->mode; p++) {
+            if (p->enabled && protocols[p->mode]) {
+                if (buffer.length) {
+                    ds_put_cstr(&buffer, ", ");
+                }
+                ds_put_cstr(&buffer, p->name);
             }
         }
+        VLOG_DBG("%s: %s: %d visible neighbors (out of %d)",
+                 hw->h_ifname,
+                 (mask == SMART_OUTGOING) ? "out filter" : "in filter",
+                 k, j);
+        VLOG_DBG("%s: protocols: %s",
+                 hw->h_ifname,
+                 buffer.length ? ds_cstr(&buffer) : "(none)");
+        ds_destroy(&buffer);
     }
-    VLOG_DBG("%s: %s: %d visible neighbors (out of %d)",
-             hw->h_ifname,
-             (mask == SMART_OUTGOING) ? "out filter" : "in filter",
-             k, j);
-    VLOG_DBG("%s: protocols: %s",
-             hw->h_ifname, buffer[0] ? buffer : "(none)");
 }
 
 /* Hide unwanted ports depending on smart mode set by the user */

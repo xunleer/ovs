@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Nicira, Inc.
+ * Copyright (c) 2015, 2016, 2019 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 /* This implementation only applies to the Linux platform.  */
 
 #include <config.h>
-#if defined(__linux__) && defined(HAVE_LINUX_PERF_EVENT_H)
+#if defined(__linux__) && defined(HAVE_LINUX_PERF_EVENT_H) && !__CHECKER__
 
 #include <stddef.h>
 #include <sys/types.h>
@@ -26,9 +26,9 @@
 #include <sys/ioctl.h>
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "perf-counter.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "util.h"
 
 static struct shash perf_counters = SHASH_INITIALIZER(&perf_counters);
@@ -111,7 +111,7 @@ perf_counter_to_ds(struct ds *ds, struct perf_counter *pfc)
         ratio = 0.0;
     }
 
-    ds_put_format(ds, "%-40s%12"PRIu64"%12"PRIu64"%12.1f\n",
+    ds_put_format(ds, "%-40s %12"PRIu64" %12"PRIu64" %12.1f\n",
                   pfc->name, pfc->n_events, pfc->total_count, ratio);
 }
 
@@ -146,7 +146,7 @@ perf_counters_to_ds(struct ds *ds)
  * Caller is responsible for free memory.
  */
 char *
-perf_counters_to_string()
+perf_counters_to_string(void)
 {
     struct ds ds;
 
@@ -176,7 +176,7 @@ perf_counters_clear(void)
 }
 
 void
-perf_counters_destroy()
+perf_counters_destroy(void)
 {
     struct shash_node *node, *next;
 
